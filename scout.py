@@ -1473,6 +1473,10 @@ class ADConnection:
         self.sch_nc    = ""
         self._impacket = None  # set when impacket backend is active
         self.gc_root = ""
+        # functional levels — populated for BOTH backends so collection never
+        # depends on ldap3's server.info (which is absent on the Kerberos path).
+        self.domain_func = -1
+        self.forest_func = -1
 
     def _ldap_port(self) -> int:
         if self.args.port:
@@ -1728,14 +1732,21 @@ class ADConnection:
         print(f"[+] Kerberos LDAP bind successful ({url}).")
 
         self._impacket = ic
-        # pull naming contexts from RootDSE
+        # Remember the FQDN so the SMB/SYSVOL Kerberos logins build a valid SPN
+        # (cifs/<fqdn>, not cifs/<ip> which yields KDC_ERR_S_PRINCIPAL_UNKNOWN).
+        if not self.args.dc_host and dc_fqdn and dc_fqdn != self.args.dc_ip:
+            self.args.dc_host = dc_fqdn
+        # pull naming contexts AND functional levels from RootDSE (no ldap3
+        # server.info on this path, so collection reads these from here).
         try:
             resp = ic.search(searchBase="", searchFilter="(objectClass=*)",
                              scope=LDAPScope("baseObject"),
                              attributes=["defaultNamingContext",
                                          "configurationNamingContext",
                                          "schemaNamingContext",
-                                         "rootDomainNamingContext"])
+                                         "rootDomainNamingContext",
+                                         "domainFunctionality",
+                                         "forestFunctionality"])
             for entry in resp:
                 # impacket can return SearchResultReference/Done entries with no
                 # 'attributes' — guard per-entry so they don't abort the loop.
@@ -1749,10 +1760,21 @@ class ADConnection:
                     elif n == "configurationNamingContext": self.cfg_nc  = v
                     elif n == "schemaNamingContext":        self.sch_nc  = v
                     elif n == "rootDomainNamingContext":    self.gc_root = v
-        except Exception:
-            pass
+                    elif n == "domainFunctionality":
+                        try: self.domain_func = int(v)
+                        except ValueError: pass
+                    elif n == "forestFunctionality":
+                        try: self.forest_func = int(v)
+                        except ValueError: pass
+        except Exception as e:
+            if self.args.verbose:
+                print(f"[!] RootDSE read failed: {e}")
         if not self.base_dn:
             self.base_dn = ",".join(f"DC={p}" for p in self.args.domain.split("."))
+        if not self.cfg_nc:
+            self.cfg_nc = f"CN=Configuration,{self.base_dn}"
+        if not self.sch_nc:
+            self.sch_nc = f"CN=Schema,{self.cfg_nc}"
         return True
 
     def _impacket_search(self, base: str, flt: str, attrs: List[str],
@@ -1795,7 +1817,7 @@ class ADConnection:
         return lm, nt
 
     def _extract_root_info(self):
-        info = self.server.info
+        info = self.server.info if self.server else None
         if info:
             dns = info.other.get("defaultNamingContext", [""])
             self.base_dn = dns[0] if isinstance(dns, list) else dns
@@ -1805,6 +1827,13 @@ class ADConnection:
             self.sch_nc  = sch[0] if isinstance(sch, list) else sch
             gc  = info.other.get("rootDomainNamingContext", [""])
             self.gc_root = gc[0] if isinstance(gc, list) else gc
+            def _lvl(key):
+                v = info.other.get(key, [None])
+                v = v[0] if isinstance(v, list) else v
+                try:    return int(v)
+                except (TypeError, ValueError): return -1
+            self.domain_func = _lvl("domainFunctionality")
+            self.forest_func = _lvl("forestFunctionality")
 
     def paged_search(self, base: str, flt: str, attrs: List[str],
                      scope=ldap3.SUBTREE, page_size: int = 500) -> List[Dict]:
@@ -1875,6 +1904,7 @@ class ADData:
         self.ds_heuristics:  str  = ""
         self.ms_ds_other_settings: str = ""
         # populated by SYSVOLChecker
+        self.sysvol_scanned: bool = False   # True only if SYSVOL was readable
         self.sysvol_data: Dict = {
             "gpp_passwords": [],       # [{gpo_name, file, username, cpassword, plaintext}]
             "registry_pol":  [],       # [{gpo_name, key, name, regtype, data}]
@@ -1886,33 +1916,45 @@ class ADData:
         self.machine_account_quota: int = -1
 
     def collect(self):
-        c = self.conn
-        print("[*] Collecting domain information...")
-        self._collect_domain_info()
-        print("[*] Collecting user accounts...")
-        self._collect_users()
-        print("[*] Collecting computer accounts...")
-        self._collect_computers()
-        print("[*] Collecting groups...")
-        self._collect_groups()
-        print("[*] Collecting domain controllers...")
-        self._collect_dcs()
-        print("[*] Collecting trust relationships...")
-        self._collect_trusts()
-        print("[*] Collecting GPOs...")
-        self._collect_gpos()
-        print("[*] Collecting sites/subnets...")
-        self._collect_sites()
-        print("[*] Collecting password settings objects...")
-        self._collect_psoes()
+        # Each step is isolated so one failure (permissions, an odd object, a
+        # transient error) degrades that section only instead of zeroing the
+        # whole assessment.
+        steps = [
+            ("domain information",        self._collect_domain_info),
+            ("user accounts",            self._collect_users),
+            ("computer accounts",        self._collect_computers),
+            ("groups",                   self._collect_groups),
+            ("domain controllers",       self._collect_dcs),
+            ("trust relationships",      self._collect_trusts),
+            ("GPOs",                     self._collect_gpos),
+            ("sites/subnets",            self._collect_sites),
+            ("password settings objects",self._collect_psoes),
+        ]
         if not self.args.no_adcs:
-            print("[*] Collecting ADCS objects...")
-            self._collect_adcs()
-        print("[*] Collecting DNS zones...")
-        self._collect_dns()
+            steps.append(("ADCS objects", self._collect_adcs))
+        steps.append(("DNS zones", self._collect_dns))
+        self.collect_errors: List[str] = []
+        for label, fn in steps:
+            print(f"[*] Collecting {label}...")
+            try:
+                fn()
+            except Exception as e:
+                self.collect_errors.append(f"{label}: {e}")
+                print(f"[!] Collection of {label} failed: {e}")
+                if self.args.verbose:
+                    traceback.print_exc()
         print("[*] Checking ADWS availability...")
-        self.adws_available = check_port(self.args.dc_ip, 9389, timeout=3)
-        print("[*] Data collection complete.")
+        try:
+            self.adws_available = check_port(self.args.dc_ip, 9389, timeout=3)
+        except Exception:
+            pass
+        n = sum(len(x) for x in (self.users, self.computers, self.dcs)) + len(self.groups)
+        print(f"[*] Data collection complete "
+              f"({len(self.users)} users, {len(self.computers)} computers, "
+              f"{len(self.groups)} groups, {len(self.dcs)} DCs).")
+        if not n:
+            print("[!] WARNING: no directory objects were collected — results "
+                  "will be incomplete. Check account rights and connectivity.")
 
     # ── domain ───────────────────────────────────────────────────────────────
 
@@ -1929,18 +1971,10 @@ class ADData:
         ])
         self.domain_obj = r
 
-        # Functional levels from rootDSE other
-        info = c.server.info
-        if info:
-            def _lvl(key):
-                v = info.other.get(key, [None])
-                v = v[0] if isinstance(v, list) else v
-                try:
-                    return int(v)
-                except (TypeError, ValueError):
-                    return -1
-            self.domain_level  = _lvl("domainFunctionality")
-            self.forest_level  = _lvl("forestFunctionality")
+        # Functional levels — read from the connection (populated for both the
+        # ldap3 and impacket/Kerberos backends at connect time).
+        self.domain_level = getattr(c, "domain_func", -1)
+        self.forest_level = getattr(c, "forest_func", -1)
 
         # Schema version
         sv = c.search_one(self.sch, "(objectClass=dMD)", ["objectVersion"])
@@ -2566,7 +2600,7 @@ class CheckEngine:
         # via domain object or defer to SMB checks
         # Check domain functional level as proxy: if DFL >= 2003, LM should be off
         # but we flag if DFL is old OR if we see evidence
-        if self.d.domain_level is not None and self.d.domain_level < 2:
+        if self.d.domain_level is not None and 0 <= self.d.domain_level < 2:
             self._add("A-LMHashAuthorized",
                       "Domain functional level suggests LM hash storage may be active. "
                       "Verify the 'Network security: Do not store LAN Manager hash' GPO.",
@@ -2645,7 +2679,9 @@ class CheckEngine:
         active_dcs = [d for d in self.d.dcs
                       if not uac_has(get_int(d["attrs"], "userAccountControl"),
                                      UAC_ACCOUNTDISABLE)]
-        if len(active_dcs) < 2:
+        # 0 means DC enumeration failed (not a real single-DC domain) — skip to
+        # avoid a false finding.
+        if 0 < len(active_dcs) < 2:
             self._add("A-NotEnoughDC",
                       f"Only {len(active_dcs)} domain controller(s) found. "
                       "Single DC is a single point of failure.",
@@ -3845,19 +3881,30 @@ class CheckEngine:
     # =========================================================================
 
     def _check_gpo_sysvol(self):
+        # Presence-based checks (only fire on an actual bad value found in SYSVOL)
+        # are always safe to run.
         self._p_gpp_passwords()
         self._a_wdigest()
         self._a_lm_compat()
+        self._a_wsus_http_gpo()
+        self._s_wsus_http_full()
+        self._a_dsrm_logon()
+        # Absence-based checks ("not configured via GPO") MUST NOT run if SYSVOL
+        # could not be read — otherwise every setting looks unconfigured and we
+        # emit false positives. Only run them when SYSVOL was actually scanned.
+        if not self.d.sysvol_scanned:
+            if not self.args.no_smb:
+                print("[!] SYSVOL not readable — skipping GPO 'not configured' "
+                      "checks (LLMNR/NBT-NS/CredGuard/UNC paths/PowerShell/NTLM) "
+                      "to avoid false positives.")
+            return
         self._a_llmnr()
         self._a_nbtns()
         self._a_credential_guard_gpo()
         self._a_hardened_paths_gpo()
         self._a_powershell_logging_gpo()
-        self._a_wsus_http_gpo()
-        self._s_wsus_http_full()
         self._a_restrict_remote_sam()
         self._a_ntlm_audit()
-        self._a_dsrm_logon()
 
     # ── RestrictRemoteSAM / NTLM audit / DSRM logon (GPO security options) ─────
 
@@ -4152,7 +4199,10 @@ class CheckEngine:
         admin_sams = set()
         for grp_name, members in self.d.priv_group_members.items():
             for m in members:
-                admin_sams.add(m.lower())
+                # members are {dn, attrs} dicts
+                sam = get_str(m.get("attrs", {}), "sAMAccountName") if isinstance(m, dict) else str(m)
+                if sam:
+                    admin_sams.add(sam.lower())
 
         kerberoastable = []
         admin_kerberoastable = []
@@ -4319,6 +4369,7 @@ class SYSVOLChecker:
             return
         try:
             self._walk_sysvol()
+            self.data.sysvol_scanned = True   # GPO-absence checks may now run
         except Exception as e:
             print(f"[!] SYSVOL walk failed: {e}")
         finally:
@@ -4328,7 +4379,10 @@ class SYSVOLChecker:
                 pass
 
     def _connect(self):
-        self.smb = SMBConnection(self.args.dc_ip, self.args.dc_ip, timeout=10)
+        # For Kerberos the remoteName must be the DC FQDN so impacket builds a
+        # valid cifs/<fqdn> SPN (an IP gives KDC_ERR_S_PRINCIPAL_UNKNOWN).
+        remote_name = (self.args.dc_host or self.args.dc_ip) if self.args.kerberos else self.args.dc_ip
+        self.smb = SMBConnection(remote_name, self.args.dc_ip, timeout=10)
         if self.args.kerberos:
             lm = nt = ""
             if self.args.hashes:
@@ -4837,7 +4891,9 @@ class SMBChecker:
 
     def _get_smb_conn(self) -> Optional["SMBConnection"]:
         try:
-            smb = SMBConnection(self.target, self.target, timeout=10)
+            # Kerberos needs the FQDN as remoteName for the cifs/<fqdn> SPN.
+            remote_name = (self.args.dc_host or self.target) if self.args.kerberos else self.target
+            smb = SMBConnection(remote_name, self.target, timeout=10)
             if self.args.kerberos:
                 lm = nt = ""
                 if self.args.hashes:
