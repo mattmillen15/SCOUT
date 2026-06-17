@@ -1481,9 +1481,9 @@ RULE_DOCS: Dict[str, Dict[str, Any]] = {
         "refs": ["https://github.com/micahvandeusen/gMSADumper"],
     },
     "A-KDSRootKey": {
-        "description": "The KDS root key material (msKds-RootKeyData) is readable in the current context.",
+        "description": "A broad / low-privileged principal is granted read on the KDS root key.",
         "why": "With the KDS root key an attacker computes the password of ANY gMSA in the forest offline (GoldenGMSA), with no further DC interaction — persistent access to every managed service account. Only Domain Admins / SYSTEM should ever read it.",
-        "technical": "CN=Master Root Keys,CN=Group Key Distribution Service,CN=Services,CN=Configuration — msKds-RootKeyData returned a value to a non-DA reader.",
+        "technical": "CN=Master Root Keys,CN=Group Key Distribution Service,CN=Services,CN=Configuration — nTSecurityDescriptor DACL grants read (GenericAll/GenericRead/ReadProperty/Control-Access) to a broad SID (Everyone / Authenticated Users / Domain Users / Domain Computers / BUILTIN\\Users).",
         "exploit": [
             "GoldenGMSA.exe kdsinfo / gmsainfo / compute --sid <gmsa-sid>",
         ],
@@ -2602,7 +2602,7 @@ class CheckEngine:
                 sd = _ldaptypes.SR_SECURITY_DESCRIPTOR(data=raw)
             except Exception:
                 continue
-            dacl = sd.get("Dacl")
+            dacl = sd["Dacl"]
             if not dacl:
                 continue
             readers = []
@@ -2626,28 +2626,62 @@ class CheckEngine:
                       affected)
 
     def _m_kds_root_key(self):
-        """KDS root key readability — GoldenGMSA offline compromise (roadmap 2)."""
+        """KDS root key over-exposure — GoldenGMSA offline compromise (roadmap 2).
+
+        Report only when a BROAD / low-privileged principal is granted read on the
+        KDS root key object, parsed from its security descriptor. Keying off "can
+        the current bind read msKds-RootKeyData" was a false positive: by Windows
+        design only SYSTEM/Domain Admins can read it, so a privileged bind (a
+        supported run mode) would trip it on every healthy domain."""
+        if not HAS_IMPACKET_LDAP:
+            return
         base = (f"CN=Master Root Keys,CN=Group Key Distribution Service,"
                 f"CN=Services,{self.d.cfg}")
         try:
             keys = self.d.conn.paged_search(
                 base, "(objectClass=msKds-ProvRootKey)",
-                ["cn", "msKds-RootKeyData", "whenCreated"])
+                ["cn", "nTSecurityDescriptor", "whenCreated"])
         except Exception:
             keys = []
-        readable = []
+        broad = self._broad_low_priv_sids()
+        READ_RIGHTS = (self._ADS_GENERIC_ALL | 0x80000000     # GENERIC_ALL | GENERIC_READ
+                       | 0x00000010 | self._ADS_CONTROL_ACCESS)  # READ_PROP | CONTROL_ACCESS
+        affected = []
         for k in keys:
-            raw = k["attrs"].get("msKds-RootKeyData")
+            raw = k["attrs"].get("nTSecurityDescriptor")
             if isinstance(raw, list):
                 raw = raw[0] if raw else None
-            if raw:   # we (current context) could read the secret material
-                readable.append(get_str(k["attrs"], "cn") or dn_base(k.get("dn", "")))
-        if readable:
+            if not isinstance(raw, (bytes, bytearray)):
+                continue
+            try:
+                sd = _ldaptypes.SR_SECURITY_DESCRIPTOR(data=raw)
+            except Exception:
+                continue
+            dacl = sd["Dacl"]
+            if not dacl:
+                continue
+            readers = []
+            for ace in dacl["Data"]:
+                try:
+                    if "DENIED" in ace["TypeName"].upper():
+                        continue
+                    mask = int(ace["Ace"]["Mask"]["Mask"])
+                    sidstr = ace["Ace"]["Sid"].formatCanonical()
+                except Exception:
+                    continue
+                if sidstr in broad and (mask & READ_RIGHTS):
+                    readers.append(broad[sidstr])
+            if readers:
+                cn = get_str(k["attrs"], "cn") or dn_base(k.get("dn", ""))
+                affected.append(f"{cn} ← {', '.join(_dedup_keep_order(readers))}")
+        if affected:
             self._add("A-KDSRootKey",
-                      "The KDS root key material is readable in the current "
-                      "context — every gMSA password in the forest can be computed "
-                      "offline (GoldenGMSA). Only Domain Admins/SYSTEM should read it.",
-                      readable)
+                      "A broad / low-privileged principal is granted read on the KDS "
+                      "root key (principal(s) after '←'). With the root key, every "
+                      "gMSA password in the forest can be computed offline "
+                      "(GoldenGMSA) — only Domain Admins/SYSTEM should be able to "
+                      "read it.",
+                      affected)
 
     def _m_entra(self):
         """On-prem-readable Entra / AAD-Connect indicators (roadmap item 3)."""
@@ -2897,7 +2931,7 @@ class CheckEngine:
             return []
         idx = self._sid_index()
         out: List[str] = []
-        dacl = sd.get("Dacl")
+        dacl = sd["Dacl"]
         if not dacl:
             return []
         for ace in dacl["Data"]:
@@ -3501,7 +3535,7 @@ class CheckEngine:
             return []
         broad = self._broad_low_priv_sids()
         out = []
-        dacl = sd.get("Dacl")
+        dacl = sd["Dacl"]
         if not dacl:
             return []
         for ace in dacl["Data"]:
@@ -3552,7 +3586,7 @@ class CheckEngine:
                      | self._ADS_WRITE_DACL | self._ADS_WRITE_OWNER
                      | self._ADS_WRITE_PROP)
         writers: List[str] = []
-        dacl = sd.get("Dacl")
+        dacl = sd["Dacl"]
         if not dacl:
             return []
         for ace in dacl["Data"]:
@@ -3588,7 +3622,7 @@ class CheckEngine:
         except Exception:
             return [], False
         broad = self._broad_low_priv_sids()
-        dacl = sd.get("Dacl")
+        dacl = sd["Dacl"]
         if not dacl:
             return [], True
         out: List[str] = []
@@ -3609,7 +3643,7 @@ class CheckEngine:
             # enroll when the ObjectType is the Enroll/AutoEnroll GUID (or absent,
             # which means "all extended rights" and therefore includes enroll).
             if mask & self._ADS_CONTROL_ACCESS:
-                ot = ace["Ace"].get("ObjectType", b"") if ace["AceType"] == 0x05 else b""
+                ot = _ace_object_type(ace["Ace"]) if ace["AceType"] == 0x05 else b""
                 if not ot or len(ot) != 16:
                     out.append(broad[sidstr]); continue
                 try:
@@ -5349,8 +5383,12 @@ _BROAD_SIDS = {
 
 # DCSync extended right GUIDs
 _DCSYNC_GUIDS = {
+    # DCSync needs Get-Changes (…aa) + Get-Changes-All (…ad). The "All" right is
+    # …f6ad — NOT …f6ab (that GUID is DS-Replication-Synchronize, which is not a
+    # DCSync primitive). The previous table had …f6ab here and would miss real
+    # Get-Changes-All ACEs.
     "1131f6aa-9c07-11d1-f79f-00c04fc2dcd2": "DS-Replication-Get-Changes",
-    "1131f6ab-9c07-11d1-f79f-00c04fc2dcd2": "DS-Replication-Get-Changes-All",
+    "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2": "DS-Replication-Get-Changes-All",
     "89e95b76-444d-4c62-991a-0facbeda640c": "DS-Replication-Get-Changes-In-Filtered-Set",
 }
 
@@ -5369,6 +5407,18 @@ def _guid_from_bytes(b: bytes) -> str:
         p1[0], p1[1], p1[2],
         p2.hex(), p3.hex()
     )
+
+# impacket's *_OBJECT_ACE only carries ObjectType when the ACE_OBJECT_TYPE_PRESENT
+# (0x1) flag is set, and the ldaptypes structures have NO .get() — a bare
+# subscript KeyErrors and `.get()` AttributeErrors. Read it safely.
+def _ace_object_type(ace_struct) -> bytes:
+    """Return an object ACE's ObjectType GUID bytes, or b'' if not present."""
+    try:
+        if ace_struct["Flags"] & 0x01:   # ACE_OBJECT_TYPE_PRESENT
+            return bytes(ace_struct["ObjectType"])
+    except Exception:
+        pass
+    return b""
 
 
 class ACLAnalyzer:
@@ -5543,7 +5593,7 @@ class ACLAnalyzer:
                 # DCSync rights
                 if check_dcsync and "OBJECT" in ace_type.upper():
                     try:
-                        obj_type = ace["Ace"].get("ObjectType", b"")
+                        obj_type = _ace_object_type(ace["Ace"])
                         if obj_type and len(obj_type) == 16:
                             guid_str = _guid_from_bytes(bytes(obj_type))
                             dcsync_name = _DCSYNC_GUIDS.get(guid_str.strip("{}").lower())
@@ -5766,24 +5816,32 @@ class ControlPathAnalyzer:
     def _gpo_edges(self):
         """GPO control -> Tier 0, with real gPLink resolution (roadmap 1). A GPO
         only gets a Tier-0 edge when it is actually linked to a container that
-        affects domain controllers (the domain root or the DCs' parent OU);
-        editing a GPO linked only to a workstation OU is SYSTEM on those hosts,
-        not an automatic path to DA. Every GPO SD is bulk-read in one query."""
+        affects domain controllers; editing a GPO linked only to a workstation OU
+        is SYSTEM on those hosts, not an automatic path to DA. Every GPO SD is
+        bulk-read in one query."""
         d = self.data
         gpo_by_dn = {g.get("dn", "").lower(): g for g in d.gpos if g.get("dn")}
-        # containers whose linked GPOs reach Tier 0: domain root + each DC's parent OU
+        # Containers whose linked GPOs reach Tier 0. GPO inheritance flows down the
+        # WHOLE OU chain, so include every ancestor container of each DC (not just
+        # the immediate parent), the domain root, and — since DCs live in sites and
+        # site-linked GPOs apply to them — any AD site.
         tier0_containers = {self.domain_root}
         for dc in d.dcs:
-            dcdn = dc.get("dn", "")
-            if "," in dcdn:
-                tier0_containers.add(dcdn.split(",", 1)[1].lower())
-        # GPO DN -> set of container DNs that link it
+            rest = dc.get("dn", "").lower()
+            while "," in rest:
+                rest = rest.split(",", 1)[1]
+                tier0_containers.add(rest)
+        for s in getattr(d, "sites", []):
+            sdn = s.get("dn", "")
+            if sdn:
+                tier0_containers.add(sdn.lower())
+        # GPO DN -> set of container DNs that link it (domain root, OUs, sites)
         linked = defaultdict(set)
         containers = []
         if d.domain_obj:
             containers.append((self.conn.base_dn, get_str(d.domain_obj["attrs"], "gPLink")))
-        for ou in getattr(d, "ous", []):
-            containers.append((ou.get("dn", ""), get_str(ou["attrs"], "gPLink")))
+        for cont in list(getattr(d, "ous", [])) + list(getattr(d, "sites", [])):
+            containers.append((cont.get("dn", ""), get_str(cont["attrs"], "gPLink")))
         for cdn, gplink in containers:
             for gdn in self._parse_gplink(gplink):
                 linked[gdn.lower()].add((cdn or "").lower())
@@ -5822,7 +5880,7 @@ class ControlPathAnalyzer:
                     continue  # only edges from resolvable, non-Tier-0 principals
                 label = None
                 if dcsync and "OBJECT" in ace["TypeName"].upper():
-                    ot = ace["Ace"].get("ObjectType", b"")
+                    ot = _ace_object_type(ace["Ace"])
                     if ot and len(ot) == 16:
                         guid = _guid_from_bytes(bytes(ot)).strip("{}").lower()
                         if guid in _DCSYNC_GUIDS:
@@ -6688,8 +6746,8 @@ document.addEventListener('DOMContentLoaded',function(){kcApply();
     Object.keys(links).forEach(function(k){links[k].classList.toggle('active',k===cur);});}
   window.addEventListener('scroll',spy);spy();});
 /* ── control-path node detail drawer (PingCastle-style drill-down) ── */
-function kcEsc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){
-  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+function kcEsc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){
+  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 function kcAge(d){return d==null?'—':(d+'d');}
 function kcStat(v){return v===false?'<span class="kc-bad">disabled</span>':
   (v===true?'<span class="kc-ok">enabled</span>':'—');}
@@ -6697,7 +6755,7 @@ function kcNode(el){
   var name=el.getAttribute('data-node');var m=(window.KC_NODES||{})[name];
   var dw=document.getElementById('kc-drawer'),ov=document.getElementById('kc-drawer-ov');
   var body=document.getElementById('kc-dw-body'),ttl=document.getElementById('kc-dw-name');
-  if(!dw||!body)return;ttl.textContent=name;
+  if(!dw||!body||!ttl)return;ttl.textContent=name;
   if(!m){body.innerHTML='<p class="kc-dw-note">No additional detail was collected for this node.</p>';}
   else{
     var h='<div style="margin-bottom:8px"><span class="kc-dw-badge'+(m.tier0?' t0':'')+'">'+kcEsc(m.type||'object')+'</span>';
@@ -7023,7 +7081,11 @@ class HTMLReporter:
     def _node_registry_json(self):
         import json as _json
         nodes = self._cp_nodes()
-        return _json.dumps(nodes, default=str).replace("</", "<\\/")
+        # ensure_ascii (json default) already escapes non-ASCII incl. U+2028/9.
+        # Neutralize < and > so no AD object name (e.g. one containing
+        # "</script>") can break out of the inline <script> element.
+        return (_json.dumps(nodes, default=str)
+                .replace("<", "\\u003c").replace(">", "\\u003e"))
 
     def _control_graph_svg(self):
         """Server-rendered layered graph of the control paths — the 'visual' an
