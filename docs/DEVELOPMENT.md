@@ -78,10 +78,15 @@ as not useful for an offensive engagement.
 
 ## Known limitations
 
-- No transitive ACL control-path graph (BloodHound-style closure); only fixed
-  high-value objects and a few broad-principal ACL checks.
-- ADCS coverage is ESC1/2/3/4/8 + key strength. ESC5/6/7/9/10 need CA-side data
-  (CA flags, CA security descriptor) not collected over LDAP today.
+- `ControlPathAnalyzer` does a real transitive closure (membership + GenericAll/
+  GenericWrite/WriteDacl/WriteOwner/Owner/DCSync edges, seeded from Tier-0). It
+  bulk-reads SDs for groups + adminCount users and per-object for the domain
+  root/GPOs; it does NOT yet read every user/computer SD, so paths that route
+  through control over an arbitrary non-admin object can be missed. GPO control
+  is modelled as "→ Tier 0" (approximation; doesn't yet check the GPO's link).
+- ADCS coverage is ESC1/2/3/4/7/8/9 + key strength. ESC6 (EDITF_ATTRIBUTE-
+  SUBJECTALTNAME2) and ESC10/11 are CA/DC registry settings not exposed over
+  LDAP, so they can't be confirmed read-only.
 - Some host-local controls (RestrictRemoteSAM, DSRM logon, NTLM auditing) are
   inferred from GPO state in SYSVOL, not read from the host registry.
 - `sIDHistory`/SID/time decoding can differ between the ldap3 and impacket
@@ -95,10 +100,10 @@ as not useful for an offensive engagement.
 
 Ordered roughly by value:
 
-1. Transitive ACL control-path analysis ("who can become Domain Admin").
-2. ADCS ESC6/ESC7 (CA flags + CA security descriptor) and ESC9/10 cert mapping.
-3. gMSA / dMSA managed-password read-ACL checks; KDS root key exposure.
-4. Deeper Entra/AAD-Connect inspection (PHS/PTA/Seamless SSO, sync-account priv).
+1. Extend control-path closure to all user/computer SDs (bulk, paged) and add
+   real GPO-link resolution so GPO→host→Tier-0 edges are precise.
+2. gMSA / dMSA managed-password read-ACL checks; KDS root key exposure.
+3. Deeper Entra/AAD-Connect inspection (PHS/PTA/Seamless SSO, sync-account priv).
 5. OU + `gPLink` inventory: GPO link/inheritance, orphaned/unlinked GPOs.
 6. Backend-agnostic normalisation of SID/time attributes; per-query failure
    surfacing in the report (so "clean" can't mean "unscanned").

@@ -335,6 +335,10 @@ RULES: Dict[str, Tuple[str, str, int, str]] = {
     "A-NTLMAudit":            ("NTLM auditing not enabled (RestrictSendingNTLMTraffic)","Anomaly",5,"LOW"),
     "A-DSRMLogon":            ("DSRM administrator allowed to log on over the network","Anomaly",25,"HIGH"),
     "A-CertTemplateESC4":     ("Certificate template ACL writable by low-privileged principal (ESC4)","Anomaly",50,"CRITICAL"),
+    "A-CertCAManageLowPriv":  ("Low-privileged principal holds CA management rights (ESC7)","Anomaly",50,"CRITICAL"),
+    "A-CertTemplateESC9":     ("Certificate template has no security extension — weak cert mapping (ESC9)","Anomaly",40,"HIGH"),
+    "P-ControlPathDA":        ("Non-privileged principals have a control path to Domain Admin","Privileged",75,"CRITICAL"),
+    "A-SCCMContainerACL":     ("System Management (SCCM) container writable by a broad principal","Anomaly",40,"HIGH"),
     "A-SCCM":                 ("SCCM/MECM site infrastructure exposed (relay / NAA / PXE attack surface)","Anomaly",40,"HIGH"),
     "A-Pre2kComputer":        ("Pre-created (pre-Windows 2000) computer accounts with a predictable password","Anomaly",50,"HIGH"),
     "A-WeakLockout":          ("No / weak account-lockout policy (password spraying viable)","Anomaly",25,"HIGH"),
@@ -480,6 +484,12 @@ RULE_MITRE: Dict[str, List[str]] = {
     "S-DesEnabled": ["T1558.003: Kerberoasting (DES)"],
     "A-AeA": ["T1558: Steal/Forge Kerberos Tickets"],
     "A-SCCM": ["T1557.001: SMB Relay", "T1078: Valid Accounts (NAA)", "T1602: Data from Config Repo"],
+    "A-SCCMContainerACL": ["T1222.001: ACL Modification", "T1557.001: SMB Relay"],
+    "A-CertCAManageLowPriv": ["T1649: Authentication Certificates (ESC7)"],
+    "A-CertTemplateESC9": ["T1649: Authentication Certificates (ESC9)"],
+    "P-ControlPathDA": ["T1222.001: ACL Modification", "T1098: Account Manipulation"],
+    "P-ControlPathIndirectEveryone": ["T1222.001: ACL Modification"],
+    "P-ControlPathIndirectMany": ["T1222.001: ACL Modification"],
     "A-Pre2kComputer": ["T1078: Valid Accounts", "T1110: Brute Force"],
     "A-WeakLockout": ["T1110.003: Password Spraying"],
     "P-ExchangePrivEsc": ["T1222.001: ACL Modification", "T1098: Account Manipulation"],
@@ -535,7 +545,9 @@ OP_CATEGORY = {
     "P-PrivilegeEveryone":"Privilege Escalation","A-BadSuccessor":"Privilege Escalation",
     "A-CertTempCustomSubject":"Privilege Escalation","A-CertTempAnyPurpose":"Privilege Escalation",
     "A-CertTempAgent":"Privilege Escalation","A-CertTemplateESC4":"Privilege Escalation",
-    "A-CertEnrollHttp":"Privilege Escalation",
+    "A-CertEnrollHttp":"Privilege Escalation","A-CertCAManageLowPriv":"Privilege Escalation",
+    "A-CertTemplateESC9":"Privilege Escalation","P-ControlPathDA":"Privilege Escalation",
+    "P-ControlPathIndirectEveryone":"Privilege Escalation","P-ControlPathIndirectMany":"Privilege Escalation",
     # Credential access / harvesting
     "P-GPPPassword":"Credential Access","A-LAPS-Not-Installed":"Credential Access",
     "A-LAPS-Joined-Computers":"Credential Access","A-LocalAdminPassword":"Credential Access",
@@ -556,7 +568,7 @@ OP_CATEGORY = {
     "S-SMB-v1":"Lateral Movement","S-Vuln-MS17_010":"Lateral Movement","A-HardenedPaths":"Lateral Movement",
     "A-DnsZoneAUCreateChild":"Lateral Movement","A-DnsZoneUpdate1":"Lateral Movement",
     "T-SIDFiltering":"Lateral Movement","T-TGTDelegation":"Lateral Movement","T-AzureADSSO":"Lateral Movement",
-    "T-Downlevel":"Lateral Movement",
+    "T-Downlevel":"Lateral Movement","A-SCCMContainerACL":"Lateral Movement",
     # Persistence
     "A-Krbtgt":"Persistence","S-SIDHistory":"Persistence","S-SIDHistoryPrivileged":"Persistence",
     "T-SIDHistoryDangerous":"Persistence","A-DSRMLogon":"Persistence","S-Vuln-MS14-068":"Persistence",
@@ -1384,6 +1396,62 @@ RULE_DOCS: Dict[str, Dict[str, Any]] = {
             "Set a lockout threshold (e.g. 5–10) with a sane observation/reset window, or deploy smart lockout / Azure password protection.",
         ],
     },
+    "P-ControlPathDA": {
+        "description": "Non-privileged principals can reach Domain Admin through a chain of control edges (group membership + dangerous ACLs / ownership).",
+        "why": "These are the multi-hop escalation routes BloodHound surfaces — a low-privileged user who can write to a group, reset an admin's password, edit a linked GPO, or take ownership of a Tier-0 object ultimately becomes Domain Admin. They are the most common real-world DA path and are invisible to membership-only review.",
+        "technical": "Transitive closure over edges: MemberOf, GenericAll/GenericWrite/WriteDacl/WriteOwner/Owner/AllExtendedRights/ForceChangePassword/Self(member) on groups, admin users, GPOs and the domain root, seeded from the Tier-0 groups.",
+        "exploit": [
+            "bloodhound-python -c All -u user -p pass -d domain.local -ns <dc>  # then 'Shortest paths to Domain Admins'",
+            "Walk the path: e.g. dacledit (WriteDacl) → net group add (AddMember) → DCSync",
+        ],
+        "remediation": [
+            "Remove the dangerous ACE / ownership at the first hop of each path (see the chain).",
+            "Re-baseline AdminSDHolder; restrict who can write to Tier-0 objects and admin accounts.",
+        ],
+        "refs": ["https://bloodhound.specterops.io/"],
+    },
+    "P-ControlPathIndirectEveryone": {
+        "description": "Everyone / Authenticated Users / Domain Users / Domain Computers has a control path to Domain Admin.",
+        "why": "Any authenticated user — i.e. every employee, and anyone who phishes one set of creds — can escalate to domain takeover. This is a worst-case finding.",
+        "remediation": ["Remove the broad-principal control edge at the first hop of the path immediately."],
+    },
+    "P-ControlPathIndirectMany": {
+        "description": "An unusually large number of non-privileged principals can reach Domain Admin via control paths.",
+        "why": "A wide blast radius for domain takeover — many accounts, any one of which if compromised yields DA. Indicates systemic ACL sprawl.",
+        "remediation": ["Review and prune delegated rights on Tier-0 objects; collapse the control paths."],
+    },
+    "A-CertCAManageLowPriv": {
+        "description": "A low-privileged principal holds CA management rights (ManageCA / Manage Certificates) on an enterprise CA — ESC7.",
+        "why": "ManageCA lets an attacker enable the EDITF_ATTRIBUTESUBJECTALTNAME2 flag (turning every template into ESC6) or approve their own failed requests; Manage Certificates lets them issue held requests. Either yields a certificate for any user and full domain compromise.",
+        "technical": "CA object (pKIEnrollmentService) nTSecurityDescriptor ACE granting ManageCA (0x1) / ManageCertificates to a non-admin.",
+        "exploit": [
+            "certipy ca -ca <CA> -enable-template <tmpl> ...   # or -add-officer / -issue-request",
+            "certipy find -vulnerable    # confirms ESC7",
+        ],
+        "remediation": [
+            "Remove CA management roles from non-Tier-0 principals (certsrv → CA → Security).",
+        ],
+        "refs": ["https://github.com/ly4k/Certipy"],
+    },
+    "A-CertTemplateESC9": {
+        "description": "A published authentication template has CT_FLAG_NO_SECURITY_EXTENSION set — ESC9 (weak certificate mapping).",
+        "why": "Without the szOID_NTDS_CA_SECURITY_EXT SID in the certificate, AD falls back to weak (UPN-based) implicit mapping. Combined with write access to a victim's userPrincipalName, an attacker enrolls a cert that authenticates as a target (incl. DAs) even after the May-2022 patches.",
+        "technical": "msPKI-Enrollment-Flag has bit 0x80000 (NO_SECURITY_EXTENSION) and the template provides an authentication EKU.",
+        "exploit": [
+            "certipy req -template <tmpl> -upn administrator@domain ... (with UPN control)",
+        ],
+        "remediation": [
+            "Clear CT_FLAG_NO_SECURITY_EXTENSION; enforce StrongCertificateBindingEnforcement=2 on DCs (KB5014754).",
+        ],
+        "refs": ["https://github.com/ly4k/Certipy"],
+    },
+    "A-SCCMContainerACL": {
+        "description": "The System Management container (SCCM/MECM) is writable by a broad / non-Tier-0 principal.",
+        "why": "Write access to the System Management container lets an attacker publish a rogue management point and coerce clients/site servers to authenticate to it (relay), or tamper with SCCM site data — a common path to SCCM, and from there domain-wide, compromise.",
+        "technical": "CN=System Management,CN=System,<domain> nTSecurityDescriptor grants GenericWrite/GenericAll/WriteDacl to Everyone/Authenticated Users/Domain Users/Computers.",
+        "remediation": ["Restrict the container ACL to the SCCM site server(s) only."],
+        "refs": ["https://github.com/garrettfoster13/sccmhunter"],
+    },
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2055,6 +2123,8 @@ class ADData:
         # populated by ACLAnalyzer
         self.acl_findings: List[Dict] = []
         self.machine_account_quota: int = -1
+        # populated by ControlPathAnalyzer
+        self.control_paths: Dict = {"count": 0, "broad": [], "paths": []}
 
     def collect(self):
         # Each step is isolated so one failure (permissions, an odd object, a
@@ -2326,7 +2396,8 @@ class ADData:
             f"CN=Enrollment Services,{pks_base}",
             "(objectClass=pKIEnrollmentService)", [
             "cn","dNSHostName","cACertificate","distinguishedName",
-            "certificateTemplates","msPKI-Enrollment-Servers"])
+            "certificateTemplates","msPKI-Enrollment-Servers",
+            "nTSecurityDescriptor","flags"])
         # Build set of template names actually published to a CA
         self._published_templates: Set[str] = set()
         for svc in self.enrollment_svcs:
@@ -2399,6 +2470,39 @@ class CheckEngine:
         self._m_sccm()
         self._m_pre2k_computers()
         self._m_weak_lockout()
+        self._m_control_paths()
+
+    def _m_control_paths(self):
+        cp = getattr(self.d, "control_paths", None) or {}
+        count = cp.get("count", 0); broad = cp.get("broad", [])
+        if not count:
+            return
+        # readable one-liners for the affected list
+        def path_str(p):
+            if not p:
+                return ""
+            s = p[0][0]
+            for src, label, dst in p:
+                s += f" --[{label}]--> {dst}"
+            return s
+        samples = [f"{name}: {path_str(path)}" for name, path, _ in cp.get("paths", [])]
+        if broad:
+            self._add("P-ControlPathIndirectEveryone",
+                      f"A broad principal ({', '.join(broad)}) has a control path to a Tier-0 "
+                      "group — i.e. ANY authenticated user can escalate to Domain Admin. "
+                      "Walk the chain and remove the first dangerous edge.",
+                      samples or broad)
+        else:
+            self._add("P-ControlPathDA",
+                      f"{count} non-privileged principal(s) can reach Domain Admin through a "
+                      "chain of group membership and dangerous ACLs/ownership (not direct "
+                      "membership). These are the multi-hop escalation routes to fix first.",
+                      samples)
+        if count >= 25:
+            self._add("P-ControlPathIndirectMany",
+                      f"{count} distinct non-privileged principals have a control path to "
+                      "Tier-0 — a very wide takeover blast radius indicating ACL sprawl.",
+                      [f"{count} principals with a path to Domain Admin"])
 
     def _m_sccm(self):
         """SCCM/MECM publishes management points + site servers to AD — a prime
@@ -2429,6 +2533,42 @@ class CheckEngine:
                       "paths to domain-wide compromise. Enumerate and attack with SharpSCCM / "
                       "sccmhunter, and check MP/DB SMB+MSSQL signing for relay.",
                       _dedup_keep_order(servers))
+            # System Management container ACL — broad write = rogue MP / relay
+            writers = self._container_broad_writers(base)
+            if writers:
+                self._add("A-SCCMContainerACL",
+                          f"The System Management container is writable by: {', '.join(writers)}. "
+                          "A non-Tier-0 principal that can write here can publish a rogue "
+                          "management point and coerce clients/site servers to authenticate to it "
+                          "for relay. Restrict the ACL to the site server(s).",
+                          writers)
+
+    def _container_broad_writers(self, dn):
+        """Broad/low-priv principals with write/control over a container's DACL."""
+        if not HAS_IMPACKET_LDAP:
+            return []
+        try:
+            a = ACLAnalyzer(self.d.conn, self.d, self.args)
+            a._build_broad_sids()
+            raw = a._fetch_sd(dn)
+            sd = a._parse_dacl(raw) if raw else None
+            if not sd or not sd["Dacl"]:
+                return []
+            danger = 0x10000000 | 0x40000000 | 0x00040000 | 0x00080000 | 0x00000002  # GA/GW/WDac/WOwn/CreateChild
+            out = []
+            for ace in sd["Dacl"]["Data"]:
+                try:
+                    if "DENIED" in ace["TypeName"].upper():
+                        continue
+                    mask = int(ace["Ace"]["Mask"]["Mask"]); sid = a._sid_str(ace["Ace"]["Sid"])
+                    name = a._broad.get(sid)
+                    if name and (mask & danger):
+                        out.append(name)
+                except Exception:
+                    continue
+            return _dedup_keep_order(out)
+        except Exception:
+            return []
 
     def _m_pre2k_computers(self):
         """Pre-staged 'Pre-Windows 2000' computer accounts still hold a password
@@ -3016,12 +3156,63 @@ class CheckEngine:
                           f"{cn} ... to weaponise.",
                           [f"{cn} writable by {p}" for p in esc4])
 
+            # ESC9: no security extension on an auth template (weak cert mapping)
+            if (enroll_flag & self._CT_NO_SECURITY_EXTENSION) and has_auth_eku:
+                self._add("A-CertTemplateESC9",
+                          f"ESC9: Template '{cn}' sets CT_FLAG_NO_SECURITY_EXTENSION with an "
+                          "authentication EKU — the issued cert omits the SID security "
+                          "extension, so AD falls back to weak (UPN) mapping. With write access "
+                          "to a victim's userPrincipalName this allows authenticating as them.",
+                          [cn])
+
+        # ESC7: low-privileged principal holds CA management rights
+        for svc in self.d.enrollment_svcs:
+            writers = self._esc7_ca_managers(svc)
+            if writers:
+                self._add("A-CertCAManageLowPriv",
+                          f"ESC7: CA '{get_str(svc['attrs'],'cn')}' grants management rights "
+                          f"(ManageCA / Manage Certificates) to: {', '.join(writers)}. They can "
+                          "flip EDITF_ATTRIBUTESUBJECTALTNAME2 (→ESC6) or approve their own "
+                          "request to mint a DA certificate. certipy ca -add-officer / -enable-template.",
+                          [f"{get_str(svc['attrs'],'cn')}: {p}" for p in writers])
+
     # Access-mask bits that let a principal rewrite a template into ESC1.
     _ADS_GENERIC_ALL   = 0x10000000
     _ADS_GENERIC_WRITE = 0x40000000
     _ADS_WRITE_DACL    = 0x00040000
     _ADS_WRITE_OWNER   = 0x00080000
     _ADS_WRITE_PROP    = 0x00000020
+    _CT_NO_SECURITY_EXTENSION = 0x00080000   # msPKI-Enrollment-Flag bit
+    _CA_MANAGE_RIGHTS  = 0x00000003          # ManageCA (0x1) | ManageCertificates (0x2)
+
+    def _esc7_ca_managers(self, svc) -> List[str]:
+        """Low-privileged principals with CA management rights (ESC7)."""
+        if not HAS_IMPACKET_LDAP:
+            return []
+        raw = svc["attrs"].get("nTSecurityDescriptor")
+        if isinstance(raw, list):
+            raw = raw[0] if raw else None
+        if not isinstance(raw, (bytes, bytearray)):
+            return []
+        try:
+            sd = _ldaptypes.SR_SECURITY_DESCRIPTOR(data=raw)
+        except Exception:
+            return []
+        broad = self._broad_low_priv_sids()
+        out = []
+        dacl = sd.get("Dacl")
+        if not dacl:
+            return []
+        for ace in dacl["Data"]:
+            try:
+                if ace["AceType"] not in (0x00, 0x05):
+                    continue
+                mask = int(ace["Ace"]["Mask"]["Mask"]); sid = ace["Ace"]["Sid"].formatCanonical()
+            except Exception:
+                continue
+            if sid in broad and (mask & self._CA_MANAGE_RIGHTS):
+                out.append(broad[sid])
+        return _dedup_keep_order(out)
 
     def _broad_low_priv_sids(self) -> Dict[str, str]:
         """Well-known SIDs that represent 'any/most authenticated principals'."""
@@ -5082,6 +5273,276 @@ class ACLAnalyzer:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# CONTROL-PATH GRAPH CLOSURE  ("who can become Domain Admin")
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ControlPathAnalyzer:
+    """Transitive closure over AD control edges (group membership + dangerous
+    ACLs / ownership) to find every non-privileged principal that can reach a
+    Tier-0 group. A BloodHound-style 'shortest path to Domain Admins', built from
+    bulk security-descriptor reads so it scales without per-object queries."""
+
+    # object-takeover rights on a target
+    _TAKEOVER = _ACE_GENERIC_ALL | _ACE_GENERIC_WRITE | _ACE_WRITE_DAC | _ACE_WRITE_OWNER
+    _MAX_PATHS = 25
+
+    def __init__(self, conn: "ADConnection", data: "ADData", args):
+        self.conn = conn; self.data = data; self.args = args
+        self.sid2name = {}; self.dn2sid = {}; self.adj = defaultdict(list); self.radj = defaultdict(list)
+        self.medges = defaultdict(list)  # membership-only (member -> group)
+
+    def run(self):
+        if not HAS_IMPACKET_LDAP:
+            return
+        print("[*] Computing control paths to Tier 0...")
+        try:
+            self._index()
+            self._membership_edges()
+            self._acl_edges()
+            self._close()
+        except Exception as e:
+            if self.args.verbose:
+                print(f"[!] control-path analysis failed: {e}")
+                traceback.print_exc()
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+    def _sid_of(self, obj):
+        raw = obj["attrs"].get("objectSid")
+        if isinstance(raw, list):
+            raw = raw[0] if raw else None
+        return sid_to_str(raw) if raw else ""
+
+    def _index(self):
+        d = self.data
+        for obj in list(d.users) + list(d.computers) + list(d.groups.values()):
+            sid = self._sid_of(obj); dn = obj.get("dn","")
+            if not sid:
+                continue
+            sam = get_str(obj["attrs"], "sAMAccountName") or dn_base(dn)
+            self.sid2name[sid] = sam
+            if dn:
+                self.dn2sid[dn.lower()] = sid
+        # well-known + domain-relative broad principals
+        self.sid2name.update({"S-1-1-0":"Everyone","S-1-5-11":"Authenticated Users",
+                              "S-1-5-7":"Anonymous Logon"})
+        self.broad = {"S-1-1-0","S-1-5-11","S-1-5-7"}
+        dsid = ""
+        if d.domain_obj:
+            dsid = self._sid_of(d.domain_obj)
+        self.dsid = dsid
+        # Tier-0 seeds (group SIDs + domain root DN)
+        self.seeds = set()
+        for rid in (512, 519, 518, 548, 551, 549, 550, 520):   # DA/EA/Schema/AcctOp/BackupOp/SrvOp/PrintOp/GPCreator
+            if dsid:
+                self.seeds.add(f"{dsid}-{rid}")
+        self.seeds |= {"S-1-5-32-544", "S-1-5-32-548", "S-1-5-32-551", "S-1-5-32-549", "S-1-5-32-550"}
+        self.tier0_groups = set(self.seeds)
+        self.domain_root = self.conn.base_dn.lower()
+        self.seeds.add(self.domain_root)
+        if dsid:
+            self.broad |= {f"{dsid}-513", f"{dsid}-515"}  # Domain Users / Computers
+            self.sid2name.setdefault(f"{dsid}-513", "Domain Users")
+            self.sid2name.setdefault(f"{dsid}-515", "Domain Computers")
+
+    def _node_name(self, node):
+        if node == self.domain_root:
+            return "Domain root"
+        return self.sid2name.get(node, node)
+
+    def _edge(self, src, dst, label, membership=False):
+        if not src or not dst or src == dst:
+            return
+        self.adj[src].append((dst, label))
+        self.radj[dst].append((src, label))
+        if membership:
+            self.medges[src].append(dst)
+
+    def _membership_edges(self):
+        # direct members of every group (member attr) -> the group SID
+        for g in self.data.groups.values():
+            gsid = self._sid_of(g)
+            if not gsid:
+                continue
+            for mdn in get_list(g["attrs"], "member"):
+                msid = self.dn2sid.get(mdn.lower())
+                if msid:
+                    self._edge(msid, gsid, "member of", membership=True)
+        # primaryGroupID memberships into Tier-0 RIDs
+        for obj in list(self.data.users) + list(self.data.computers):
+            pg = get_int(obj["attrs"], "primaryGroupID", 0)
+            if pg and self.dsid:
+                gsid = f"{self.dsid}-{pg}"
+                if gsid in self.sid2name:
+                    self._edge(self._sid_of(obj), gsid, "primary group", membership=True)
+
+    def _acl_edges(self):
+        # bulk-read SDs for groups + privileged (adminCount) users; per-object for
+        # the domain root, AdminSDHolder and GPOs.
+        for dn, sid, sd in self._bulk_sds("(objectClass=group)"):
+            if sid:
+                self._add_acl_edges(sd, sid, "group")
+        for dn, sid, sd in self._bulk_sds("(&(objectCategory=person)(objectClass=user)(adminCount=1))"):
+            if sid:
+                self._add_acl_edges(sd, sid, "admin user")
+        # domain root (DCSync / takeover -> Tier 0)
+        sd = self._fetch_one_sd(self.conn.base_dn)
+        if sd:
+            self._add_acl_edges(sd, self.domain_root, "domain root", dcsync=True)
+        # GPOs -> Tier 0 (editing a GPO ≈ SYSTEM on linked hosts)
+        for gpo in self.data.gpos[:200]:
+            gdn = gpo.get("dn","")
+            if not gdn:
+                continue
+            sd = self._fetch_one_sd(gdn)
+            if sd:
+                gnode = "GPO:" + gdn.lower()
+                self.sid2name[gnode] = "GPO " + (get_str(gpo["attrs"],"displayName") or dn_base(gdn))
+                self._add_acl_edges(sd, gnode, "gpo")
+                self._edge(gnode, self.domain_root, "applies to hosts")
+
+    def _add_acl_edges(self, sd, target_node, kind, dcsync=False):
+        try:
+            if sd["OwnerSid"]:
+                osid = sd["OwnerSid"].formatCanonical()
+                if osid in self.sid2name and osid not in self.tier0_groups:
+                    self._edge(osid, target_node, "owns")
+        except Exception:
+            pass
+        dacl = sd["Dacl"]
+        if not dacl:
+            return
+        for ace in dacl["Data"]:
+            try:
+                if "DENIED" in ace["TypeName"].upper():
+                    continue
+                mask = int(ace["Ace"]["Mask"]["Mask"])
+                psid = ace["Ace"]["Sid"].formatCanonical()
+                if psid not in self.sid2name or psid in self.tier0_groups:
+                    continue  # only edges from resolvable, non-Tier-0 principals
+                label = None
+                if dcsync and "OBJECT" in ace["TypeName"].upper():
+                    ot = ace["Ace"].get("ObjectType", b"")
+                    if ot and len(ot) == 16:
+                        guid = _guid_from_bytes(bytes(ot)).strip("{}").lower()
+                        if guid in _DCSYNC_GUIDS:
+                            label = "DCSync"
+                if label is None and (mask & self._TAKEOVER):
+                    if mask & _ACE_GENERIC_ALL:   label = "GenericAll"
+                    elif mask & _ACE_WRITE_DAC:   label = "WriteDacl"
+                    elif mask & _ACE_WRITE_OWNER: label = "WriteOwner"
+                    else:                          label = "GenericWrite"
+                if label:
+                    self._edge(psid, target_node, label)
+            except Exception:
+                continue
+
+    def _close(self):
+        # reverse BFS from Tier-0 seeds -> everything that can reach Tier 0
+        reach = set(); dq = list(self.seeds)
+        while dq:
+            n = dq.pop()
+            for src, _ in self.radj.get(n, []):
+                if src not in reach:
+                    reach.add(src); dq.append(src)
+        # expected admins = pure-membership closure of Tier 0
+        admins = set(); dq = list(self.seeds)
+        while dq:
+            n = dq.pop()
+            for src, _ in self.radj.get(n, []):
+                if src in admins:
+                    continue
+                # only follow this back-edge if it's a membership edge
+                if any(dst == n for dst in self.medges.get(src, [])):
+                    admins.add(src); dq.append(src)
+        principals = {s for s in reach if s in self.sid2name and not s.startswith("GPO:")}
+        control = principals - admins - self.tier0_groups - {self.domain_root}
+        broad = [self.sid2name[s] for s in control if s in self.broad]
+        # shortest path (forward BFS) for the most interesting principals
+        prio = sorted(control, key=lambda s: (0 if s in self.broad else 1, self.sid2name.get(s,"")))
+        paths = []
+        for s in prio[:self._MAX_PATHS]:
+            p = self._shortest(s)
+            if p:
+                paths.append((self.sid2name.get(s, s), p, s in self.broad))
+        self.data.control_paths = {"count": len(control), "broad": _dedup_keep_order(broad),
+                                   "paths": paths}
+
+    def _shortest(self, start):
+        from collections import deque
+        seen = {start}; q = deque([(start, [])])
+        while q:
+            node, path = q.popleft()
+            for dst, label in self.adj.get(node, []):
+                if dst in self.seeds:
+                    return path + [(self._node_name(node), label, self._node_name(dst))]
+                if dst not in seen and len(path) < 6:
+                    seen.add(dst); q.append((dst, path + [(self._node_name(node), label, self._node_name(dst))]))
+        return []
+
+    # ── bulk SD reader (both backends) ────────────────────────────────────────
+    def _bulk_sds(self, ldap_filter):
+        out = []
+        if getattr(self.conn, "_impacket", None):
+            try:
+                from impacket.ldap.ldapasn1 import Control, SimplePagedResultsControl, Scope as LDAPScope
+                from pyasn1.codec.ber import encoder
+                from pyasn1.type import univ
+                sdctrl = Control(); sdctrl["controlType"] = "1.2.840.113556.1.4.801"
+                seq = univ.Sequence(); seq.setComponentByPosition(0, univ.Integer(0x05))
+                sdctrl["controlValue"] = encoder.encode(seq)
+                paged = SimplePagedResultsControl(size=500)
+                resp = self.conn._impacket.search(
+                    searchBase=self.conn.base_dn, searchFilter=ldap_filter,
+                    attributes=["objectSid","nTSecurityDescriptor"],
+                    searchControls=[sdctrl, paged])
+                for e in resp:
+                    try:
+                        dn = str(e["objectName"]); sid = ""; sdb = None
+                        for a in e["attributes"]:
+                            t = str(a["type"])
+                            if t == "objectSid" and a["vals"]:
+                                sid = sid_to_str(bytes(a["vals"][0]))
+                            elif t == "nTSecurityDescriptor" and a["vals"]:
+                                sdb = bytes(a["vals"][0])
+                        if sdb:
+                            sd = _ldaptypes.SR_SECURITY_DESCRIPTOR(); sd.fromString(sdb)
+                            out.append((dn, sid, sd))
+                    except Exception:
+                        continue
+            except Exception as e:
+                if self.args.verbose:
+                    print(f"[!] bulk SD (impacket) failed: {e}")
+            return out
+        try:
+            from ldap3.protocol.microsoft import security_descriptor_control as sdc
+            gen = self.conn.conn.extend.standard.paged_search(
+                search_base=self.conn.base_dn, search_filter=ldap_filter,
+                search_scope=ldap3.SUBTREE, attributes=["objectSid","nTSecurityDescriptor"],
+                controls=[sdc(sdflags=0x05)], paged_size=500, generator=True)
+            for e in gen:
+                if e.get("type") != "searchResEntry":
+                    continue
+                raw = e.get("raw_attributes", {})
+                sdb = raw.get("nTSecurityDescriptor", [None])
+                sdb = sdb[0] if isinstance(sdb, list) else sdb
+                sraw = raw.get("objectSid", [None]); sraw = sraw[0] if isinstance(sraw, list) else sraw
+                if sdb:
+                    sd = _ldaptypes.SR_SECURITY_DESCRIPTOR(); sd.fromString(sdb)
+                    out.append((e.get("dn",""), sid_to_str(sraw) if sraw else "", sd))
+        except Exception as e:
+            if self.args.verbose:
+                print(f"[!] bulk SD (ldap3) failed: {e}")
+        return out
+
+    def _fetch_one_sd(self, dn):
+        a = ACLAnalyzer(self.conn, self.data, self.args)
+        raw = a._fetch_sd(dn)
+        if not raw:
+            return None
+        return a._parse_dacl(raw)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # SMB CHECKS
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -5235,6 +5696,9 @@ EXPOSURE_WEIGHTS = {
     "A-DCLdapSign":45, "A-SMB2SignatureNotRequired":45, "A-DCLdapsChannelBinding":42,
     "S-DesEnabled":45, "A-NullSession":40, "P-AdminCountOrphan":35,
     "A-SCCM":72, "A-Pre2kComputer":78, "A-WeakLockout":40,
+    "A-CertCAManageLowPriv":88, "A-CertTemplateESC9":80,
+    "P-ControlPathDA":92, "P-ControlPathIndirectEveryone":95, "P-ControlPathIndirectMany":70,
+    "A-SCCMContainerACL":75,
 }
 
 # rule_id -> (mode, weight). mode 'flat' adds weight; mode 'pct_users'/'pct_comps'
@@ -6158,24 +6622,28 @@ class HTMLReporter:
                 '<th class="kc-num">Admin</th><th class="kc-num">Pwd age (d)</th>'
                 '<th class="kc-num">Last logon (d)</th><th>Flags</th></tr></thead>'
                 f'<tbody>{rows}</tbody></table></div></div>')
-        if not blocks:
-            return ""
-        # control-path principals (who holds rights over Tier-0)
-        acl = self.data.acl_findings
+        # control-path closure: shortest paths to Domain Admin (BloodHound-style)
+        cpaths = getattr(self.data, "control_paths", None) or {}
         cp = ""
-        if acl:
-            labels = {"dcsync":"DCSync","dangerous_acl":"Dangerous ACL","owner":"Owner",
-                      "write_property":"WriteProperty","gpo_write":"GPO Write"}
-            rows = "".join(
-                f'<tr><td><strong>{self._e(a.get("sid_name",""))}</strong></td>'
-                f'<td><span class="kc-aflag bad">{labels.get(a.get("type",""),a.get("type",""))}</span></td>'
-                f'<td>{self._e(a.get("right",""))}</td><td>{self._e(a.get("object",""))}</td></tr>'
-                for a in acl)
-            cp = ('<div class="kc-sub-h">Principals with control over Tier-0</div>'
-                  '<p class="kc-sub">Non-Tier-0 principals holding rights that lead to domain takeover '
-                  '(the edges behind the attack paths above).</p>'
-                  '<table class="kc-table"><thead><tr><th>Principal</th><th>Right type</th>'
-                  f'<th>Right</th><th>Over</th></tr></thead><tbody>{rows}</tbody></table>')
+        if cpaths.get("paths"):
+            chains = ""
+            for name, path, is_broad in cpaths["paths"]:
+                if not path:
+                    continue
+                ne = [self._node(path[0][0], "attacker", "☣")]
+                for k, (src, label, dst) in enumerate(path):
+                    last = (k == len(path) - 1)
+                    ne += [label, self._node(dst, "crown" if last else "", "♛" if last else "")]
+                chains += self._chain(ne, "CRITICAL" if is_broad else "HIGH",
+                                      "via membership + ACL/owner edges")
+            extra = cpaths.get("count", 0) - len(cpaths["paths"])
+            more = f'<p class="kc-sub">… and {extra} more principal(s) with a path to Tier-0.</p>' if extra > 0 else ""
+            cp = ('<div class="kc-sub-h">Shortest paths to Domain Admin '
+                  f'<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--faint)">'
+                  f'— {cpaths.get("count",0)} non-privileged principal(s) can reach Tier-0</span></div>'
+                  f'{chains}{more}')
+        if not blocks and not cp:
+            return ""
         return ('<section class="kc-section" id="sec-priv"><h2 class="kc-h2">Privileged accounts'
                 '<span class="tag">click a group — notable = stale / kerberoastable / no-expiry</span></h2>'
                 f'{blocks}{cp}</section>')
@@ -6432,6 +6900,14 @@ def main():
             print(f"[!] ACL analysis error: {e}")
             traceback.print_exc()
 
+    # ── control-path graph closure (who can become DA) ────────────────────────
+    try:
+        ControlPathAnalyzer(ad_conn, data, args).run()
+    except Exception as e:
+        if args.verbose:
+            print(f"[!] control-path analysis error: {e}")
+            traceback.print_exc()
+
     # ── run checks ───────────────────────────────────────────────────────────
     print("[*] Running security checks...")
     engine = CheckEngine(data, args)
@@ -6462,9 +6938,8 @@ def main():
     for f in findings:
         sevc[f.severity] += 1
     print(f"\n{'='*60}")
-    print(f"  POSTURE GRADE : {scores['grade']}  ({scores['grade_label']})")
-    print(f"  Exposure      : {scores['exposure']:3d}/100  (ease of reaching Tier 0)")
-    print(f"  Hygiene debt  : {scores['hygiene']:3d}/100  (misconfig & stale load)")
+    print(f"  EXPOSURE      : {scores['exposure']:3d}/100  ({scores.get('verdict','')})")
+    print(f"  HYGIENE DEBT  : {scores['hygiene']:3d}/100  (misconfig & stale load)")
     print(f"{'='*60}")
     print(f"  Findings : {len(findings)}  "
           f"(CRIT {sevc['CRITICAL']} · HIGH {sevc['HIGH']} · "
@@ -6506,7 +6981,7 @@ def main():
             "tool": TOOL_NAME, "version": VERSION,
             "domain": args.domain, "dc_ip": args.dc_ip, "auth_mode": auth_mode,
             "timestamp": datetime.datetime.now().isoformat(),
-            "scores": {k: scores[k] for k in ("grade","grade_label","exposure","hygiene","cat_counts") if k in scores},
+            "scores": {k: scores[k] for k in ("exposure","hygiene","verdict","cat_counts") if k in scores},
             "findings": [
                 {"rule_id": f.rule_id, "title": f.title,
                  "category": f.category, "operation": op_category(f.rule_id, f.category),
@@ -6525,10 +7000,10 @@ def main():
         cpath = args.csv if args.csv != "__AUTO__" else f"scout_{args.domain}.csv"
         with open(cpath, "w", encoding="utf-8", newline="") as cf:
             w = _csv.writer(cf)
-            w.writerow(["rule_id", "title", "category", "severity", "maturity",
+            w.writerow(["rule_id", "title", "operation", "severity",
                         "points", "mitre", "affected_count", "details", "affected"])
             for f in sorted_findings:
-                w.writerow([f.rule_id, f.title, f.category, f.severity, f.maturity,
+                w.writerow([f.rule_id, f.title, op_category(f.rule_id, f.category), f.severity,
                             f.points, "; ".join(f.mitre), len(f.affected),
                             f.details, " | ".join(map(str, f.affected))])
         print(f"[+] CSV findings saved: {cpath}")
