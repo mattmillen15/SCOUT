@@ -10,22 +10,31 @@ It is built to run from a non-domain-joined box during an internal assessment.
 
 ## Features
 
-- **Four scored categories** — Anomaly, Privileged, Stale, Trust. Each is capped
-  at 100; the global score is the worst category. A separate
-  **CMMI maturity level (1–5)** reflects programme maturity.
+- **Two-axis scoring → A–F grade.** *Exposure* (0–100) is set by the easiest
+  available path to Tier 0, so a hardened domain scores low and a one-step
+  takeover scores high — it actually differentiates environments. *Hygiene debt*
+  (0–100) grades misconfiguration/stale load by prevalence. The two combine into
+  an A–F posture grade. Findings are organized by **operational category**
+  (Privilege Escalation, Credential Access, Lateral Movement, Persistence,
+  Recon & Exposure, Hygiene & Legacy), not a compliance taxonomy.
+- **Paths to Domain Dominance** — BloodHound-style control-path chains
+  (attacker → control edge → … → Tier 0) with the exact tradecraft to walk each.
 - **MITRE ATT&CK mapping** on findings, with a tactic coverage matrix.
-- **Modern escalation coverage** beyond classic checks: resource-based
-  constrained delegation (RBCD), constrained delegation on service accounts,
-  ADCS ESC1/2/3/4/8, computer accounts in privileged groups, orphaned
-  `adminCount`, privileged SID-history backdoors, GPP passwords, DCSync/ACL
-  control paths, and more.
+- **Coverage tuned to internal pentests** — RBCD, constrained delegation on
+  service accounts, ADCS ESC1/2/3/4/8, **SCCM/MECM** site infrastructure,
+  **pre-staged (Pre-Windows 2000) computer accounts**, **password-spray surface**
+  (no/weak lockout), computer accounts in privileged groups, orphaned
+  `adminCount`, privileged SID-history, GPP passwords, WSUS-over-HTTP,
+  Kerberoasting/AS-REP, coercion/relay (signing, LLMNR/NBT-NS, spooler/WebClient),
+  and DCSync/ACL control paths. Watered-down/non-actionable checks are omitted by
+  design.
 - **Kerberos that works against hardened DCs.** SCOUT requests the TGT itself
   from a password, NT hash (overpass-the-hash) or AES key, then binds with
   GSS-SPNEGO. This satisfies *LDAP signing required* and, over plain 389,
   sidesteps *LDAPS channel binding (EPA)*. ccache reuse is also supported.
 - **Interactive HTML report** — click any finding for evidence, copy-ready
   exploitation commands, remediation and affected objects; severity/category
-  filters, search, ATT&CK coverage, prioritised action plan, light/dark theme
+  filters, search, ATT&CK coverage, prioritized action plan, light/dark theme
   and print-to-PDF. Plus machine-readable JSON and CSV for tracking over time.
 
 ## Install
@@ -84,9 +93,9 @@ usable credentials are present, SCOUT transparently upgrades to Kerberos.
 - `scout_<domain>_<ts>.html` — the primary interactive deliverable.
 - `--json` / `--csv` — findings for diffing or tracking across scans.
 
-## Scope and authorisation
+## Scope and authorization
 
-SCOUT is for **authorised** security assessments only. It reads directory data
+SCOUT is for **authorized** security assessments only. It reads directory data
 with the rights of the account you supply; it does not modify the directory.
 
 ## License

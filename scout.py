@@ -3,11 +3,13 @@
 SCOUT - Security Configuration Observation & Understanding Tool
 Active Directory security assessment for non-domain-joined Linux operators.
 
-Four risk categories (Anomaly, Privileged, Stale, Trust) with 0-100 scoring,
-a CMMI maturity model, MITRE ATT&CK mapping and modern-escalation
-coverage (RBCD, constrained delegation, ADCS ESC, privileged SID-history). Data
-is collected over LDAP/LDAPS; SMB/SYSVOL checks use impacket where available.
-Outputs an interactive single-file HTML report plus JSON and CSV.
+Operator-oriented internal AD assessment: control-path / domain-dominance
+analysis, ADCS (ESC1-4/8), SCCM, WSUS, Kerberoasting/AS-REP, GPP/LAPS, RBCD,
+pre-staged computer accounts, coercion/relay and spray surface, with MITRE
+ATT&CK mapping. Scored on two axes — Exposure (easiest path to Tier 0) and
+Hygiene debt — combined into an A-F posture grade (not a saturating gauge).
+Data is collected over LDAP/LDAPS; SMB/SYSVOL checks use impacket where
+available. Outputs an interactive single-file HTML report plus JSON and CSV.
 
 Auth options (impacket / bloodhound-python style):
   -u user -p pass         -d domain.local --dc-ip 10.0.0.1
@@ -124,7 +126,7 @@ SCHEMA_VERSIONS = {13:"2000",30:"2003",31:"2003R2",44:"2008",47:"2008R2",
 FUNCTIONAL_LEVELS = {0:"2000",1:"2003 Interim",2:"2003",3:"2008",
                      4:"2008R2",5:"2012",6:"2012R2",7:"2016/2019/2022"}
 
-# ── Rule catalogue: id -> (title, category, points, severity) ─────────────────
+# ── Rule catalog: id -> (title, category, points, severity) ─────────────────
 # severity: INFO LOW MEDIUM HIGH CRITICAL
 RULES: Dict[str, Tuple[str, str, int, str]] = {
     # Anomaly
@@ -193,7 +195,7 @@ RULES: Dict[str, Tuple[str, str, int, str]] = {
     "A-BackupMetadata":       ("Backup metadata/tombstone accessible","Anomaly",10,"MEDIUM"),
     "A-AuditDC":              ("Insufficient audit policy on domain controllers","Anomaly",5,"LOW"),
     "A-AuditPowershell":      ("PowerShell script block logging not enabled","Anomaly",5,"LOW"),
-    "A-AnonymousAuthorizedGPO":("Anonymous principal authorised on GPO","Anomaly",15,"HIGH"),
+    "A-AnonymousAuthorizedGPO":("Anonymous principal authorized on GPO","Anomaly",15,"HIGH"),
     "A-LimitBlankPasswordUse":("Blank passwords accessible from network","Anomaly",25,"HIGH"),
     "A-WSUS-SslProtocol":     ("WSUS using weak SSL/TLS protocol","Anomaly",10,"MEDIUM"),
     # Privileged
@@ -293,7 +295,7 @@ RULES: Dict[str, Tuple[str, str, int, str]] = {
     "T-SIDFiltering":         ("SID filtering not enabled on trust","Trust",25,"HIGH"),
     "T-SIDHistoryDangerous":  ("Dangerous SID history across trust boundary","Trust",50,"CRITICAL"),
     "T-SIDHistorySameDomain": ("SID history within same domain","Trust",10,"MEDIUM"),
-    "T-SIDHistoryUnknownDomain":("SID history from unrecognised domain","Trust",10,"MEDIUM"),
+    "T-SIDHistoryUnknownDomain":("SID history from unrecognized domain","Trust",10,"MEDIUM"),
     "T-TGTDelegation":        ("TGT delegation enabled on trust","Trust",50,"CRITICAL"),
     "T-AzureADSSO":           ("Azure AD Seamless SSO account misconfigured","Trust",25,"HIGH"),
     "T-ScriptOutOfDomain":    ("Login scripts referenced from outside the domain","Trust",10,"MEDIUM"),
@@ -333,6 +335,9 @@ RULES: Dict[str, Tuple[str, str, int, str]] = {
     "A-NTLMAudit":            ("NTLM auditing not enabled (RestrictSendingNTLMTraffic)","Anomaly",5,"LOW"),
     "A-DSRMLogon":            ("DSRM administrator allowed to log on over the network","Anomaly",25,"HIGH"),
     "A-CertTemplateESC4":     ("Certificate template ACL writable by low-privileged principal (ESC4)","Anomaly",50,"CRITICAL"),
+    "A-SCCM":                 ("SCCM/MECM site infrastructure exposed (relay / NAA / PXE attack surface)","Anomaly",40,"HIGH"),
+    "A-Pre2kComputer":        ("Pre-created (pre-Windows 2000) computer accounts with a predictable password","Anomaly",50,"HIGH"),
+    "A-WeakLockout":          ("No / weak account-lockout policy (password spraying viable)","Anomaly",25,"HIGH"),
 }
 
 # Field/army palette — oxide red, rust, mustard/brass, olive drab, field grey.
@@ -359,7 +364,7 @@ MATURITY_DESC = {
     4: "Controls are measured and managed; detection and prevention are effective "
        "(SOC rules, security GPOs, smart-card 2FA, bastion).",
     5: "Continuous improvement and threat hunting. Persistence and cross-domain "
-       "movement are actively detected; ACL paths are analysed.",
+       "movement are actively detected; ACL paths are analyzed.",
 }
 RULE_MATURITY: Dict[str, int] = {
     # Level 1 — fix immediately (domain-takeover class)
@@ -474,6 +479,9 @@ RULE_MITRE: Dict[str, List[str]] = {
     "P-RecoveryModeUnprotected": ["T1556: Modify Authentication Process"],
     "S-DesEnabled": ["T1558.003: Kerberoasting (DES)"],
     "A-AeA": ["T1558: Steal/Forge Kerberos Tickets"],
+    "A-SCCM": ["T1557.001: SMB Relay", "T1078: Valid Accounts (NAA)", "T1602: Data from Config Repo"],
+    "A-Pre2kComputer": ["T1078: Valid Accounts", "T1110: Brute Force"],
+    "A-WeakLockout": ["T1110.003: Password Spraying"],
     "P-ExchangePrivEsc": ["T1222.001: ACL Modification", "T1098: Account Manipulation"],
 }
 
@@ -500,6 +508,94 @@ def scaled_points(rule_id: str, base_points: int, n_affected: int) -> int:
         per, cap = RULE_SCALE[rule_id]
         return max(base_points if n_affected else 0, min(cap, per * n_affected))
     return base_points
+
+# ── Operational categories — how a pentester groups findings during an engagement
+#    (not the internal A/P/S/T taxonomy). Used only for report grouping/filtering.
+OPCAT_ORDER = ["Privilege Escalation", "Credential Access", "Lateral Movement",
+               "Persistence", "Recon & Exposure", "Hygiene & Legacy"]
+OPCAT_COLOUR = {
+    "Privilege Escalation":"#bd4234", "Credential Access":"#cb7a2f",
+    "Lateral Movement":"#5d7a86", "Persistence":"#8a6d4f",
+    "Recon & Exposure":"#6f8f3f", "Hygiene & Legacy":"#8c917a",
+}
+OP_CATEGORY = {
+    # Privilege escalation → Tier 0
+    "P-DCSync":"Privilege Escalation","P-DangerousACLDomain":"Privilege Escalation",
+    "P-DangerousACLDA":"Privilege Escalation","P-DangerousACLGPO":"Privilege Escalation",
+    "P-WriteToPrivGroup":"Privilege Escalation","P-OwnsPrivObject":"Privilege Escalation",
+    "P-ModifiableGPO":"Privilege Escalation","P-ServiceDomainAdmin":"Privilege Escalation",
+    "P-ComputerInPrivGroup":"Privilege Escalation","P-UnconstrainedDelegation":"Privilege Escalation",
+    "P-ConstrainedDelegService":"Privilege Escalation","P-RBCD":"Privilege Escalation",
+    "P-RBCD-Dangerous":"Privilege Escalation","P-DelegationDCt2a4d":"Privilege Escalation",
+    "P-DelegationDCa2d2":"Privilege Escalation","P-DangerousExtendedRight":"Privilege Escalation",
+    "P-MachineAccountQuota":"Privilege Escalation","P-DNSAdmin":"Privilege Escalation",
+    "P-ExchangePrivEsc":"Privilege Escalation","A-MembershipEveryone":"Privilege Escalation",
+    "P-AdminNum":"Privilege Escalation","P-SchemaAdmin":"Privilege Escalation",
+    "A-AdminSDHolder":"Privilege Escalation","P-DelegationEveryone":"Privilege Escalation",
+    "P-PrivilegeEveryone":"Privilege Escalation","A-BadSuccessor":"Privilege Escalation",
+    "A-CertTempCustomSubject":"Privilege Escalation","A-CertTempAnyPurpose":"Privilege Escalation",
+    "A-CertTempAgent":"Privilege Escalation","A-CertTemplateESC4":"Privilege Escalation",
+    "A-CertEnrollHttp":"Privilege Escalation",
+    # Credential access / harvesting
+    "P-GPPPassword":"Credential Access","A-LAPS-Not-Installed":"Credential Access",
+    "A-LAPS-Joined-Computers":"Credential Access","A-LocalAdminPassword":"Credential Access",
+    "A-ReversiblePwd":"Credential Access","S-Reversible":"Credential Access",
+    "S-C-Reversible":"Credential Access","A-LMHashAuthorized":"Credential Access",
+    "A-WDigest":"Credential Access","S-Kerberoastable":"Credential Access",
+    "S-KerberoastableAdmin":"Credential Access","P-Kerberoasting":"Credential Access",
+    "S-NoPreAuth":"Credential Access","S-NoPreAuthAdmin":"Credential Access",
+    "S-DesEnabled":"Credential Access","P-AdminCountOrphan":"Credential Access",
+    "A-Pre2kComputer":"Credential Access",
+    # Lateral movement / relay / coercion
+    "A-DCLdapSign":"Lateral Movement","A-DCLdapsChannelBinding":"Lateral Movement",
+    "A-LDAPSigningDisabled":"Lateral Movement","A-SMB2SignatureNotRequired":"Lateral Movement",
+    "A-SMB2SignatureNotEnabled":"Lateral Movement","A-LLMNR":"Lateral Movement",
+    "A-NBTNSDisabled":"Lateral Movement","A-LMCompatibilityLevel":"Lateral Movement",
+    "A-DC-Spooler":"Lateral Movement","A-DC-WebClient":"Lateral Movement",
+    "A-DC-Coerce":"Lateral Movement","A-WSUS-HTTP":"Lateral Movement","A-SCCM":"Lateral Movement",
+    "S-SMB-v1":"Lateral Movement","S-Vuln-MS17_010":"Lateral Movement","A-HardenedPaths":"Lateral Movement",
+    "A-DnsZoneAUCreateChild":"Lateral Movement","A-DnsZoneUpdate1":"Lateral Movement",
+    "T-SIDFiltering":"Lateral Movement","T-TGTDelegation":"Lateral Movement","T-AzureADSSO":"Lateral Movement",
+    "T-Downlevel":"Lateral Movement",
+    # Persistence
+    "A-Krbtgt":"Persistence","S-SIDHistory":"Persistence","S-SIDHistoryPrivileged":"Persistence",
+    "T-SIDHistoryDangerous":"Persistence","A-DSRMLogon":"Persistence","S-Vuln-MS14-068":"Persistence",
+    # Recon & exposure
+    "A-NullSession":"Recon & Exposure","A-RootDseAnonBinding":"Recon & Exposure",
+    "A-PreWin2000Anonymous":"Recon & Exposure","A-PreWin2000AuthenticatedUsers":"Recon & Exposure",
+    "A-PreWin2000Other":"Recon & Exposure","A-DsHeuristicsAnonymous":"Recon & Exposure",
+    "A-RestrictRemoteSAM":"Recon & Exposure","A-Guest":"Recon & Exposure",
+    # Hygiene & legacy
+    "A-MinPwdLen":"Hygiene & Legacy","A-PwdComplexity":"Hygiene & Legacy","A-PwdHistory":"Hygiene & Legacy",
+    "A-PwdMaxAge":"Hygiene & Legacy","A-PwdGPO":"Hygiene & Legacy","A-WeakLockout":"Hygiene & Legacy",
+    "S-Inactive":"Hygiene & Legacy","S-C-Inactive":"Hygiene & Legacy","S-DC-Inactive":"Hygiene & Legacy",
+    "S-DC-NotUpdated":"Hygiene & Legacy","S-PwdNeverExpires":"Hygiene & Legacy",
+    "S-PwdNotRequired":"Hygiene & Legacy","S-PwdLastSet-45":"Hygiene & Legacy",
+    "S-PwdLastSet-90":"Hygiene & Legacy","S-PwdLastSet-DC":"Hygiene & Legacy",
+    "S-AesNotEnabled":"Hygiene & Legacy","A-AeA":"Hygiene & Legacy","S-OS-XP":"Hygiene & Legacy",
+    "S-OS-Vista":"Hygiene & Legacy","S-OS-NT":"Hygiene & Legacy","S-OS-W10":"Hygiene & Legacy",
+    "S-FunctionalLevel1":"Hygiene & Legacy","S-FunctionalLevel3":"Hygiene & Legacy",
+    "P-Inactive":"Hygiene & Legacy","P-AdminPwdTooOld":"Hygiene & Legacy","P-ProtectedUsers":"Hygiene & Legacy",
+}
+def op_category(rule_id: str, category: str) -> str:
+    if rule_id in OP_CATEGORY:
+        return OP_CATEGORY[rule_id]
+    # sensible fallback by internal category
+    return {"Privileged":"Privilege Escalation","Stale":"Hygiene & Legacy",
+            "Trust":"Lateral Movement"}.get(category, "Recon & Exposure")
+
+# Findings that are not actionable on an offensive engagement (DR/availability/
+# defensive-logging hygiene). Suppressed so the report stays operator-relevant.
+SUPPRESSED_RULES = {
+    "P-RecycleBin", "A-NotEnoughDC", "S-KerberosArmoring", "S-KerberosArmoringDC",
+    "A-PowerShellLogging", "A-PowerShellTranscript", "A-CredentialGuard",
+    "A-AuditPowershell", "A-AuditDC", "A-PrivilegeAudit", "A-NTLMAudit",
+    "P-UnprotectedOU", "S-DC-SubnetMissing", "S-PrimaryGroup", "S-C-PrimaryGroup",
+    "S-Duplicate", "S-Domain$$$", "A-SmartCardPwdRotation", "A-SmartCardRequired",
+    "A-NoServicePolicy", "A-BackupMetadata", "S-DefaultOUChanged", "S-JavaSchema",
+    "S-TerminalServicesGPO", "S-ADRegistration", "S-FolderOptions", "S-FirewallScript",
+    "S-DefenderASR", "P-OperatorsEmpty", "A-DnsZoneTransfert", "A-DnsZoneUpdate2",
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RULE DOCUMENTATION — pentester-focused detail surfaced in the report's
@@ -1241,6 +1337,51 @@ RULE_DOCS: Dict[str, Dict[str, Any]] = {
         "remediation": [
             "Restrict template ACLs to specific enrollment groups; remove write rights from broad principals.",
             "Enable manager approval on sensitive templates.",
+        ],
+    },
+    "A-SCCM": {
+        "description": "Microsoft Configuration Manager (SCCM/MECM) site infrastructure is published in AD.",
+        "why": "SCCM is a top internal-pentest target: management points accept NTLM and are relayable (to MSSQL/site DB or SMB), Network Access Accounts (NAA) and task-sequence/PXE secrets are recoverable and often over-privileged, and the site DB or a primary site server frequently yields domain-wide admin. Site data published to AD gives an unauthenticated/low-priv attacker the server inventory to start.",
+        "technical": "System Management container (CN=System Management,CN=System,<domain>) holds mSSMSManagementPoint / mSSMSSite objects (dNSHostName, mSSMSSiteCode). The container ACL grants client publishing rights.",
+        "exploit": [
+            "SharpSCCM.exe get site-info / get naa     # recover Network Access Account creds",
+            "sccmhunter.py find -u user -p pass -d domain -dc-ip <dc>",
+            "ntlmrelayx.py -t mssql://<sccm-db> -smb2support   # relay MP/site server auth",
+            "PXEthief / pxethiefy   # recover task-sequence secrets from PXE",
+        ],
+        "remediation": [
+            "Enforce SMB signing + Extended Protection on MP/site/DB servers; enable MSSQL EPA.",
+            "Remove the legacy Network Access Account; use Enhanced HTTP / PKI.",
+            "Require a PXE password and disable unknown-computer support where unused.",
+            "Tier site servers/DB as Tier-0; restrict the System Management container ACL.",
+        ],
+        "refs": ["https://github.com/Mayyhem/SharpSCCM", "https://github.com/garrettfoster13/sccmhunter"],
+    },
+    "A-Pre2kComputer": {
+        "description": "Pre-created (Pre-Windows 2000) computer accounts that still hold a predictable, name-derived password.",
+        "why": "A computer account staged with 'Assign this computer account as a pre-Windows 2000 computer' gets its password set to the lowercase short host name (sAMAccountName without the trailing $). Until a real host joins, anyone can authenticate AS that computer — get a TGT, read LAPS, target RBCD/shadow-credentials, or kerberoast — from an unauthenticated position.",
+        "technical": "Computer objects with logonCount=0, userAccountControl WORKSTATION_TRUST set, often PASSWD_NOTREQD, and pwdLastSet≈whenCreated. Password guess = lower(name without $).",
+        "exploit": [
+            "pre2k unauth -d domain.local -dc-ip <dc>          # spray default creds",
+            "pre2k auth -u 'HOST$' -p host -d domain.local -dc-ip <dc>",
+            "getTGT.py 'domain.local/HOST$:host'               # then act as the computer",
+        ],
+        "remediation": [
+            "Reset or delete unused pre-staged computer accounts.",
+            "Pre-stage with a random password and the correct joining identity, not the Pre-Windows 2000 option.",
+        ],
+        "refs": ["https://github.com/garrettfoster13/pre2k"],
+    },
+    "A-WeakLockout": {
+        "description": "The domain (or a fine-grained policy) has no — or a very high — account-lockout threshold.",
+        "why": "Without lockout, password spraying is essentially free: an attacker tries one common password against every account each observation window and rarely trips an alert. This is the single most reliable initial-access technique on internal engagements.",
+        "technical": "domain lockoutThreshold = 0 (no lockout) or > 10; also check fine-grained PSOs (msDS-LockoutThreshold).",
+        "exploit": [
+            "nxc smb <dc> -u users.txt -p 'Season2025!' --continue-on-success",
+            "kerbrute passwordspray -d domain.local users.txt 'Welcome1!'",
+        ],
+        "remediation": [
+            "Set a lockout threshold (e.g. 5–10) with a sane observation/reset window, or deploy smart lockout / Azure password protection.",
         ],
     },
 }
@@ -2052,7 +2193,7 @@ class ADData:
             "msDS-AllowedToDelegateTo","msDS-AllowedToActOnBehalfOfOtherIdentity",
             "ms-Mcs-AdmPwdExpirationTime","msLAPS-PasswordExpirationTime",
             "distinguishedName","msDS-IsRODC","primaryGroupID","whenCreated",
-            "objectSid","name","dNSHostName"])
+            "objectSid","name","dNSHostName","logonCount"])
 
     # ── groups ────────────────────────────────────────────────────────────────
 
@@ -2222,6 +2363,8 @@ class CheckEngine:
         return RULES.get(rule_id, (rule_id, "Anomaly", 5, "MEDIUM"))
 
     def _add(self, rule_id: str, details: str = "", affected: List[str] = None):
+        if rule_id in SUPPRESSED_RULES:   # non-actionable on an engagement
+            return
         t, cat, pts, sev = self._rule(rule_id)
         aff = _dedup_keep_order(affected or [])
         self.findings.append(Finding(
@@ -2252,6 +2395,83 @@ class CheckEngine:
         self._m_computer_in_priv_group()
         self._m_admincount_orphan()
         self._m_sidhistory_privileged()
+        self._m_sccm()
+        self._m_pre2k_computers()
+        self._m_weak_lockout()
+
+    def _m_sccm(self):
+        """SCCM/MECM publishes management points + site servers to AD — a prime
+        relay / NAA / PXE target. Surface them so the operator knows to go after it."""
+        base = f"CN=System Management,CN=System,{self.d.base}"
+        try:
+            objs = self.d.conn.paged_search(
+                base, "(|(objectClass=mSSMSManagementPoint)(objectClass=mSSMSSite)"
+                      "(objectClass=mSSMSRoamingBoundaryRange))",
+                ["dNSHostName", "mSSMSSiteCode", "mSSMSMPName", "name", "cn"])
+        except Exception:
+            objs = []
+        servers, sites = [], set()
+        for o in objs:
+            a = o["attrs"]
+            host = get_str(a, "dNSHostName") or get_str(a, "mSSMSMPName") or get_str(a, "cn")
+            sc = get_str(a, "mSSMSSiteCode")
+            if sc:
+                sites.add(sc)
+            if host:
+                servers.append(f"{host}{(' ['+sc+']') if sc else ''}")
+        if servers:
+            self._add("A-SCCM",
+                      f"SCCM/MECM site infrastructure is published in AD "
+                      f"(sites: {', '.join(sorted(sites)) or 'n/a'}). Management points and "
+                      "site servers accept NTLM and are commonly relayable; the Network Access "
+                      "Account, PXE/task-sequence secrets and the site database are frequent "
+                      "paths to domain-wide compromise. Enumerate and attack with SharpSCCM / "
+                      "sccmhunter, and check MP/DB SMB+MSSQL signing for relay.",
+                      _dedup_keep_order(servers))
+
+    def _m_pre2k_computers(self):
+        """Pre-staged 'Pre-Windows 2000' computer accounts still hold a password
+        equal to the lowercase short hostname — authenticate as the computer."""
+        affected = []
+        for c in self.d.computers:
+            a = c["attrs"]
+            uac = get_int(a, "userAccountControl")
+            if uac_has(uac, UAC_ACCOUNTDISABLE):
+                continue
+            if not uac_has(uac, UAC_WORKSTATION_TRUST):
+                continue
+            # canonical signature: PASSWD_NOTREQD on a never-logged-on workstation
+            never_used = get_int(a, "logonCount", 0) == 0
+            if uac_has(uac, UAC_PASSWD_NOTREQD) and never_used:
+                sam = get_str(a, "sAMAccountName")
+                guess = sam[:-1].lower() if sam.endswith("$") else sam.lower()
+                affected.append(f"{sam} (try password: {guess})")
+        if affected:
+            self._add("A-Pre2kComputer",
+                      "Pre-created computer accounts carry PASSWD_NOTREQD and have never logged "
+                      "on — the password is almost certainly the lowercase short hostname "
+                      "(Pre-Windows 2000 pre-staging). Authenticate as the computer to obtain a "
+                      "TGT and pivot (LAPS read, RBCD, shadow credentials).",
+                      affected)
+
+    def _m_weak_lockout(self):
+        """No / weak lockout = password spraying is free."""
+        dom = self.d.domain_obj
+        if not dom:
+            return
+        thr = get_int(dom["attrs"], "lockoutThreshold", -1)
+        if thr == 0:
+            self._add("A-WeakLockout",
+                      "Account lockout threshold is 0 — accounts NEVER lock out. Domain-wide "
+                      "password spraying can run unthrottled. This is the most reliable initial-"
+                      "access path on internal tests.",
+                      ["lockoutThreshold=0 (disabled)"])
+        elif thr > 10:
+            self._add("A-WeakLockout",
+                      f"Account lockout threshold is {thr} (high) — slow password spraying stays "
+                      "under the limit. Lower it and pair with smart-lockout / Azure password "
+                      "protection.",
+                      [f"lockoutThreshold={thr}"])
 
     # privileged RIDs and well-known built-in SIDs that must never appear in
     # an account's SID history (classic stealth-persistence backdoor).
@@ -2488,7 +2708,7 @@ class CheckEngine:
         # An anonymous LDAP bind always succeeds at the protocol level in AD.
         # We only flag this if the anonymous session can actually *read* directory objects
         # (e.g., user/computer accounts) — that is a genuine misconfiguration.
-        # Simply binding as anonymous and reading rootDSE is normal behaviour.
+        # Simply binding as anonymous and reading rootDSE is normal behavior.
         try:
             srv = Server(self.args.dc_ip, port=389, get_info=ALL, connect_timeout=5)
             tc  = Connection(srv, auto_bind=True)
@@ -2514,7 +2734,7 @@ class CheckEngine:
 
     def _a_root_dse_anon(self):
         # rootDSE is publicly readable on all AD servers by design (RFC 4512).
-        # This is expected behaviour, not a vulnerability; skip to avoid noise.
+        # This is expected behavior, not a vulnerability; skip to avoid noise.
         pass
 
     def _a_ds_heuristics(self):
@@ -4019,7 +4239,7 @@ class CheckEngine:
                       "Recommended value is 5 (NTLMv2 only, refuse LM/NTLMv1). "
                       "NTLMv1 hashes are trivially cracked or relayed (e.g. Responder).",
                       [f"LmCompatibilityLevel={val}"])
-        # If `val is None` (not configured), keep silent. The default behaviour
+        # If `val is None` (not configured), keep silent. The default behavior
         # on supported OS versions is NTLMv2-only — flagging absence here was
         # responsible for false-positive noise on healthy domains.
 
@@ -4606,7 +4826,7 @@ def _guid_from_bytes(b: bytes) -> str:
 
 
 class ACLAnalyzer:
-    """Fetches and analyses DACLs on high-value AD objects for dangerous ACEs."""
+    """Fetches and analyzes DACLs on high-value AD objects for dangerous ACEs."""
 
     def __init__(self, conn: "ADConnection", data: "ADData", args):
         self.conn  = conn
@@ -4871,6 +5091,8 @@ class SMBChecker:
         self.findings = findings
 
     def _add(self, rule_id: str, details: str = "", affected: List[str] = None):
+        if rule_id in SUPPRESSED_RULES:
+            return
         t, cat, pts, sev = RULES.get(rule_id,
                            (rule_id, "Anomaly", 5, "MEDIUM"))
         aff = _dedup_keep_order(affected or [])
@@ -4976,24 +5198,110 @@ class SMBChecker:
 # RISK SCORER
 # ─────────────────────────────────────────────────────────────────────────────
 
-class RiskScorer:
-    def __init__(self, findings: List[Finding]):
-        self.findings = findings
+# ── SCOUT risk model ──────────────────────────────────────────────────────────
+# Two orthogonal axes instead of one saturating gauge:
+#   EXPOSURE (0-100) = how reachable Tier-0 is, defined by the *easiest* attack
+#       path available to the operator. A domain with one ESC1 template and a
+#       domain with GPP+DCSync are both bad, but a hardened domain with no path
+#       scores near zero — so the number actually differentiates.
+#   HYGIENE DEBT (0-100) = prevalence-graded misconfiguration/stale debt, so size
+#       and sloppiness of the estate move the number continuously.
+# A combined A-F POSTURE GRADE is the headline. (No 4x cap-at-100 "max" gauge.)
 
-    def score(self) -> Dict[str, int]:
-        # Scoring model: per-category danger score, each capped at 100;
-        # the global score is the MAX of the four (worst category wins).
-        cats = defaultdict(int)
-        for cat in ("Anomaly", "Privileged", "Stale", "Trust"):
-            cats[cat] = 0
+# rule_id -> attacker effort to convert it into Tier-0 access (higher = easier).
+EXPOSURE_WEIGHTS = {
+    # one wrong ACE / unauth -> domain compromise
+    "P-DCSync":100, "P-DangerousACLDomain":100, "P-DangerousACLDA":100,
+    "P-WriteToPrivGroup":100, "A-MembershipEveryone":100, "P-RBCD-Dangerous":100,
+    "P-OwnsPrivObject":97, "P-DelegationEveryone":96, "P-PrivilegeEveryone":94,
+    "P-DelegationKeyAdmin":92,
+    # any authenticated user, trivially
+    "P-GPPPassword":95, "A-CertTempCustomSubject":95, "P-ComputerInPrivGroup":94,
+    "S-SIDHistoryPrivileged":94, "A-CertTemplateESC4":92, "P-ServiceDomainAdmin":92,
+    "P-ModifiableGPO":90, "P-DangerousExtendedRight":90, "S-Vuln-MS14-068":90,
+    # reliable but needs cracking / coercion / a foothold
+    "S-KerberoastableAdmin":85, "S-NoPreAuthAdmin":85, "A-CertEnrollHttp":85,
+    "P-UnconstrainedDelegation":84, "A-CertTempAgent":84, "A-CertTempAnyPurpose":82,
+    "T-SIDHistoryDangerous":82, "A-DC-Coerce":80, "T-TGTDelegation":78,
+    "S-Vuln-MS17_010":78, "P-DelegationDCt2a4d":82, "P-DelegationDCa2d2":82,
+    # moderate / multi-step
+    "P-DNSAdmin":70, "A-DnsZoneAUCreateChild":70, "A-WSUS-HTTP":70,
+    "P-Kerberoasting":66, "A-WDigest":64, "A-LMCompatibilityLevel":64,
+    "A-LMHashAuthorized":62, "P-ExchangePrivEsc":80, "A-BadSuccessor":88,
+    # foothold-dependent / lower leverage
+    "S-Kerberoastable":55, "S-NoPreAuth":52, "P-ConstrainedDelegService":55,
+    "P-RBCD":55, "A-ReversiblePwd":52, "S-Reversible":52, "P-MachineAccountQuota":48,
+    "A-DCLdapSign":45, "A-SMB2SignatureNotRequired":45, "A-DCLdapsChannelBinding":42,
+    "S-DesEnabled":45, "A-NullSession":40, "P-AdminCountOrphan":35,
+    "A-SCCM":72, "A-Pre2kComputer":78, "A-WeakLockout":40,
+}
+
+# rule_id -> (mode, weight). mode 'flat' adds weight; mode 'pct_users'/'pct_comps'
+# scales weight by the fraction of (enabled) users/computers affected.
+HYGIENE_WEIGHTS = {
+    "S-Inactive":("pct_users",16), "S-PwdLastSet-90":("pct_users",12),
+    "S-PwdLastSet-45":("pct_users",6), "S-PwdNeverExpires":("pct_users",8),
+    "S-PwdNotRequired":("pct_users",10), "S-AesNotEnabled":("pct_users",6),
+    "S-C-Inactive":("pct_comps",14), "S-C-PrimaryGroup":("pct_comps",4),
+    "A-LAPS-Not-Installed":("flat",12), "A-LAPS-Joined-Computers":("pct_comps",8),
+    "A-LocalAdminPassword":("flat",12), "S-OS-NT":("flat",14), "S-OS-XP":("flat",12),
+    "S-OS-Vista":("flat",8), "S-OS-W10":("flat",4), "S-SMB-v1":("flat",10),
+    "A-MinPwdLen":("flat",8), "A-PwdComplexity":("flat",6), "A-PwdHistory":("flat",3),
+    "A-PwdMaxAge":("flat",3), "A-Krbtgt":("flat",8), "A-DCLdapSign":("flat",6),
+    "A-SMB2SignatureNotRequired":("flat",6), "A-SMB2SignatureNotEnabled":("flat",8),
+    "A-ReversiblePwd":("flat",8), "S-DesEnabled":("flat",6), "P-RecycleBin":("flat",3),
+    "A-Guest":("flat",4), "P-AdminNum":("flat",6), "P-AdminPwdTooOld":("flat",5),
+    "P-Inactive":("flat",6), "S-FunctionalLevel1":("flat",10), "S-FunctionalLevel3":("flat",5),
+    "S-DC-NotUpdated":("flat",5), "A-LLMNR":("flat",4), "A-NBTNSDisabled":("flat",3),
+    "A-HardenedPaths":("flat",4), "A-CredentialGuard":("flat",4), "P-ProtectedUsers":("flat",5),
+    "S-SIDHistory":("flat",4), "A-RestrictRemoteSAM":("flat",3), "P-MachineAccountQuota":("flat",5),
+}
+
+GRADE_COLOUR = {"A":"#5f8a3a","B":"#74934a","C":"#cda52b","D":"#cb7a2f","F":"#bd4234"}
+
+
+class RiskScorer:
+    def __init__(self, findings: List[Finding], data=None):
+        self.findings = findings
+        self.data = data
+
+    def exposure(self) -> int:
+        """Easiest path to Tier-0 defines exposure; a little breadth bonus so a
+        domain with many high-leverage paths edges out one with a single path."""
+        if not self.findings:
+            return 0
+        weights = sorted((EXPOSURE_WEIGHTS.get(f.rule_id, 0)
+                          for f in {f.rule_id: f for f in self.findings}.values()),
+                         reverse=True)
+        top = weights[0] if weights else 0
+        if top == 0:
+            return 0
+        breadth = sum(1 for w in weights if w >= 70) - 1
+        return int(min(100, top + min(8, max(0, breadth) * 2)))
+
+    def hygiene(self) -> int:
+        nu = nc = 1
+        if self.data is not None:
+            nu = max(1, sum(1 for u in self.data.users
+                            if not uac_has(get_int(u["attrs"], "userAccountControl"), UAC_ACCOUNTDISABLE)))
+            nc = max(1, sum(1 for c in self.data.computers
+                            if not uac_has(get_int(c["attrs"], "userAccountControl"), UAC_ACCOUNTDISABLE)))
+        debt = 0.0
+        seen = {}
         for f in self.findings:
-            cats[f.category] += f.points
-        for k in list(cats.keys()):
-            cats[k] = min(cats[k], 100)
-        total = max(cats.values()) if cats else 0
-        cats["Total"] = total
-        cats["Maturity"] = self.maturity()
-        return dict(cats)
+            seen.setdefault(f.rule_id, f)
+        for rid, f in seen.items():
+            spec = HYGIENE_WEIGHTS.get(rid)
+            if not spec:
+                continue
+            mode, w = spec
+            if mode == "flat":
+                debt += w
+            elif mode == "pct_users":
+                debt += w * min(1.0, len(f.affected) / nu)
+            elif mode == "pct_comps":
+                debt += w * min(1.0, len(f.affected) / nc)
+        return int(min(100, round(debt)))
 
     def maturity(self) -> int:
         """Achieved CMMI maturity = lowest level still gated by a failing rule
@@ -5003,17 +5311,39 @@ class RiskScorer:
         return min(f.maturity for f in self.findings)
 
     @staticmethod
+    def grade(exposure: int, hygiene: int) -> str:
+        """A-F posture grade — exposure dominates (it's the attacker's reality),
+        hygiene nudges the borderline cases."""
+        if exposure >= 85:           return "F"
+        if exposure >= 60:           return "D"
+        if exposure >= 35:           return "C" if hygiene < 70 else "D"
+        if exposure >= 15:           return "C" if hygiene >= 50 else "B"
+        if hygiene >= 65:            return "C"
+        if hygiene >= 35:            return "B"
+        return "A"
+
+    GRADE_LABEL = {"A":"Hardened","B":"Defensible","C":"Exposed","D":"At risk","F":"Compromisable"}
+
+    def score(self) -> Dict[str, Any]:
+        exp = self.exposure(); hyg = self.hygiene(); g = self.grade(exp, hyg)
+        cat_counts = defaultdict(int)
+        for f in self.findings:
+            cat_counts[f.category] += 1
+        return {
+            "exposure": exp, "hygiene": hyg, "grade": g,
+            "grade_label": self.GRADE_LABEL.get(g, ""),
+            "maturity": self.maturity(),
+            "cat_counts": {c: cat_counts.get(c, 0) for c in ("Anomaly","Privileged","Stale","Trust")},
+        }
+
+    # legacy 0-100 band colour, reused for the exposure/hygiene bars
+    @staticmethod
     def risk_label(score: int) -> Tuple[str, str]:
-        """(label, colour) — 25/50/75/100 risk bands, field palette."""
-        if score >= 75:
-            return "CRITICAL RISK", "#b23a2e"
-        if score >= 50:
-            return "HIGH RISK",     "#c2702a"
-        if score >= 25:
-            return "MEDIUM RISK",   "#c9a227"
-        if score > 0:
-            return "LOW RISK",      "#6f8f3f"
-        return "MINIMAL RISK",      "#6f8f3f"
+        if score >= 75: return "CRITICAL", "#bd4234"
+        if score >= 50: return "HIGH",     "#cb7a2f"
+        if score >= 25: return "MEDIUM",   "#cda52b"
+        if score > 0:   return "LOW",      "#74934a"
+        return "MINIMAL", "#5f8a3a"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5037,7 +5367,6 @@ ATTACK_TACTIC_ORDER = ["Initial Access","Resource Development","Discovery",
                        "Credential Access","Privilege Escalation","Defense Evasion",
                        "Persistence","Lateral Movement"]
 
-# rule_id -> remediation effort tier for the roadmap (default Medium)
 RULE_EFFORT = {
     "A-WDigest":"Low","A-LMCompatibilityLevel":"Low","A-LLMNR":"Low","A-NBTNSDisabled":"Low",
     "A-DCLdapSign":"Low","A-SMB2SignatureNotRequired":"Low","A-SMB2SignatureNotEnabled":"Low",
@@ -5052,151 +5381,166 @@ RULE_EFFORT = {
     "P-ComputerInPrivGroup":"High","P-ServiceDomainAdmin":"High",
 }
 
-# ── Theme — field/army ops console (olive drab + khaki + brass). Dark by
-#    default, with a light variant for print; a clean monochrome print sheet. ──
+# Plain, non-condensed system fonts — a condensed display face made headings look
+# vertically stretched. Used both in CSS and (literally) inside SVG <text>.
+
 _KC_CSS = r"""
 :root{
-  --bg:#13150d; --surface:#1b1e12; --surface2:#222616; --surface3:#2a2f1c;
-  --border:#343a22; --border2:#454d2e; --track:#2c3119;
-  --text:#e8e3d2; --muted:#9aa07f; --faint:#6c7350;
-  --accent:#c2a14e;        /* brass / khaki */
-  --accent2:#7d8c4e;       /* field radio green */
-  --deck:#cdbb8a;          /* painted marking tan */
-  --crit:#b23a2e; --high:#c2702a; --med:#c9a227; --low:#6f8f3f; --info:#8a8f78;
-  --ok:#7a9a4e; --warn:#c9a227; --bad:#b23a2e;
-  --shadow:0 6px 26px rgba(0,0,0,.5);
+  --bg:#15170f; --surface:#1c1f13; --surface2:#242818; --surface3:#2d321f;
+  --border:#363c23; --border2:#4a5230; --track:#2f341c;
+  --text:#e9e4d3; --muted:#a0a585; --faint:#717954;
+  --accent:#c7a64f; --accent2:#869150; --deck:#d3c193;
+  --crit:#bd4234; --high:#cb7a2f; --med:#cda52b; --low:#74934a; --info:#8c917a;
+  --ok:#82a155; --warn:#cda52b; --bad:#bd4234;
+  --shadow:0 4px 22px rgba(0,0,0,.42);
   --mono:'JetBrains Mono','SFMono-Regular',ui-monospace,Menlo,Consolas,monospace;
-  --sans:'Inter','Segoe UI',system-ui,-apple-system,sans-serif;
-  --head:'Oswald','Roboto Condensed','Arial Narrow',var(--sans);
-  --r:7px; --r-sm:4px;
+  --sans:'Segoe UI','Helvetica Neue',Arial,system-ui,-apple-system,sans-serif;
+  --r:8px; --r-sm:4px;
 }
 html[data-theme=light]{
-  --bg:#dcd8c4; --surface:#ebe7d6; --surface2:#e2ddc8; --surface3:#d6d0b8;
-  --border:#bdb491; --border2:#a89f7c; --track:#cfc8ad;
-  --text:#23270f; --muted:#5d6244; --faint:#7c8160;
-  --accent:#7a5f1e; --accent2:#566b2f; --deck:#5a5230;
-  --shadow:0 4px 16px rgba(60,55,30,.18);
+  --bg:#dedac6; --surface:#edead8; --surface2:#e4dfc9; --surface3:#d8d2b9;
+  --border:#c0b794; --border2:#aaa07c; --track:#d0c9ae;
+  --text:#21250e; --muted:#585d40; --faint:#787d5c;
+  --accent:#7c611f; --accent2:#536530; --deck:#5a5230;
+  --shadow:0 3px 14px rgba(60,55,30,.16);
 }
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:var(--sans);background:var(--bg);color:var(--text);font-size:14px;
-  line-height:1.55;-webkit-font-smoothing:antialiased;
-  background-image:radial-gradient(1200px 700px at 85% -8%,rgba(194,161,78,.05),transparent 70%);}
-a{color:var(--accent);text-decoration:none}
-a:hover{text-decoration:underline}
-code{font-family:var(--mono);font-size:.86em;background:var(--surface3);
-  padding:1px 6px;border-radius:var(--r-sm);color:var(--deck)}
+  line-height:1.55;-webkit-font-smoothing:antialiased}
+a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
+code{font-family:var(--mono);font-size:.85em;background:var(--surface3);padding:1px 6px;
+  border-radius:var(--r-sm);color:var(--deck)}
 .kc-mono{font-family:var(--mono);font-size:.88em}
 .kc-muted{color:var(--muted)}
-h1,h2,h3,h4{font-family:var(--head);font-weight:700;letter-spacing:.04em}
+h1,h2,h3,h4{font-weight:700;letter-spacing:.01em}
+.ulabel{font-family:var(--mono);font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint)}
 
-/* ── cover ── */
-.kc-cover{background:linear-gradient(160deg,#1c1f12,#10120b 70%);border-bottom:3px solid var(--accent);
-  position:relative;overflow:hidden}
-html[data-theme=light] .kc-cover{background:linear-gradient(160deg,#cfc8ad,#bdb491 70%)}
-.kc-cover-band{font-family:var(--mono);font-size:11px;letter-spacing:.32em;text-transform:uppercase;
-  color:#13150d;background:repeating-linear-gradient(135deg,var(--accent) 0 14px,#1b1e12 14px 28px);
-  padding:6px 24px;text-align:center;font-weight:700}
-.kc-cover-body{max-width:1180px;margin:0 auto;padding:40px 40px 44px;text-align:center;position:relative;z-index:1}
-.kc-logo{font-size:54px;line-height:1;color:var(--accent);text-shadow:0 2px 0 rgba(0,0,0,.4)}
-.kc-cover h1{font-size:58px;letter-spacing:.22em;margin-top:6px;color:var(--text)}
-.kc-cover-sub{font-family:var(--mono);font-size:12px;letter-spacing:.34em;text-transform:uppercase;
-  color:var(--muted);margin-top:2px}
-.kc-cover-domain{font-family:var(--head);font-size:22px;letter-spacing:.06em;color:var(--deck);margin:18px 0 4px}
-.kc-cover-meta{margin:18px auto 0;border-collapse:collapse;font-size:13px;max-width:520px;width:100%}
-.kc-cover-meta td{padding:5px 14px;border-bottom:1px dashed var(--border2);text-align:left}
-.kc-cover-meta td:first-child{color:var(--muted);text-transform:uppercase;font-size:11px;
-  letter-spacing:.08em;font-family:var(--mono);width:46%}
-.kc-cover-score{display:inline-block;margin-top:22px;border:2px solid;border-radius:10px;padding:10px 26px;background:rgba(0,0,0,.18)}
-.kc-cover-score span{font-family:var(--head);font-size:44px;font-weight:700}
-.kc-cover-score small{display:block;font-family:var(--mono);font-size:11px;letter-spacing:.14em;color:var(--muted)}
+/* ── slim header ── */
+.kc-head{display:flex;align-items:center;gap:14px;padding:14px 26px;
+  background:linear-gradient(180deg,#1d2113,#15170f);border-bottom:1px solid var(--border);position:relative}
+html[data-theme=light] .kc-head{background:linear-gradient(180deg,#d2cbb0,#dedac6)}
+.kc-head::after{content:"";position:absolute;left:0;right:0;bottom:-3px;height:3px;
+  background:repeating-linear-gradient(135deg,var(--accent) 0 16px,#15170f 16px 32px);opacity:.8}
+.kc-head .mark{font-size:26px;color:var(--accent);line-height:1}
+.kc-head .name{font-size:24px;font-weight:800;letter-spacing:.26em;color:var(--text)}
+.kc-head .full{font-size:12px;color:var(--muted);letter-spacing:.02em;border-left:1px solid var(--border2);
+  padding-left:14px;margin-left:2px}
+.kc-head .class{margin-left:auto;font-family:var(--mono);font-size:10px;letter-spacing:.18em;
+  color:#15170f;background:var(--accent);padding:4px 11px;border-radius:3px;font-weight:700}
 
 /* ── sticky nav ── */
-.kc-nav{position:sticky;top:0;z-index:50;display:flex;align-items:center;gap:14px;
-  background:rgba(19,21,13,.94);backdrop-filter:blur(6px);border-bottom:1px solid var(--border);
-  padding:0 20px;height:48px}
-html[data-theme=light] .kc-nav{background:rgba(220,216,196,.95)}
-.kc-nav::after{content:"";position:absolute;left:0;right:0;bottom:-1px;height:2px;opacity:.5;
-  background:repeating-linear-gradient(135deg,var(--accent2) 0 10px,transparent 10px 20px)}
-.kc-nav-brand{font-family:var(--head);letter-spacing:.18em;color:var(--accent);font-weight:700;font-size:16px}
-.kc-nav-links{display:flex;gap:4px;flex:1;overflow:auto}
-.kc-nav-links a{font-family:var(--mono);font-size:11.5px;letter-spacing:.06em;text-transform:uppercase;
+.kc-nav{position:sticky;top:0;z-index:50;display:flex;align-items:center;gap:12px;
+  background:rgba(21,23,15,.95);backdrop-filter:blur(6px);border-bottom:1px solid var(--border);
+  padding:0 26px;height:44px}
+html[data-theme=light] .kc-nav{background:rgba(222,218,198,.96)}
+.kc-nav-links{display:flex;gap:3px;flex:1;overflow:auto}
+.kc-nav-links a{font-family:var(--mono);font-size:11px;letter-spacing:.05em;text-transform:uppercase;
   color:var(--muted);padding:6px 10px;border-radius:var(--r-sm);white-space:nowrap}
 .kc-nav-links a:hover,.kc-nav-links a.active{color:var(--text);background:var(--surface2);text-decoration:none}
-.kc-navb{display:inline-block;margin-left:6px;background:var(--accent);color:#13150d;border-radius:9px;
-  font-size:10px;padding:0 6px;font-weight:700}
+.kc-navb{margin-left:6px;background:var(--accent);color:#15170f;border-radius:9px;font-size:10px;padding:0 6px;font-weight:700}
 .kc-nav-tools{display:flex;gap:6px}
 .kc-iconbtn{background:var(--surface2);border:1px solid var(--border2);color:var(--text);
   width:30px;height:30px;border-radius:var(--r-sm);cursor:pointer;font-size:15px}
 .kc-iconbtn:hover{border-color:var(--accent);color:var(--accent)}
 
-/* ── layout ── */
-.kc-container{max-width:1180px;margin:0 auto;padding:26px 24px 60px}
+/* ── layout — wide ── */
+.kc-container{max-width:1480px;margin:0 auto;padding:24px 28px 64px}
 .kc-section{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);
-  padding:22px 24px;margin-bottom:22px;box-shadow:var(--shadow)}
-.kc-h2{font-size:18px;letter-spacing:.08em;text-transform:uppercase;color:var(--text);
-  padding-bottom:10px;margin-bottom:14px;border-bottom:1px solid var(--border);
-  display:flex;align-items:center;gap:9px}
-.kc-h2 .kc-count{color:var(--muted);font-weight:400;font-size:14px}
-.kc-sub{color:var(--muted);font-size:13px;margin-bottom:14px}
-.kc-sub-h{font-family:var(--head);font-size:14px;letter-spacing:.06em;text-transform:uppercase;
-  color:var(--deck);margin:18px 0 10px}
+  padding:22px 28px;margin-bottom:20px;box-shadow:var(--shadow)}
+.kc-h2{font-size:16px;letter-spacing:.05em;text-transform:uppercase;color:var(--text);
+  padding-bottom:10px;margin-bottom:16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:9px}
+.kc-h2 .kc-count{color:var(--muted);font-weight:400}
+.kc-h2 .tag{margin-left:auto;font-family:var(--mono);font-size:10px;letter-spacing:.1em;
+  text-transform:uppercase;color:var(--faint);font-weight:400}
+.kc-sub{color:var(--muted);font-size:13px;margin-bottom:16px;max-width:980px}
+.kc-sub-h{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--deck);margin:20px 0 10px;font-weight:700}
 .kc-critborder{border-left:3px solid var(--crit)}
 .kc-critsub{color:var(--crit);font-weight:600}
 
-/* ── narrative ── */
-.kc-narrative p{margin-bottom:10px;font-size:14.5px;line-height:1.65}
-.kc-keyrisks{margin-top:18px;background:var(--surface2);border:1px solid var(--border);
-  border-radius:var(--r);padding:14px 18px}
-.kc-keyrisks h3{font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:var(--deck);margin-bottom:8px}
-.kc-keyrisks ul{list-style:none}
-.kc-keyrisks li{padding:5px 0;display:flex;align-items:baseline;gap:8px}
-.kc-dot{width:9px;height:9px;border-radius:50%;flex-shrink:0;display:inline-block;transform:translateY(1px)}
-.kc-kr-sub{color:var(--muted);font-size:12.5px}
-
-/* ── scorecard ── */
-.kc-scorecard{display:grid;grid-template-columns:auto auto 1fr;gap:16px;margin-top:6px}
-@media(max-width:880px){.kc-scorecard{grid-template-columns:1fr}}
-.kc-card{background:var(--surface2);border:1px solid var(--border);border-radius:var(--r);padding:14px 16px}
-.kc-card-h{font-family:var(--mono);font-size:10.5px;letter-spacing:.12em;text-transform:uppercase;
-  color:var(--faint);margin-bottom:8px}
-.kc-card-gauge,.kc-card-donut{text-align:center}
+/* ── summary: scoreband + dossier + narrative ── */
+.kc-scoreband{display:flex;gap:16px;flex-wrap:wrap;align-items:stretch;margin-bottom:18px}
+.kc-grade{flex:0 0 auto;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  width:150px;border-radius:var(--r);color:#15170f;padding:14px}
+.kc-grade .g{font-size:64px;font-weight:800;line-height:1}
+.kc-grade .gl{font-family:var(--mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase;margin-top:2px;font-weight:700}
+.kc-meters{flex:1;min-width:300px;display:flex;flex-direction:column;justify-content:center;gap:14px;
+  background:var(--surface2);border:1px solid var(--border);border-radius:var(--r);padding:16px 18px}
+.kc-meter-h{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:5px}
+.kc-meter-h b{font-size:13px;letter-spacing:.02em} .kc-meter-h .v{font-family:var(--mono);font-weight:700}
+.kc-meter-h small{color:var(--muted);font-size:11px;margin-left:7px}
+.kc-meter-t{background:var(--track);border-radius:4px;height:11px;overflow:hidden}
+.kc-meter-f{height:11px;border-radius:4px}
+.kc-readout{flex:0 0 auto;display:flex;gap:14px;align-items:center;
+  background:var(--surface2);border:1px solid var(--border);border-radius:var(--r);padding:12px 16px}
+.kc-readout .col{display:flex;flex-direction:column;align-items:center;gap:2px}
+.kc-mat-chip{display:inline-block;font-family:var(--mono);font-size:11px;font-weight:700;padding:4px 9px;border-radius:4px;color:#15170f}
+.kc-summary2{display:grid;grid-template-columns:320px 1fr;gap:22px;align-items:start}
+@media(max-width:1000px){.kc-summary2{grid-template-columns:1fr}}
+.kc-dossier{background:var(--surface2);border:1px solid var(--border);border-radius:var(--r);overflow:hidden}
+.kc-dossier-h{font-family:var(--mono);font-size:10px;letter-spacing:.14em;text-transform:uppercase;
+  color:#15170f;background:var(--accent);padding:6px 12px;font-weight:700}
+.kc-dossier table{width:100%;border-collapse:collapse;font-size:12.5px}
+.kc-dossier td{padding:6px 12px;border-bottom:1px solid var(--border)}
+.kc-dossier tr:last-child td{border-bottom:none}
+.kc-dossier td:first-child{color:var(--faint);font-family:var(--mono);font-size:10.5px;
+  letter-spacing:.04em;text-transform:uppercase;width:42%;vertical-align:top}
+.kc-dossier td:last-child{color:var(--text);word-break:break-word}
+.kc-narrative p{margin-bottom:11px;font-size:14px;line-height:1.65}
 .kc-legend{display:flex;flex-wrap:wrap;gap:8px;justify-content:center;margin-top:6px;font-size:11px;color:var(--muted)}
 .kc-legend i{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:4px}
-.kc-cat-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
-@media(max-width:880px){.kc-cat-grid{grid-template-columns:repeat(2,1fr)}}
-.kc-cat-card{background:var(--surface3);border-top:3px solid;border-radius:var(--r-sm);padding:10px 12px}
-.kc-cat-label{font-family:var(--mono);font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
-.kc-cat-score{font-family:var(--head);font-size:32px;line-height:1.05}
+.kc-keyrisks{margin-top:8px}
+.kc-keyrisks ul{list-style:none}
+.kc-keyrisks li{padding:5px 0;display:flex;align-items:baseline;gap:9px;border-bottom:1px dashed var(--border)}
+.kc-keyrisks li:last-child{border-bottom:none}
+.kc-dot{width:9px;height:9px;border-radius:50%;flex-shrink:0;transform:translateY(1px)}
+.kc-kr-sub{color:var(--muted);font-size:12.5px}
+
+/* category strip */
+.kc-catstrip{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin-top:18px}
+.kc-cat-card{background:var(--surface2);border:1px solid var(--border);border-top:3px solid;border-radius:var(--r-sm);padding:11px 14px}
+.kc-cat-label{font-family:var(--mono);font-size:10px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.kc-cat-score{font-size:30px;font-weight:800;line-height:1.1}
 .kc-cat-count{font-size:11px;color:var(--faint)}
 .kc-cat-track{background:var(--track);border-radius:3px;height:6px;margin-top:6px;overflow:hidden}
 .kc-cat-bar{height:6px;border-radius:3px}
 
-/* ── maturity ladder ── */
-.kc-ladder{display:flex;align-items:center;justify-content:space-between;margin:14px 0 6px;max-width:560px}
-.kc-mstep{display:flex;flex-direction:column;align-items:center;gap:4px}
-.kc-mlabel{font-family:var(--mono);font-size:9.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
-.kc-mconn{flex:1;height:2px;background:var(--border2);margin:0 4px;margin-bottom:18px}
-.kc-mbox{background:var(--surface2);border-left:3px solid var(--accent);border-radius:0 var(--r-sm) var(--r-sm) 0;
-  padding:10px 14px;margin:10px 0;font-size:13.5px}
-.kc-mtag{font-family:var(--mono);font-size:10px;background:var(--surface3);border:1px solid var(--border2);
-  color:var(--deck);border-radius:3px;padding:1px 5px}
+/* ── attack-path chains (BloodHound-style) ── */
+.kc-paths-tag{display:inline-flex;gap:14px;margin-bottom:16px;flex-wrap:wrap}
+.kc-pstat{background:var(--surface2);border:1px solid var(--border);border-radius:var(--r-sm);padding:8px 14px}
+.kc-pstat b{font-size:20px;font-weight:800;color:var(--accent)}
+.kc-pstat span{display:block;font-family:var(--mono);font-size:9.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--faint)}
+.kc-chain{display:flex;align-items:stretch;flex-wrap:wrap;gap:0;background:var(--surface2);
+  border:1px solid var(--border);border-left:3px solid var(--crit);border-radius:var(--r-sm);
+  padding:12px 14px;margin-bottom:10px}
+.kc-chain.sev-high{border-left-color:var(--high)} .kc-chain.sev-medium{border-left-color:var(--med)}
+.kc-chain-row{display:flex;align-items:center;flex-wrap:wrap;gap:2px;flex:1;min-width:0}
+.kc-node{display:inline-flex;align-items:center;gap:5px;background:var(--surface3);border:1px solid var(--border2);
+  border-radius:14px;padding:4px 11px;font-size:12.5px;font-weight:600;white-space:nowrap}
+.kc-node.attacker{border-color:var(--high);color:var(--high)}
+.kc-node.crown{border-color:var(--crit);background:rgba(189,66,52,.14);color:var(--crit);font-weight:700}
+.kc-node .ic{font-size:12px;opacity:.85}
+.kc-edge{display:inline-flex;flex-direction:column;align-items:center;color:var(--muted);
+  font-family:var(--mono);font-size:9px;letter-spacing:.03em;text-transform:uppercase;padding:0 4px;min-width:54px}
+.kc-edge::after{content:"→";font-size:15px;line-height:.8;color:var(--accent)}
+.kc-chain-meta{display:flex;flex-direction:column;justify-content:center;align-items:flex-end;
+  gap:4px;padding-left:12px;border-left:1px dashed var(--border);margin-left:8px}
+.kc-chain-tool{font-family:var(--mono);font-size:10px;color:var(--deck)}
 
 /* ── ATT&CK ── */
-.kc-attack-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px}
+.kc-attack-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:12px}
 .kc-tcol{background:var(--surface2);border:1px solid var(--border);border-radius:var(--r);padding:10px}
-.kc-tcol-h{font-family:var(--mono);font-size:10px;letter-spacing:.08em;text-transform:uppercase;
-  color:var(--accent);border-bottom:1px solid var(--border);padding-bottom:6px;margin-bottom:8px}
-.kc-tech{display:flex;align-items:center;gap:6px;padding:5px 6px;border-radius:var(--r-sm);
-  background:var(--surface3);margin-bottom:5px;cursor:default}
+.kc-tcol-h{font-family:var(--mono);font-size:10px;letter-spacing:.06em;text-transform:uppercase;color:var(--accent);
+  border-bottom:1px solid var(--border);padding-bottom:6px;margin-bottom:8px}
+.kc-tech{display:flex;align-items:center;gap:6px;padding:5px 6px;border-radius:var(--r-sm);background:var(--surface3);margin-bottom:5px}
 .kc-tech-id{font-family:var(--mono);font-size:10.5px;color:var(--deck)}
-.kc-tech-n{flex:1;font-size:11.5px;color:var(--text)}
-.kc-tech-c{font-family:var(--mono);font-size:11px;background:var(--accent);color:#13150d;border-radius:8px;padding:0 6px;font-weight:700}
+.kc-tech-n{flex:1;font-size:11.5px}
+.kc-tech-c{font-family:var(--mono);font-size:11px;background:var(--accent);color:#15170f;border-radius:8px;padding:0 6px;font-weight:700}
 
 /* ── tables ── */
 .kc-table{width:100%;border-collapse:collapse;border-radius:var(--r-sm);overflow:hidden;font-size:13px}
-.kc-table th{background:var(--surface3);color:var(--deck);text-align:left;padding:9px 11px;
-  font-family:var(--mono);font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;font-weight:600}
-.kc-table td{padding:9px 11px;border-bottom:1px solid var(--border);vertical-align:top}
+.kc-table th{background:var(--surface3);color:var(--deck);text-align:left;padding:9px 12px;
+  font-family:var(--mono);font-size:10.5px;letter-spacing:.05em;text-transform:uppercase;font-weight:600}
+.kc-table td{padding:9px 12px;border-bottom:1px solid var(--border);vertical-align:top}
 .kc-table tbody tr:last-child td{border-bottom:none}
 .kc-table tbody tr:hover td{background:var(--surface2)}
 .kc-num{text-align:right;font-variant-numeric:tabular-nums;font-family:var(--mono)}
@@ -5204,104 +5548,97 @@ html[data-theme=light] .kc-nav{background:rgba(220,216,196,.95)}
 .kc-sid code{font-size:10px;color:var(--faint);background:transparent;padding:0}
 .kc-crit-val{background:var(--crit);color:#fff;font-weight:700}
 .kc-ok{color:var(--ok);font-weight:600}.kc-bad{color:var(--bad);font-weight:600}.kc-warn{color:var(--warn);font-weight:600}
-
-/* pills / badges */
 .kc-sev-pill,.kc-cat-pill{display:inline-block;color:#fff;padding:2px 8px;border-radius:var(--r-sm);
-  font-family:var(--mono);font-size:10px;font-weight:700;letter-spacing:.05em;text-transform:uppercase}
-.kc-cat-pill{color:#13150d}
+  font-family:var(--mono);font-size:10px;font-weight:700;letter-spacing:.04em;text-transform:uppercase}
+.kc-cat-pill{color:#15170f}
 .kc-badge{display:inline-block;color:#fff;padding:1px 7px;border-radius:3px;font-size:10px;font-weight:700;font-family:var(--mono)}
 .kc-badge-crit{background:var(--crit)}
 .kc-mini{display:inline-block;font-family:var(--mono);font-size:10px;background:var(--surface3);
   border:1px solid var(--border2);color:var(--deck);border-radius:3px;padding:1px 5px;margin:1px 2px}
 
-/* ── roadmap ── */
-.kc-rm-tier{font-size:14px;letter-spacing:.06em;text-transform:uppercase;color:var(--deck);margin:18px 0 8px}
-.kc-rm-desc{font-family:var(--sans);font-weight:400;font-size:12px;color:var(--muted);text-transform:none;letter-spacing:0}
+/* roadmap */
+.kc-rm-tier{font-size:13px;letter-spacing:.05em;text-transform:uppercase;color:var(--deck);margin:18px 0 8px;font-weight:700}
+.kc-rm-desc{font-weight:400;font-size:12px;color:var(--muted);text-transform:none;letter-spacing:0}
 .kc-rm-table tbody tr{cursor:pointer}
 .kc-rm-fix{color:var(--muted);font-size:12px;margin-top:3px}
-
-/* attack paths */
 .kc-ap-sub{color:var(--muted);font-size:12px;margin-top:2px}
 
-/* ── findings ── */
+/* findings */
 .kc-toolbar{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:8px}
 .kc-pills{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
 .kc-fsep{width:1px;height:20px;background:var(--border2);margin:0 4px}
-.kc-fp{font-family:var(--mono);font-size:11px;letter-spacing:.04em;background:var(--surface2);
-  color:var(--muted);border:1px solid var(--border2);border-radius:14px;padding:4px 12px;cursor:pointer;
-  --c:var(--accent)}
+.kc-fp{font-family:var(--mono);font-size:11px;background:var(--surface2);color:var(--muted);
+  border:1px solid var(--border2);border-radius:14px;padding:4px 12px;cursor:pointer;--c:var(--accent)}
 .kc-fp:hover{color:var(--text);border-color:var(--c)}
-.kc-fp-on,.kc-fp.on{background:var(--c);color:#13150d;border-color:var(--c);font-weight:700}
+.kc-fp-on,.kc-fp.on{background:var(--c);color:#15170f;border-color:var(--c);font-weight:700}
 .kc-toolbar-r{display:flex;gap:6px;align-items:center}
 #kc-q{background:var(--surface2);border:1px solid var(--border2);color:var(--text);border-radius:14px;
-  padding:5px 12px;font-size:12.5px;outline:none;min-width:180px}
+  padding:5px 12px;font-size:12.5px;outline:none;min-width:200px}
 #kc-q:focus{border-color:var(--accent)}
 .kc-showing{font-family:var(--mono);font-size:11px;color:var(--faint);margin-bottom:6px}
 .kc-ftable td{vertical-align:middle}
 .kc-frow{cursor:pointer}
 .kc-frow:hover td{background:var(--surface2)}
 .kc-frow:focus{outline:2px solid var(--accent);outline-offset:-2px}
-.kc-toggle{display:inline-block;width:18px;height:18px;line-height:16px;text-align:center;
-  border:1px solid var(--border2);border-radius:50%;color:var(--muted);font-weight:700;font-size:12px}
+.kc-toggle{display:inline-block;width:18px;height:18px;line-height:16px;text-align:center;border:1px solid var(--border2);
+  border-radius:50%;color:var(--muted);font-weight:700;font-size:12px}
 .kc-frow:hover .kc-toggle{border-color:var(--accent);color:var(--accent)}
 .kc-panel{background:var(--bg);border:1px solid var(--border);border-left:3px solid var(--accent);
-  border-radius:0 var(--r-sm) var(--r-sm) 0;padding:14px 18px;margin:2px 0 8px}
+  border-radius:0 var(--r-sm) var(--r-sm) 0;padding:16px 20px;margin:2px 0 8px}
 .kc-block{margin-top:12px}.kc-block:first-child{margin-top:0}
-.kc-bh{font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;
-  color:var(--deck);margin-bottom:5px}
-.kc-bb{font-size:13px;color:var(--text);line-height:1.6}
+.kc-bh{font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--deck);margin-bottom:5px}
+.kc-bb{font-size:13px;line-height:1.6}
 .kc-attck-row{margin-bottom:6px}
 .kc-evidence{background:var(--surface2);border-left:3px solid var(--accent2);padding:8px 12px;border-radius:0 var(--r-sm) var(--r-sm) 0}
-.kc-attack{background:rgba(178,58,46,.08);border-left:3px solid var(--crit);padding:8px 12px;border-radius:0 var(--r-sm) var(--r-sm) 0}
-.kc-fix{background:rgba(122,154,78,.1);border-left:3px solid var(--ok);padding:8px 12px;border-radius:0 var(--r-sm) var(--r-sm) 0}
+.kc-attack{background:rgba(189,66,52,.08);border-left:3px solid var(--crit);padding:8px 12px;border-radius:0 var(--r-sm) var(--r-sm) 0}
+.kc-fix{background:rgba(130,161,85,.1);border-left:3px solid var(--ok);padding:8px 12px;border-radius:0 var(--r-sm) var(--r-sm) 0}
 .kc-cmd,.kc-fixlist,.kc-reflist,.kc-affected{list-style:none}
 .kc-cmd li{padding:3px 0;display:flex;align-items:center;gap:8px}
-.kc-cmd li code{flex:1;background:#0c0d08;border:1px solid var(--border2);color:#d7e0b0;
-  padding:4px 8px;border-radius:var(--r-sm);word-break:break-all;display:block}
-html[data-theme=light] .kc-cmd li code{background:#23270f;color:#dfe3c8}
+.kc-cmd li code{flex:1;background:#0d0e08;border:1px solid var(--border2);color:#dbe3b4;padding:5px 9px;
+  border-radius:var(--r-sm);word-break:break-all;display:block}
+html[data-theme=light] .kc-cmd li code{background:#21250e;color:#e2e6cb}
 .kc-copy{font-family:var(--mono);font-size:10px;background:var(--surface3);border:1px solid var(--border2);
-  color:var(--muted);border-radius:3px;padding:3px 8px;cursor:pointer;flex-shrink:0}
+  color:var(--muted);border-radius:3px;padding:4px 9px;cursor:pointer;flex-shrink:0}
 .kc-copy:hover{border-color:var(--accent);color:var(--accent)}
 .kc-fixlist li,.kc-reflist li{padding:3px 0 3px 16px;position:relative;font-size:12.5px}
 .kc-fixlist li::before{content:"▸";position:absolute;left:0;color:var(--accent2)}
-.kc-affected{columns:2;column-gap:22px;font-family:var(--mono);font-size:11.5px;color:var(--muted);margin-top:2px}
+.kc-affected{columns:3;column-gap:22px;font-family:var(--mono);font-size:11.5px;color:var(--muted);margin-top:2px}
+@media(max-width:900px){.kc-affected{columns:2}}
 .kc-affected li{padding:1px 0;break-inside:avoid}
 .kc-affected .kc-more{color:var(--faint);font-style:italic}
 
-/* ── inventory ── */
-.kc-stat-grid{display:grid;gap:10px;grid-template-columns:repeat(auto-fill,minmax(170px,1fr))}
-.kc-stat{background:var(--surface2);border:1px solid var(--border);border-radius:var(--r-sm);padding:9px 12px}
-.kc-stat-l{font-family:var(--mono);font-size:9.5px;letter-spacing:.05em;text-transform:uppercase;color:var(--faint)}
-.kc-stat-v{font-family:var(--head);font-size:18px;color:var(--text);margin-top:1px}
+/* inventory */
+.kc-stat-grid{display:grid;gap:10px;grid-template-columns:repeat(auto-fill,minmax(168px,1fr))}
+.kc-stat{background:var(--surface2);border:1px solid var(--border);border-radius:var(--r-sm);padding:9px 13px}
+.kc-stat-l{font-family:var(--mono);font-size:9.5px;letter-spacing:.04em;text-transform:uppercase;color:var(--faint)}
+.kc-stat-v{font-size:18px;font-weight:700;margin-top:1px}
 .kc-roster{margin-bottom:12px}
 .kc-roster h4{font-size:12px;color:var(--deck);margin-bottom:5px}
 .kc-rchip{display:inline-block;font-family:var(--mono);font-size:11px;background:var(--surface3);
   border:1px solid var(--border2);border-radius:3px;padding:2px 7px;margin:2px}
 .kc-rchip.kc-more{color:var(--faint)}
-.kc-barchart{display:flex;flex-direction:column;gap:5px}
+.kc-barchart{display:flex;flex-direction:column;gap:5px;max-width:760px}
 .kc-bar-row{display:flex;align-items:center;gap:10px}
-.kc-bar-l{width:230px;font-size:12px;color:var(--muted);text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.kc-bar-l{width:240px;font-size:12px;color:var(--muted);text-align:right;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .kc-bar-t{flex:1;background:var(--track);border-radius:3px;height:14px;overflow:hidden}
 .kc-bar-f{height:14px;border-radius:3px}
-.kc-bar-n{width:40px;font-family:var(--mono);font-size:11px;color:var(--muted)}
+.kc-bar-n{width:42px;font-family:var(--mono);font-size:11px;color:var(--muted)}
 
-.kc-footer{text-align:center;color:var(--faint);font-family:var(--mono);font-size:11px;
-  letter-spacing:.06em;padding:24px;border-top:1px solid var(--border)}
-.kc-top{position:fixed;right:20px;bottom:20px;width:42px;height:42px;border-radius:50%;
-  background:var(--accent);color:#13150d;border:none;font-size:20px;cursor:pointer;box-shadow:var(--shadow);z-index:40}
+.kc-footer{text-align:center;color:var(--faint);font-family:var(--mono);font-size:11px;letter-spacing:.05em;
+  padding:24px;border-top:1px solid var(--border)}
+.kc-top{position:fixed;right:22px;bottom:22px;width:42px;height:42px;border-radius:50%;background:var(--accent);
+  color:#15170f;border:none;font-size:20px;cursor:pointer;box-shadow:var(--shadow);z-index:40}
 
-/* ── print ── */
 @media print{
-  @page{size:A4;margin:14mm}
-  html[data-theme]{--bg:#fff;--surface:#fff;--surface2:#f4f2ea;--surface3:#eceadd;
-    --border:#bbb;--border2:#999;--track:#e3e1d6;--text:#1a1a12;--muted:#444;--faint:#666;--shadow:none}
+  @page{size:A4;margin:13mm}
+  html[data-theme]{--bg:#fff;--surface:#fff;--surface2:#f5f3ea;--surface3:#edebde;--border:#bbb;--border2:#999;
+    --track:#e4e2d6;--text:#1a1a12;--muted:#444;--faint:#666;--shadow:none}
   body{background:#fff}
   .kc-nav,.kc-top,.kc-toolbar,.kc-iconbtn,.kc-copy{display:none!important}
   .kc-section{break-inside:avoid;box-shadow:none;border:1px solid #ccc}
-  .kc-cover{break-after:page}
   .kc-frow,.kc-drow{display:table-row!important}
-  .kc-cmd li code{background:#f4f2ea;color:#1a1a12;border:1px solid #ccc}
-  a{color:#23270f}
+  .kc-cmd li code{background:#f5f3ea;color:#1a1a12;border:1px solid #ccc}
+  a{color:#21250e}
 }
 """
 
@@ -5311,17 +5648,17 @@ function kcTheme(){var h=document.documentElement;var n=h.getAttribute('data-the
 (function(){try{var t=localStorage.getItem('scout-theme');if(t)document.documentElement.setAttribute('data-theme',t)}catch(e){}})();
 function kcTog(i){var r=document.getElementById('dr-'+i),ic=document.getElementById('ic-'+i);if(!r)return;
   var open=r.style.display==='table-row';r.style.display=open?'none':'table-row';
-  if(ic){ic.textContent=open?'+':'−';ic.style.background=open?'':'var(--accent)';ic.style.color=open?'':'#13150d';ic.style.borderColor=open?'':'var(--accent)';}}
+  if(ic){ic.textContent=open?'+':'−';ic.style.background=open?'':'var(--accent)';ic.style.color=open?'':'#15170f';ic.style.borderColor=open?'':'var(--accent)';}}
 function kcAll(open){document.querySelectorAll('.kc-drow').forEach(function(r){r.style.display=open?'table-row':'none'});
   document.querySelectorAll('.kc-toggle').forEach(function(ic){ic.textContent=open?'−':'+';
-    ic.style.background=open?'var(--accent)':'';ic.style.color=open?'#13150d':'';ic.style.borderColor=open?'var(--accent)':'';});}
+    ic.style.background=open?'var(--accent)':'';ic.style.color=open?'#15170f':'';ic.style.borderColor=open?'var(--accent)':'';});}
 var kcF={sev:'',cat:''};
 function kcFil(btn){var f=btn.getAttribute('data-f'),k=f.split(':')[0],v=f.substring(k.length+1);
   if(k==='sev'){document.querySelectorAll('.kc-fp:not(.kc-fp-cat)').forEach(function(b){b.classList.remove('kc-fp-on','on')});
     btn.classList.add(v?'on':'kc-fp-on');kcF.sev=v;}
   else{if(kcF.cat===v){kcF.cat='';btn.classList.remove('on');}else{document.querySelectorAll('.kc-fp-cat').forEach(function(b){b.classList.remove('on')});btn.classList.add('on');kcF.cat=v;}}
   kcApply();}
-function kcApply(){var q=(document.getElementById('kc-q').value||'').toLowerCase();var shown=0,tot=0;
+function kcApply(){var qel=document.getElementById('kc-q');var q=(qel?qel.value:'').toLowerCase();var shown=0,tot=0;
   document.querySelectorAll('.kc-frow').forEach(function(r){tot++;
     var okS=!kcF.sev||r.getAttribute('data-sev')===kcF.sev;
     var okC=!kcF.cat||r.getAttribute('data-cat')===kcF.cat;
@@ -5334,24 +5671,23 @@ function kcJump(id){var el=document.getElementById(id);if(!el)return;
   if(el.classList.contains('kc-frow')){var i=el.getAttribute('data-i');var dr=document.getElementById('dr-'+i);
     if(dr&&dr.style.display!=='table-row')kcTog(i);}}
 function kcCopy(btn){var code=btn.parentNode.querySelector('code');if(!code)return;
-  var t=code.textContent;navigator.clipboard&&navigator.clipboard.writeText(t);
+  navigator.clipboard&&navigator.clipboard.writeText(code.textContent);
   var o=btn.textContent;btn.textContent='copied';setTimeout(function(){btn.textContent=o},1200);}
 document.addEventListener('DOMContentLoaded',function(){kcApply();
   var secs=[].slice.call(document.querySelectorAll('section[id]'));
   var links={};document.querySelectorAll('.kc-nav-links a').forEach(function(a){links[a.getAttribute('href').slice(1)]=a;});
-  function spy(){var y=window.scrollY+120,cur=null;secs.forEach(function(s){if(s.offsetTop<=y)cur=s.id;});
+  function spy(){var y=window.scrollY+110,cur=null;secs.forEach(function(s){if(s.offsetTop<=y)cur=s.id;});
     Object.keys(links).forEach(function(k){links[k].classList.toggle('active',k===cur);});}
   window.addEventListener('scroll',spy);spy();});
 """
 
 
 class HTMLReporter:
-    """Single-file, dependency-free interactive HTML deliverable styled as a
-    field assessment briefing: cover + classification banner, assessment summary,
-    scorecard, CMMI maturity ladder, prioritised action plan, attack paths with
-    copyable tradecraft, MITRE ATT&CK coverage, evidence tables, filterable
-    findings with expandable evidence, and an enriched inventory. Light/dark
-    themes and print-to-PDF styling included."""
+    """Single-file, dependency-free interactive HTML deliverable built for the
+    operator running the assessment: a slim header, an at-a-glance summary with
+    the target dossier, a BloodHound-style 'Paths to Domain Dominance' view, a
+    prioritized action plan, MITRE ATT&CK coverage, evidence tables and a
+    filterable finding register with copy-ready tradecraft. Light/dark + print."""
 
     _SEV_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
 
@@ -5390,30 +5726,15 @@ class HTMLReporter:
             c[f.category] += 1
         return c
 
-    # ── inline SVG charts ─────────────────────────────────────────────────────
-    def _gauge(self, score, colour):
-        score = max(0, min(100, score))
-        angle = score / 100 * 180
-        rad = math.radians(180 - angle)
-        cx, cy, r = 90, 90, 76
-        x = cx + r * math.cos(rad); y = cy - r * math.sin(rad)
-        return (
-            '<svg width="180" height="106" viewBox="0 0 180 106" aria-hidden="true">'
-            '<path d="M 14 90 A 76 76 0 0 1 166 90" fill="none" stroke="var(--track)" stroke-width="15" stroke-linecap="round"/>'
-            f'<path d="M 14 90 A 76 76 0 0 1 {x:.2f} {y:.2f}" fill="none" stroke="{colour}" stroke-width="15" stroke-linecap="round"/>'
-            f'<text x="90" y="80" text-anchor="middle" font-size="40" font-weight="800" fill="{colour}" font-family="var(--head)">{score}</text>'
-            '<text x="90" y="99" text-anchor="middle" font-size="11" fill="var(--muted)">/ 100 danger</text></svg>')
-
+    # ── inline SVG donut (literal font family — SVG ignores CSS vars) ─────────
     def _donut(self):
         counts = self._sev_counts()
         order = ["CRITICAL","HIGH","MEDIUM","LOW","INFO"]
         total = sum(counts[s] for s in order) or 1
-        cx = cy = 70; r = 52; w = 22
+        cx = cy = 64; r = 48; w = 20
         nonzero = [s for s in order if counts[s]]
         segs = []; start = -90.0
         if len(nonzero) == 1:
-            # one full ring — an arc with coincident endpoints renders nothing,
-            # so draw a circle instead.
             segs.append(f'<circle cx="{cx}" cy="{cy}" r="{r}" fill="none" stroke="{SEV_COLOUR[nonzero[0]]}" stroke-width="{w}"/>')
         else:
             for s in nonzero:
@@ -5426,75 +5747,42 @@ class HTMLReporter:
                 start = end
         if not nonzero:
             segs.append(f'<circle cx="{cx}" cy="{cy}" r="{r}" fill="none" stroke="var(--track)" stroke-width="{w}"/>')
-        return ('<svg width="140" height="140" viewBox="0 0 140 140" aria-hidden="true">' + "".join(segs) +
-                f'<text x="{cx}" y="{cy-2}" text-anchor="middle" font-size="30" font-weight="800" fill="var(--text)" font-family="var(--head)">{len(self.findings)}</text>'
-                f'<text x="{cx}" y="{cy+16}" text-anchor="middle" font-size="11" fill="var(--muted)">findings</text></svg>')
+        return ('<svg width="128" height="128" viewBox="0 0 128 128" aria-hidden="true">' + "".join(segs) +
+                f'<text x="{cx}" y="{cy-2}" text-anchor="middle" font-size="28" font-weight="800" fill="var(--text)" font-family="Segoe UI, Arial, sans-serif">{len(self.findings)}</text>'
+                f'<text x="{cx}" y="{cy+15}" text-anchor="middle" font-size="10" fill="var(--muted)" font-family="Segoe UI, Arial, sans-serif">findings</text></svg>')
 
-    def _maturity_ladder(self, level):
-        out = ['<div class="kc-ladder">']
-        for lv in range(1, 6):
-            col = ["#b23a2e","#c2702a","#c9a227","#6f8f3f","#4f7a3a"][lv-1]
-            cur = (lv == level)
-            fill = col if cur else "var(--track)"
-            txt = "#13150d" if cur else "var(--muted)"
-            ring = f"stroke:{col};stroke-width:2" if cur else "stroke:var(--border2);stroke-width:1"
-            out.append(f'<div class="kc-mstep"><svg width="46" height="46" viewBox="0 0 46 46">'
-                       f'<circle cx="23" cy="23" r="20" fill="{fill}" style="{ring}"/>'
-                       f'<text x="23" y="29" text-anchor="middle" font-size="18" font-weight="800" fill="{txt}" font-family="var(--head)">{lv}</text></svg>'
-                       f'<div class="kc-mlabel">{MATURITY_LABEL[lv]}</div></div>')
-            if lv < 5:
-                out.append('<div class="kc-mconn"></div>')
-        out.append('</div>')
-        return "".join(out)
-
-    # ── cover / nav ───────────────────────────────────────────────────────────
-    def _cover(self):
-        total = self.scores.get("Total", 0)
-        label, colour = RiskScorer.risk_label(total)
-        rows = [("Domain", self.domain), ("Domain controller", self.dc_ip),
-                ("Assessment date", self.date), ("Authentication", self.auth_mode or "n/a")]
-        if self.prepared_by:
-            rows.append(("Prepared by", self.prepared_by))
-        if self.scope:
-            rows.append(("Scope", self.scope))
-        rows.append(("Tool", f"{TOOL_NAME} v{VERSION}"))
-        meta = "".join(f'<tr><td>{self._e(k)}</td><td>{self._e(v)}</td></tr>' for k, v in rows)
+    # ── slim header / nav ──────────────────────────────────────────────────────
+    def _head(self):
         return (
-            '<div class="kc-cover" id="top">'
-            '<div class="kc-cover-band">Confidential — Authorised Security Assessment</div>'
-            '<div class="kc-cover-body">'
-            '<div class="kc-logo">✶</div>'
-            f'<h1>{TOOL_NAME}</h1>'
-            '<div class="kc-cover-sub">Active Directory Field Assessment</div>'
-            f'<div class="kc-cover-domain">{self._e(self.domain)}</div>'
-            f'<table class="kc-cover-meta"><tbody>{meta}</tbody></table>'
-            f'<div class="kc-cover-score" style="border-color:{colour}">'
-            f'<span style="color:{colour}">{total}</span><small>/100 — {self._e(label)}</small></div>'
-            '</div></div>')
+            '<header class="kc-head" id="top">'
+            '<span class="mark">✶</span>'
+            f'<span class="name">{TOOL_NAME}</span>'
+            f'<span class="full">{self._e(TOOL_LONG)}</span>'
+            '<span class="class">CONFIDENTIAL</span>'
+            '</header>')
 
     def _nav(self):
-        items = [("exec","Summary",""),("maturity","Maturity",""),("roadmap","Action Plan",""),
-                 ("paths","Attack Paths",""),("attack","ATT&CK",""),
+        items = [("summary","Summary",""),("paths","Domain Dominance",""),
+                 ("roadmap","Action Plan",""),("attack","ATT&CK",""),
                  ("findings","Findings",str(len(self.findings))),("inventory","Inventory","")]
         links = ""
         for sid, name, badge in items:
             b = f'<span class="kc-navb">{badge}</span>' if badge else ""
             links += f'<a href="#sec-{sid}">{name}{b}</a>'
         return ('<nav class="kc-nav" id="kc-nav">'
-                f'<a class="kc-nav-brand" href="#top">✶ {TOOL_NAME}</a>'
                 f'<div class="kc-nav-links">{links}</div>'
                 '<div class="kc-nav-tools">'
                 '<button class="kc-iconbtn" onclick="kcTheme()" title="Toggle theme">◐</button>'
                 '<button class="kc-iconbtn" onclick="window.print()" title="Print / Save PDF">⎙</button>'
                 '</div></nav>')
 
-    # ── assessment summary ────────────────────────────────────────────────────
+    # ── summary ────────────────────────────────────────────────────────────────
     _MARQUEE = {
         "P-GPPPassword":"recoverable GPP passwords in SYSVOL",
         "P-DCSync":"DCSync rights granted to non-admins",
         "A-CertTempCustomSubject":"an ESC1-exploitable certificate template",
         "A-CertTemplateESC4":"an ESC4 template-ACL takeover",
-        "A-CertEnrollHttp":"ESC8 HTTP certificate enrolment (relayable)",
+        "A-CertEnrollHttp":"ESC8 HTTP certificate enrollment (relayable)",
         "P-UnconstrainedDelegation":"unconstrained Kerberos delegation",
         "A-WDigest":"WDigest cleartext credential caching",
         "A-LMCompatibilityLevel":"NTLMv1 still permitted",
@@ -5505,72 +5793,30 @@ class HTMLReporter:
         "A-MembershipEveryone":"'Everyone' inside a privileged group",
         "P-RBCD-Dangerous":"resource-based delegation on a domain controller",
         "A-DC-Coerce":"a DC authentication-coercion vector",
+        "A-SCCM":"relayable SCCM/MECM site infrastructure",
+        "A-Pre2kComputer":"pre-staged computer accounts with default passwords",
+        "A-WeakLockout":"no account lockout (password spraying is free)",
     }
 
-    def _narrative(self):
-        total = self.scores.get("Total", 0)
-        label, _ = RiskScorer.risk_label(total)
-        sc = self._sev_counts()
-        crit, high = sc.get("CRITICAL",0), sc.get("HIGH",0)
-        mat = self.scores.get("Maturity",3)
-        worst = max(("Anomaly","Privileged","Stale","Trust"), key=lambda c: self.scores.get(c,0))
-        parts = [
-            f"This assessment of <strong>{self._e(self.domain)}</strong> returns an overall danger "
-            f"score of <strong>{total}/100</strong> (<strong>{self._e(label)}</strong>), taken as the "
-            f"worst of four category scores — weakest is <strong>{worst}</strong> at "
-            f"{self.scores.get(worst,0)}/100. SCOUT raised <strong>{len(self.findings)}</strong> "
-            f"findings (<strong>{crit}</strong> critical, <strong>{high}</strong> high).",
-            f"On the CMMI maturity scale the domain sits at <strong>Level {mat} — "
-            f"{self._e(MATURITY_LABEL.get(mat,''))}</strong>. {self._e(MATURITY_DESC.get(mat,''))}",
-        ]
-        marquee = [t for r, t in self._MARQUEE.items() if r in self.by_rule]
-        if marquee:
-            s = marquee[:4]
-            parts.append("Most urgent: the environment exposes " +
-                         (", ".join(s[:-1]) + " and " + s[-1] if len(s) > 1 else s[0]) +
-                         " — each a realistic, low-cost path to domain compromise that should be "
-                         "remediated first.")
-        else:
-            parts.append("No single-step domain-takeover primitives were detected; work the "
-                         "prioritised action plan below to keep it that way.")
-        return "".join(f"<p>{p}</p>" for p in parts)
-
-    def _key_risks(self):
-        seen = set(); items = []
-        for f in sorted(self.findings, key=lambda x:(self._SEV_ORDER.get(x.severity,9), -x.points)):
-            if f.rule_id in seen or f.severity not in ("CRITICAL","HIGH"):
-                continue
-            seen.add(f.rule_id); items.append(f)
-            if len(items) >= 6:
-                break
-        if not items:
-            return ""
-        rows = ""
-        for f in items:
-            one = (self._doc(f.rule_id).get("description") or f.details or f.title)
-            one = one if len(one) <= 150 else one[:147] + "…"
-            rows += (f'<li><span class="kc-dot" style="background:{f.sev_colour}"></span>'
-                     f'<a href="#f-{self._e(f.rule_id)}" onclick="kcJump(\'f-{self._e(f.rule_id)}\');return false"><strong>{self._e(f.title)}</strong></a> '
-                     f'<span class="kc-kr-sub">{self._e(one)}</span></li>')
-        return f'<div class="kc-keyrisks"><h3>Key risks at a glance</h3><ul>{rows}</ul></div>'
-
-    def _scorecard(self):
-        total = self.scores.get("Total", 0)
-        _, colour = RiskScorer.risk_label(total)
-        cats = ""
-        for cat in ["Anomaly","Privileged","Stale","Trust"]:
-            sc = self.scores.get(cat,0); _, scol = RiskScorer.risk_label(sc)
-            n = self._cat_counts().get(cat,0); ccol = CAT_COLOUR.get(cat,"#888")
-            cats += (f'<div class="kc-cat-card" style="border-top-color:{ccol}">'
-                     f'<div class="kc-cat-label">{cat}</div>'
-                     f'<div class="kc-cat-score" style="color:{scol}">{sc}</div>'
-                     f'<div class="kc-cat-count">{n} finding(s)</div>'
-                     f'<div class="kc-cat-track"><div class="kc-cat-bar" style="background:{scol};width:{min(sc,100)}%"></div></div></div>')
-        return ('<div class="kc-scorecard">'
-                f'<div class="kc-card kc-card-gauge"><div class="kc-card-h">Global danger</div>{self._gauge(total,colour)}</div>'
-                f'<div class="kc-card kc-card-donut"><div class="kc-card-h">Severity mix</div>{self._donut()}{self._sev_legend()}</div>'
-                f'<div class="kc-card kc-card-cats"><div class="kc-card-h">Category scores — global = worst</div>'
-                f'<div class="kc-cat-grid">{cats}</div></div></div>')
+    def _dossier(self):
+        rows = [("Target domain", self.domain), ("Domain controller", self.dc_ip),
+                ("Authentication", self.auth_mode or "n/a"), ("Assessed", self.date)]
+        if self.prepared_by:
+            rows.append(("Operator", self.prepared_by))
+        if self.scope:
+            rows.append(("Scope", self.scope))
+        d = self.data
+        try:
+            dfl = FUNCTIONAL_LEVELS.get(d.domain_level, str(d.domain_level))
+            rows.append(("Functional level", dfl))
+        except Exception:
+            pass
+        rows.append(("Objects", f"{len(d.users)} users · {len(d.computers)} computers · {len(d.dcs)} DC(s)"))
+        rows.append(("Findings", f"{len(self.findings)} total"))
+        rows.append(("Tool", f"{TOOL_NAME} v{VERSION}"))
+        body = "".join(f'<tr><td>{self._e(k)}</td><td>{self._e(v)}</td></tr>' for k, v in rows)
+        return ('<div class="kc-dossier"><div class="kc-dossier-h">Assessment dossier</div>'
+                f'<table><tbody>{body}</tbody></table></div>')
 
     def _sev_legend(self):
         sc = self._sev_counts(); out = '<div class="kc-legend">'
@@ -5579,31 +5825,309 @@ class HTMLReporter:
                 out += f'<span><i style="background:{SEV_COLOUR[s]}"></i>{s.title()} {sc[s]}</span>'
         return out + '</div>'
 
-    def _exec_section(self):
-        return ('<section class="kc-section" id="sec-exec"><h2 class="kc-h2">Assessment summary</h2>'
-                f'<div class="kc-narrative">{self._narrative()}</div>{self._scorecard()}{self._key_risks()}</section>')
+    def _meter(self, label, value, hint):
+        _, col = RiskScorer.risk_label(value)
+        return (f'<div><div class="kc-meter-h"><b>{self._e(label)} '
+                f'<small>{self._e(hint)}</small></b><span class="v" style="color:{col}">{value}<small>/100</small></span></div>'
+                f'<div class="kc-meter-t"><div class="kc-meter-f" style="width:{value}%;background:{col}"></div></div></div>')
 
-    # ── maturity ──────────────────────────────────────────────────────────────
-    def _maturity_section(self):
-        mat = self.scores.get("Maturity", 3); nxt = mat + 1
-        blockers = sorted({f.rule_id: f for f in self.findings if f.maturity <= mat}.values(),
-                          key=lambda f:(f.maturity, self._SEV_ORDER.get(f.severity,9)))
-        rows = "".join(f'<tr onclick="kcJump(\'f-{self._e(f.rule_id)}\')"><td><span class="kc-mtag">L{f.maturity}</span></td>'
-                       f'<td><code>{self._e(f.rule_id)}</code></td><td>{self._e(f.title)}</td></tr>'
-                       for f in blockers[:12])
-        nextline = (f"To advance to <strong>Level {nxt} — {MATURITY_LABEL.get(nxt,'')}</strong>, "
-                    f"resolve every Level&nbsp;≤&nbsp;{mat} finding below."
-                    if mat < 5 else "The domain has reached the highest maturity level — maintain it.")
-        return ('<section class="kc-section" id="sec-maturity"><h2 class="kc-h2">Maturity level</h2>'
-                '<p class="kc-sub">CMMI 1–5 scale (ANSSI model). Your level is the lowest still gated by a '
-                'failing rule — one unfixed Level-1 issue pins the whole domain at Level 1.</p>'
-                f'{self._maturity_ladder(mat)}'
-                f'<div class="kc-mbox"><strong>Level {mat} — {MATURITY_LABEL.get(mat,"")}.</strong> '
-                f'{self._e(MATURITY_DESC.get(mat,""))}</div>'
-                f'<p class="kc-sub">{nextline}</p>'
-                + (f'<table class="kc-table"><thead><tr><th style="width:60px">Level</th>'
-                   '<th style="width:220px">Rule</th><th>Finding</th></tr></thead><tbody>'
-                   f'{rows}</tbody></table>' if rows else "") + '</section>')
+    def _scoreband(self):
+        s = self.scores
+        g = s.get("grade","?"); gcol = GRADE_COLOUR.get(g,"#888")
+        glabel = s.get("grade_label","")
+        exp = s.get("exposure",0); hyg = s.get("hygiene",0)
+        return ('<div class="kc-scoreband">'
+                f'<div class="kc-grade" style="background:{gcol}"><div class="g">{self._e(g)}</div>'
+                f'<div class="gl">{self._e(glabel)}</div></div>'
+                '<div class="kc-meters">'
+                f'{self._meter("Exposure", exp, "ease of reaching Tier 0")}'
+                f'{self._meter("Hygiene debt", hyg, "misconfiguration & stale-object load")}'
+                '</div>'
+                '<div class="kc-readout">'
+                f'<div class="col">{self._donut()}{self._sev_legend()}</div>'
+                '</div></div>')
+
+    def _narrative(self):
+        s = self.scores
+        g = s.get("grade","?"); glabel = s.get("grade_label","")
+        exp = s.get("exposure",0); hyg = s.get("hygiene",0)
+        sc = self._sev_counts(); crit, high = sc.get("CRITICAL",0), sc.get("HIGH",0)
+        if exp >= 85:    estate = "an attacker on the internal network can reach Domain Admin in a single, low-skill step"
+        elif exp >= 60:  estate = "a clear, reliable path to Domain Admin exists"
+        elif exp >= 35:  estate = "Tier-0 is reachable but requires cracking, coercion or a foothold first"
+        elif exp >= 15:  estate = "no direct path was found, but exploitable footholds exist"
+        else:            estate = "no practical path to Tier-0 was identified from the collected data"
+        parts = [
+            f"<strong>{self._e(self.domain)}</strong> grades <strong style=\"color:{GRADE_COLOUR.get(g,'#888')}\">"
+            f"{self._e(g)} ({self._e(glabel)})</strong>. Exposure is <strong>{exp}/100</strong> — {estate} — "
+            f"and hygiene debt is <strong>{hyg}/100</strong>, across <strong>{len(self.findings)}</strong> "
+            f"findings ({crit} critical, {high} high).",
+        ]
+        marquee = [t for r, t in self._MARQUEE.items() if r in self.by_rule]
+        if marquee:
+            sm = marquee[:4]
+            parts.append("Immediate exploitation is available via " +
+                         (", ".join(sm[:-1]) + " and " + sm[-1] if len(sm) > 1 else sm[0]) +
+                         " — see Domain Dominance below for the routes to Tier 0.")
+        else:
+            parts.append("No single-step takeover primitives were found; work the action plan to keep it that way.")
+        return "".join(f"<p>{p}</p>" for p in parts)
+
+    def _key_risks(self):
+        seen = set(); items = []
+        for f in sorted(self.findings, key=lambda x:(self._SEV_ORDER.get(x.severity,9), -x.points)):
+            if f.rule_id in seen or f.severity not in ("CRITICAL","HIGH"):
+                continue
+            seen.add(f.rule_id); items.append(f)
+            if len(items) >= 7:
+                break
+        if not items:
+            return ""
+        rows = ""
+        for f in items:
+            one = (self._doc(f.rule_id).get("description") or f.details or f.title)
+            one = one if len(one) <= 130 else one[:127] + "…"
+            rows += (f'<li><span class="kc-dot" style="background:{f.sev_colour}"></span>'
+                     f'<span style="flex:1"><a href="#f-{self._e(f.rule_id)}" onclick="kcJump(\'f-{self._e(f.rule_id)}\');return false"><strong>{self._e(f.title)}</strong></a> '
+                     f'<span class="kc-kr-sub">{self._e(one)}</span></span></li>')
+        return ('<div class="kc-keyrisks"><div class="kc-sub-h">Key risks at a glance</div>'
+                f'<ul>{rows}</ul></div>')
+
+    def _opcat(self, f):
+        return op_category(f.rule_id, f.category)
+
+    def _category_strip(self):
+        # Finding counts per OPERATIONAL category (how a pentester groups work),
+        # with a severity breakdown — informational, not a fake 0-100 gauge.
+        sev_by_cat = {c: defaultdict(int) for c in OPCAT_ORDER}
+        tot = defaultdict(int)
+        for f in self.findings:
+            oc = self._opcat(f)
+            if oc in sev_by_cat:
+                sev_by_cat[oc][f.severity] += 1; tot[oc] += 1
+        cards = ""
+        for cat in OPCAT_ORDER:
+            n = tot.get(cat,0); ccol = OPCAT_COLOUR.get(cat,"#888")
+            bd = sev_by_cat[cat]
+            chips = "".join(
+                f'<span style="color:{SEV_COLOUR[s]};font-family:var(--mono);font-size:10.5px;margin-right:8px">{bd[s]} {s[:4].lower()}</span>'
+                for s in ("CRITICAL","HIGH","MEDIUM","LOW") if bd.get(s))
+            cards += (f'<div class="kc-cat-card" style="border-top-color:{ccol}">'
+                      f'<div class="kc-cat-label">{cat}</div>'
+                      f'<div class="kc-cat-score" style="color:{ccol}">{n}</div>'
+                      f'<div class="kc-cat-count">{chips or "clean"}</div></div>')
+        return f'<div class="kc-catstrip">{cards}</div>'
+
+    def _summary_section(self):
+        return ('<section class="kc-section" id="sec-summary"><h2 class="kc-h2">Summary'
+                '<span class="tag">grade = exposure (easiest Tier-0 path) + hygiene debt</span></h2>'
+                f'{self._scoreband()}'
+                '<div class="kc-summary2">'
+                f'{self._dossier()}'
+                f'<div><div class="kc-narrative">{self._narrative()}</div>{self._key_risks()}</div>'
+                '</div>'
+                f'{self._category_strip()}</section>')
+
+    # ── Paths to Domain Dominance (control-path chains) ───────────────────────
+    def _node(self, label, kind="", icon=""):
+        cls = "kc-node" + (f" {kind}" if kind else "")
+        ic = f'<span class="ic">{icon}</span>' if icon else ""
+        return f'<span class="{cls}">{ic}{self._e(label)}</span>'
+
+    def _edge(self, label):
+        return f'<span class="kc-edge">{self._e(label)}</span>'
+
+    def _chain(self, nodes_edges, sev, tool=""):
+        """nodes_edges: list alternating node-html, edge-label, node-html, …"""
+        row = ""
+        for i, part in enumerate(nodes_edges):
+            row += part if i % 2 == 0 else self._edge(part)
+        meta = f'<div class="kc-chain-meta"><span class="kc-sev-pill" style="background:{SEV_COLOUR.get(sev,"#888")}">{sev}</span>' \
+               + (f'<span class="kc-chain-tool">{self._e(tool)}</span>' if tool else "") + '</div>'
+        scls = {"CRITICAL":"", "HIGH":"sev-high", "MEDIUM":"sev-medium"}.get(sev, "sev-medium")
+        return f'<div class="kc-chain {scls}"><div class="kc-chain-row">{row}</div>{meta}</div>'
+
+    def _build_paths(self):
+        """Synthesise attacker -> … -> Tier 0 chains from the findings + ACL data."""
+        chains = []  # (severity, html)
+        DA = self._node("Domain Admin", "crown", "♛")
+        DOM = self._node("Domain compromise", "crown", "♛")
+        any_user = self._node("Any domain user", "attacker", "☣")
+        unauth = self._node("Unauthenticated", "attacker", "☣")
+
+        # ACL-derived control edges (DCSync / dangerous ACL / GPO / priv-group write)
+        for a in self.data.acl_findings:
+            t = a.get("type",""); who = a.get("sid_name") or a.get("sid") or "principal"
+            right = a.get("right",""); obj = a.get("object","")
+            n_who = self._node(who, "attacker", "☣")
+            if t == "dcsync":
+                chains.append(("CRITICAL", self._chain(
+                    [n_who, "DS-Repl", self._node("NTDS secrets","crown","🔑"), "dump", DOM],
+                    "CRITICAL", "secretsdump.py -just-dc")))
+            elif t in ("dangerous_acl","owner"):
+                chains.append(("CRITICAL", self._chain(
+                    [n_who, right or "WriteDACL", self._node(obj or "Domain root"), "grant DCSync", DOM],
+                    "CRITICAL", "dacledit / secretsdump")))
+            elif t == "gpo_write":
+                chains.append(("CRITICAL", self._chain(
+                    [n_who, "edit GPO", self._node(obj or "GPO"), "applies to", self._node("Computers / DCs"), "SYSTEM", DOM],
+                    "CRITICAL", "pyGPOAbuse")))
+            elif t == "write_property":
+                chains.append(("HIGH", self._chain(
+                    [n_who, right or "Write", self._node(obj or "privileged object"), "add member", DA],
+                    "HIGH", "")))
+
+        def has(rid): return rid in self.by_rule
+        def aff(rid, n=1):
+            f = self.by_rule.get(rid)
+            return (f.affected[:n] if f and f.affected else [])
+
+        if has("P-DCSync") and not any(c for s,c in chains if "NTDS" in c):
+            who = (aff("P-DCSync") or ["non-admin principal"])[0]
+            chains.append(("CRITICAL", self._chain(
+                [self._node(who.split()[0],"attacker","☣"), "DCSync", self._node("NTDS secrets","crown","🔑"), "dump", DOM],
+                "CRITICAL", "secretsdump.py -just-dc")))
+        if has("P-GPPPassword"):
+            chains.append(("CRITICAL", self._chain(
+                [any_user, "read SYSVOL", self._node("GPP cpassword","crown","🔑"), "AES-decrypt", self._node("Local admin creds")],
+                "CRITICAL", "gpp-decrypt")))
+        if has("A-CertTempCustomSubject"):
+            tmpl = (aff("A-CertTempCustomSubject") or ["vuln template"])[0]
+            chains.append(("CRITICAL", self._chain(
+                [any_user, "ESC1 enrol", self._node(tmpl), "SAN=DA", self._node("DA certificate","crown","📜"), "PKINIT", DA],
+                "CRITICAL", "certipy req -upn administrator@…")))
+        if has("A-CertTemplateESC4"):
+            tmpl = (aff("A-CertTemplateESC4") or ["template"])[0].split()[0]
+            chains.append(("CRITICAL", self._chain(
+                [any_user, "ESC4 WriteDACL", self._node(tmpl), "make ESC1", self._node("DA certificate","crown","📜"), "PKINIT", DA],
+                "CRITICAL", "certipy template")))
+        if has("A-CertEnrollHttp"):
+            chains.append(("CRITICAL", self._chain(
+                [self._node("Coerced DC$","attacker","☣"), "NTLM relay", self._node("ADCS web enrol (ESC8)"), "issue", self._node("DC certificate","crown","📜"), "DCSync", DOM],
+                "CRITICAL", "PetitPotam + ntlmrelayx")))
+        if has("P-ServiceDomainAdmin") or has("S-KerberoastableAdmin"):
+            svc = (aff("S-KerberoastableAdmin") or aff("P-ServiceDomainAdmin") or ["svc_admin"])[0].split()[0]
+            chains.append(("CRITICAL", self._chain(
+                [any_user, "Kerberoast", self._node(svc), "crack RC4", self._node("svc password","crown","🔑"), "member of", DA],
+                "CRITICAL", "GetUserSPNs.py -request → hashcat -m 13100")))
+        if has("P-ComputerInPrivGroup"):
+            m = (aff("P-ComputerInPrivGroup") or ["WS$"])[0].split()[0]
+            chains.append(("CRITICAL", self._chain(
+                [self._node("SYSTEM on "+m,"attacker","☣"), "machine secret", self._node(m), "member of", DA],
+                "CRITICAL", "")))
+        if has("S-SIDHistoryPrivileged"):
+            who = (aff("S-SIDHistoryPrivileged") or ["account"])[0].split()[0]
+            chains.append(("CRITICAL", self._chain(
+                [self._node(who,"attacker","☣"), "SID history", self._node("privileged SID","crown","🔑"), "honoured at logon", DA],
+                "CRITICAL", "")))
+        if has("P-RBCD-Dangerous"):
+            chains.append(("CRITICAL", self._chain(
+                [self._node("controlled principal","attacker","☣"), "RBCD", self._node("Domain controller","crown","♛"), "S4U impersonate", DA],
+                "CRITICAL", "rbcd.py + getST.py")))
+        elif has("P-RBCD"):
+            tgt = (aff("P-RBCD") or ["host"])[0]
+            chains.append(("HIGH", self._chain(
+                [self._node("controlled / new machine","attacker","☣"), "RBCD", self._node(tgt), "S4U impersonate", self._node("any user on host")],
+                "HIGH", "rbcd.py")))
+        if has("P-UnconstrainedDelegation"):
+            h = (aff("P-UnconstrainedDelegation") or ["host"])[0]
+            chains.append(("CRITICAL", self._chain(
+                [self._node("Coerced DC$","attacker","☣"), "auth to", self._node(h+" (unconstrained)"), "capture TGT", DA],
+                "CRITICAL", "printerbug.py + krbrelayx")))
+        if has("P-MachineAccountQuota") and (has("P-RBCD") or not chains):
+            chains.append(("HIGH", self._chain(
+                [any_user, "MAQ>0: add machine", self._node("attacker computer"), "RBCD/shadow-cred", self._node("target host")],
+                "HIGH", "addcomputer.py")))
+        if has("A-DnsZoneAUCreateChild"):
+            chains.append(("HIGH", self._chain(
+                [any_user, "ADIDNS write", self._node("wpad / * record"), "coerce + relay", self._node("victim creds")],
+                "HIGH", "dnstool.py + Responder")))
+        if has("S-NoPreAuthAdmin") or has("S-NoPreAuth"):
+            who = (aff("S-NoPreAuthAdmin") or aff("S-NoPreAuth") or ["account"])[0].split()[0]
+            sev = "CRITICAL" if has("S-NoPreAuthAdmin") else "HIGH"
+            chains.append((sev, self._chain(
+                [unauth, "AS-REP roast", self._node(who), "crack", self._node("password","crown","🔑")],
+                sev, "GetNPUsers.py → hashcat -m 18200")))
+        if has("A-Pre2kComputer"):
+            m = (aff("A-Pre2kComputer") or ["HOST$"])[0].split()[0]
+            chains.append(("HIGH", self._chain(
+                [unauth, "default pwd", self._node(m), "auth as computer", self._node("foothold + TGT","crown","🔑")],
+                "HIGH", "pre2k auth / getTGT.py")))
+        if has("A-WeakLockout"):
+            chains.append(("HIGH", self._chain(
+                [unauth, "password spray", self._node("no-lockout policy"), "valid creds", self._node("domain foothold","crown","🔑")],
+                "HIGH", "nxc smb --continue-on-success / kerbrute")))
+        if has("A-SCCM"):
+            h = (aff("A-SCCM") or ["SCCM site server"])[0].split()[0]
+            chains.append(("HIGH", self._chain(
+                [self._node("Coerced/relayed auth","attacker","☣"), "NTLM relay", self._node(h+" (MP/site)"), "NAA / site DB", self._node("privileged creds","crown","🔑")],
+                "HIGH", "SharpSCCM / sccmhunter / ntlmrelayx")))
+        return chains
+
+    def _paths_section(self):
+        chains = self._build_paths()
+        if not chains:
+            return ('<section class="kc-section" id="sec-paths"><h2 class="kc-h2">Paths to domain dominance</h2>'
+                    '<p class="kc-sub">No single-/few-step escalation path to Tier 0 was identified from the '
+                    'collected data. Re-check after authenticated ACL collection, and review the action plan.</p></section>')
+        order = {"CRITICAL":0,"HIGH":1,"MEDIUM":2}
+        chains.sort(key=lambda c: order.get(c[0], 3))
+        ncrit = sum(1 for s,_ in chains if s == "CRITICAL")
+        body = "".join(c for _, c in chains)
+        # exposure stats
+        dc_n = len(self.data.dcs)
+        unconstrained = len(self.by_rule.get("P-UnconstrainedDelegation").affected) if "P-UnconstrainedDelegation" in self.by_rule else 0
+        ca_n = len(self.data.enrollment_svcs) if getattr(self.data, "enrollment_svcs", None) else 0
+        stats = (f'<div class="kc-paths-tag">'
+                 f'<div class="kc-pstat"><b>{len(chains)}</b><span>escalation paths</span></div>'
+                 f'<div class="kc-pstat"><b>{ncrit}</b><span>one-step to Tier 0</span></div>'
+                 f'<div class="kc-pstat"><b>{dc_n}</b><span>domain controllers</span></div>'
+                 f'<div class="kc-pstat"><b>{ca_n}</b><span>certificate authorities</span></div>'
+                 f'<div class="kc-pstat"><b>{unconstrained}</b><span>unconstrained hosts</span></div>'
+                 f'</div>')
+        return ('<section class="kc-section kc-critborder" id="sec-paths">'
+                '<h2 class="kc-h2">Paths to domain dominance'
+                '<span class="tag">attacker → control → Tier 0</span></h2>'
+                '<p class="kc-sub">Concrete routes from a low-privileged (or unauthenticated) starting point to '
+                'domain compromise, derived from the collected ACLs, delegations, certificate templates and account '
+                'misconfigurations. Each row is a chain of control edges with the tradecraft to walk it.</p>'
+                f'{stats}{body}</section>')
+
+    # ── action plan ────────────────────────────────────────────────────────────
+    def _roadmap_section(self):
+        agg = {}
+        for f in self.findings:
+            a = agg.setdefault(f.rule_id, {"f":f,"pts":0,"aff":0})
+            a["pts"] += f.points; a["aff"] += len(f.affected)
+        rows = [{"rid":r,"f":a["f"],"pts":min(a["pts"],100),"aff":a["aff"],
+                 "effort":RULE_EFFORT.get(r,"Medium")} for r, a in agg.items()]
+        rows.sort(key=lambda r:(-r["pts"], self._SEV_ORDER.get(r["f"].severity,9)))
+        tiers = {"Low":("Quick wins","Low-effort GPO / setting changes with high payback"),
+                 "Medium":("Strategic","Account, ACL and delegation hardening"),
+                 "High":("Programme","Architecture, rollout and lifecycle work")}
+        out = ""
+        for tier in ("Low","Medium","High"):
+            tr = [r for r in rows if r["effort"] == tier]
+            if not tr:
+                continue
+            body = ""
+            for r in tr[:16]:
+                f = r["f"]; fix = (self._doc(r["rid"]).get("remediation") or [f.details or "See finding detail."])[0]
+                body += (f'<tr onclick="kcJump(\'f-{self._e(r["rid"])}\')">'
+                         f'<td><span class="kc-sev-pill" style="background:{f.sev_colour}">{self._e(f.severity)}</span></td>'
+                         f'<td><strong>{self._e(f.title)}</strong><div class="kc-rm-fix">{self._e(fix)}</div></td>'
+                         f'<td class="kc-num">{r["pts"]}</td><td class="kc-num">{r["aff"] or "—"}</td></tr>')
+            title, desc = tiers[tier]
+            out += (f'<h3 class="kc-rm-tier">{title} <span class="kc-rm-desc">— {desc}</span></h3>'
+                    '<table class="kc-table kc-rm-table"><thead><tr><th style="width:90px">Severity</th><th>Action</th>'
+                    '<th style="width:80px" class="kc-num">Risk&nbsp;↓</th><th style="width:74px" class="kc-num">Objects</th></tr></thead>'
+                    f'<tbody>{body}</tbody></table>')
+        if not out:
+            return ""
+        return ('<section class="kc-section" id="sec-roadmap"><h2 class="kc-h2">Prioritized action plan</h2>'
+                '<p class="kc-sub">Grouped by effort, ranked by risk reduction. “Risk ↓” is the danger-point '
+                'contribution recovered by fixing the item. Click a row to jump to the finding.</p>'
+                f'{out}</section>')
 
     # ── ATT&CK coverage ───────────────────────────────────────────────────────
     def _attack_section(self):
@@ -5634,96 +6158,6 @@ class HTMLReporter:
                 '<p class="kc-sub">Triggered findings mapped to adversary techniques, grouped by tactic. '
                 'Hover a technique for the contributing rules.</p>'
                 f'<div class="kc-attack-grid">{cols}</div></section>')
-
-    # ── action plan / roadmap ─────────────────────────────────────────────────
-    def _roadmap_section(self):
-        agg = {}
-        for f in self.findings:
-            a = agg.setdefault(f.rule_id, {"f":f,"pts":0,"aff":0})
-            a["pts"] += f.points; a["aff"] += len(f.affected)
-        rows = [{"rid":r,"f":a["f"],"pts":min(a["pts"],100),"aff":a["aff"],
-                 "effort":RULE_EFFORT.get(r,"Medium")} for r, a in agg.items()]
-        rows.sort(key=lambda r:(-r["pts"], self._SEV_ORDER.get(r["f"].severity,9)))
-        tiers = {"Low":("Quick wins","Low-effort GPO / setting changes with high payback"),
-                 "Medium":("Strategic","Account, ACL and delegation hardening"),
-                 "High":("Programme","Architecture, rollout and lifecycle work")}
-        out = ""
-        for tier in ("Low","Medium","High"):
-            tr = [r for r in rows if r["effort"] == tier]
-            if not tr:
-                continue
-            body = ""
-            for r in tr[:14]:
-                f = r["f"]; fix = (self._doc(r["rid"]).get("remediation") or [f.details or "See finding detail."])[0]
-                body += (f'<tr onclick="kcJump(\'f-{self._e(r["rid"])}\')">'
-                         f'<td><span class="kc-sev-pill" style="background:{f.sev_colour}">{self._e(f.severity)}</span></td>'
-                         f'<td><strong>{self._e(f.title)}</strong><div class="kc-rm-fix">{self._e(fix)}</div></td>'
-                         f'<td class="kc-num">{r["pts"]}</td><td class="kc-num">{r["aff"] or "—"}</td></tr>')
-            title, desc = tiers[tier]
-            out += (f'<h3 class="kc-rm-tier">{title} <span class="kc-rm-desc">— {desc}</span></h3>'
-                    '<table class="kc-table kc-rm-table"><thead><tr><th style="width:90px">Severity</th><th>Action</th>'
-                    '<th style="width:80px" class="kc-num">Risk&nbsp;↓</th><th style="width:74px" class="kc-num">Objects</th></tr></thead>'
-                    f'<tbody>{body}</tbody></table>')
-        if not out:
-            return ""
-        return ('<section class="kc-section" id="sec-roadmap"><h2 class="kc-h2">Prioritised action plan</h2>'
-                '<p class="kc-sub">Grouped by effort, ranked by risk reduction. “Risk ↓” is the danger-point '
-                'contribution recovered by fixing the item. Click a row to jump to the finding.</p>'
-                f'{out}</section>')
-
-    # ── top attack paths ──────────────────────────────────────────────────────
-    _ATTACK_PRIORITY = [
-        ("P-GPPPassword","GPP cpassword recoverable from SYSVOL"),
-        ("A-CertTempCustomSubject","ADCS ESC1 — enrollee-supplied SAN"),
-        ("A-CertTemplateESC4","ADCS ESC4 — template ACL takeover"),
-        ("A-CertTempAgent","ADCS ESC3 — enrollment agent abuse"),
-        ("A-CertTempAnyPurpose","ADCS ESC2 — any-purpose EKU template"),
-        ("A-CertEnrollHttp","ADCS ESC8 — HTTP enrollment relay"),
-        ("P-DCSync","DCSync rights on the domain root"),
-        ("P-DangerousACLDomain","Dangerous ACE on the domain root"),
-        ("P-RBCD-Dangerous","RBCD configured on a domain controller"),
-        ("P-WriteToPrivGroup","Write access to a privileged group"),
-        ("P-ComputerInPrivGroup","Computer account in a privileged group"),
-        ("S-SIDHistoryPrivileged","Privileged SID-history backdoor"),
-        ("P-UnconstrainedDelegation","Unconstrained delegation on a non-DC host"),
-        ("P-RBCD","Resource-based constrained delegation"),
-        ("P-ConstrainedDelegService","Constrained delegation on a service account"),
-        ("P-ServiceDomainAdmin","Service account is Domain Admin"),
-        ("S-KerberoastableAdmin","Kerberoast-able admin account"),
-        ("S-NoPreAuthAdmin","ASREP-roast-able admin account"),
-        ("A-MembershipEveryone","Everyone is a member of a privileged group"),
-        ("P-ModifiableGPO","Non-admin can edit a high-impact GPO"),
-        ("A-WDigest","WDigest stores cleartext credentials"),
-        ("A-LMCompatibilityLevel","NTLMv1 permitted on the domain"),
-        ("P-MachineAccountQuota","MachineAccountQuota > 0 (RBCD / shadow creds)"),
-        ("S-Kerberoastable","Kerberoast-able service accounts"),
-        ("S-NoPreAuth","ASREP-roast-able user accounts"),
-        ("A-DC-Coerce","MS-RPRN/WebClient coercion on DC"),
-        ("A-DnsZoneAUCreateChild","ADIDNS write — any user can spoof DNS"),
-        ("A-WSUS-HTTP","HTTP WSUS — update injection to SYSTEM"),
-        ("S-Vuln-MS14-068","DC potentially vulnerable to MS14-068"),
-        ("S-Vuln-MS17_010","Host vulnerable to MS17-010 (EternalBlue)"),
-    ]
-
-    def _paths_section(self):
-        chosen = [(h, self.by_rule[r]) for r, h in self._ATTACK_PRIORITY if r in self.by_rule]
-        if not chosen:
-            return ""
-        rows = ""
-        for headline, f in chosen:
-            one = (self._doc(f.rule_id).get("description") or f.details or f.title)
-            one = one if len(one) <= 170 else one[:167] + "…"
-            chips = "".join(f'<span class="kc-mini">{self._e(m.split(":")[0])}</span>' for m in f.mitre[:2])
-            rows += (f'<tr onclick="kcJump(\'f-{self._e(f.rule_id)}\')">'
-                     f'<td><span class="kc-sev-pill" style="background:{f.sev_colour}">{self._e(f.severity)}</span></td>'
-                     f'<td><code>{self._e(f.rule_id)}</code></td>'
-                     f'<td><strong>{self._e(headline)}</strong><div class="kc-ap-sub">{self._e(one)}</div></td>'
-                     f'<td>{chips}</td></tr>')
-        return ('<section class="kc-section" id="sec-paths"><h2 class="kc-h2">Top attack paths</h2>'
-                '<p class="kc-sub">Ranked by exploitation cost. Click a row for tradecraft and evidence.</p>'
-                '<table class="kc-table"><thead><tr><th style="width:90px">Severity</th><th style="width:190px">Rule</th>'
-                '<th>Attack vector</th><th style="width:120px">ATT&amp;CK</th></tr></thead>'
-                f'<tbody>{rows}</tbody></table></section>')
 
     # ── evidence sections ─────────────────────────────────────────────────────
     def _gpp_section(self):
@@ -5759,7 +6193,7 @@ class HTMLReporter:
 
     def _kerberoast_section(self):
         kf = [f for f in self.findings if f.rule_id in ("S-Kerberoastable","S-KerberoastableAdmin","P-Kerberoasting")]
-        accts = _dedup_keep_order([a for f in kf for a in f.affected])[:40]
+        accts = _dedup_keep_order([a for f in kf for a in f.affected])[:48]
         if not accts:
             return ""
         rows = "".join(f'<tr><td><strong>{self._e(a)}</strong></td></tr>' for a in accts)
@@ -5773,7 +6207,7 @@ class HTMLReporter:
         if not acl:
             return ""
         labels = {"dcsync":"DCSync","dangerous_acl":"Dangerous ACL","owner":"Owner","write_property":"WriteProperty","gpo_write":"GPO Write"}
-        cols = {"dcsync":"#b23a2e","dangerous_acl":"#c2702a","owner":"#c2702a","write_property":"#c9a227","gpo_write":"#c2702a"}
+        cols = {"dcsync":"#bd4234","dangerous_acl":"#cb7a2f","owner":"#cb7a2f","write_property":"#cda52b","gpo_write":"#cb7a2f"}
         rows = ""
         for f in acl:
             t = f.get("type","")
@@ -5781,8 +6215,8 @@ class HTMLReporter:
                      f'<td><span class="kc-badge" style="background:{cols.get(t,"#888")}">{labels.get(t,t)}</span></td>'
                      f'<td><strong>{self._e(f.get("right",""))}</strong></td><td>{self._e(f.get("object",""))}</td>'
                      f'<td class="kc-detail">{self._e(f.get("detail",""))}</td></tr>')
-        return ('<section class="kc-section"><h2 class="kc-h2">🔗 Control paths to Tier 0</h2>'
-                '<p class="kc-sub">Principals with these rights can reach Domain Admin via documented chains.</p>'
+        return ('<section class="kc-section"><h2 class="kc-h2">🔗 Control-path edges (Tier 0)</h2>'
+                '<p class="kc-sub">Raw ACL/owner/DCSync edges behind the Domain Dominance paths above.</p>'
                 '<table class="kc-table"><thead><tr><th>Principal</th><th>Type</th><th>Right</th><th>Target</th>'
                 f'<th>Detail</th></tr></thead><tbody>{rows}</tbody></table></section>')
 
@@ -5802,7 +6236,7 @@ class HTMLReporter:
                 '<table class="kc-table"><thead><tr><th>Partner</th><th>Type</th><th>Direction</th><th>SID filtering</th>'
                 f'<th>TGT delegation</th></tr></thead><tbody>{rows}</tbody></table></section>')
 
-    # ── findings table ────────────────────────────────────────────────────────
+    # ── findings register ──────────────────────────────────────────────────────
     def _finding_panel(self, f):
         doc = self._doc(f.rule_id); desc = doc.get("description") or f.details or ""
         parts = []
@@ -5826,7 +6260,7 @@ class HTMLReporter:
             items = "".join(f'<li><a href="{self._e(u)}" target="_blank" rel="noopener">{self._e(u)}</a></li>' for u in doc["refs"])
             parts.append(f'<div class="kc-block"><div class="kc-bh">References</div><ul class="kc-reflist">{items}</ul></div>')
         if f.affected:
-            n = len(f.affected); shown = f.affected[:80]; extra = n - len(shown)
+            n = len(f.affected); shown = f.affected[:90]; extra = n - len(shown)
             items = "".join(f'<li>{self._e(a)}</li>' for a in shown)
             tail = f'<li class="kc-more">… and {extra} more</li>' if extra > 0 else ""
             parts.append(f'<div class="kc-block"><div class="kc-bh">Affected ({n})</div><ul class="kc-affected">{items}{tail}</ul></div>')
@@ -5835,46 +6269,44 @@ class HTMLReporter:
         return "".join(parts)
 
     def _findings_section(self):
-        sf = sorted(self.findings, key=lambda f:(self._SEV_ORDER.get(f.severity,9), f.category, f.rule_id))
-        rows = []
-        seen_rid = set()
+        # Group by operational category, then severity within — the way an
+        # operator works the list during an engagement.
+        sf = sorted(self.findings, key=lambda f:(OPCAT_ORDER.index(self._opcat(f)) if self._opcat(f) in OPCAT_ORDER else 9,
+                                                 self._SEV_ORDER.get(f.severity,9), f.rule_id))
+        rows = []; seen_rid = set()
         for i, f in enumerate(sf):
-            cat_col = CAT_COLOUR.get(f.category,"#888")
-            # First finding of a rule keeps the canonical anchor f-<rule_id> so
-            # cross-links resolve; duplicates get a unique id (valid HTML).
+            oc = self._opcat(f); oc_col = OPCAT_COLOUR.get(oc,"#888")
             anchor = f"f-{f.rule_id}" if f.rule_id not in seen_rid else f"f-{f.rule_id}-{i}"
             seen_rid.add(f.rule_id)
             rows.append(
                 f'<tr class="kc-frow" id="{self._e(anchor)}" data-i="{i}" data-sev="{f.severity}" '
-                f'data-cat="{f.category}" onclick="kcTog({i})" tabindex="0" role="button" '
+                f'data-cat="{self._e(oc)}" onclick="kcTog({i})" tabindex="0" role="button" '
                 f'onkeydown="if(event.key===\'Enter\'||event.key===\' \'){{event.preventDefault();kcTog({i})}}">'
                 f'<td><span id="ic-{i}" class="kc-toggle">+</span></td>'
                 f'<td><span class="kc-sev-pill" style="background:{f.sev_colour}">{self._e(f.severity)}</span></td>'
-                f'<td><span class="kc-cat-pill" style="background:{cat_col}">{self._e(f.category)}</span></td>'
-                f'<td><span class="kc-mtag">L{f.maturity}</span></td>'
+                f'<td><span class="kc-cat-pill" style="background:{oc_col}">{self._e(oc)}</span></td>'
                 f'<td><code>{self._e(f.rule_id)}</code></td><td><strong>{self._e(f.title)}</strong></td>'
                 f'<td class="kc-num">{f.points}</td></tr>'
                 f'<tr class="kc-drow" id="dr-{i}" style="display:none"><td></td>'
-                f'<td colspan="6"><div class="kc-panel">{self._finding_panel(f)}</div></td></tr>')
+                f'<td colspan="5"><div class="kc-panel">{self._finding_panel(f)}</div></td></tr>')
+        catpills = "".join(
+            f'<button class="kc-fp kc-fp-cat" data-f="cat:{self._e(c)}" onclick="kcFil(this)" '
+            f'style="--c:{OPCAT_COLOUR[c]}">{self._e(c)}</button>' for c in OPCAT_ORDER)
         pills = ('<button class="kc-fp kc-fp-on" data-f="sev:" onclick="kcFil(this)">All</button>'
-                 '<button class="kc-fp" data-f="sev:CRITICAL" onclick="kcFil(this)" style="--c:#b23a2e">Critical</button>'
-                 '<button class="kc-fp" data-f="sev:HIGH" onclick="kcFil(this)" style="--c:#c2702a">High</button>'
-                 '<button class="kc-fp" data-f="sev:MEDIUM" onclick="kcFil(this)" style="--c:#c9a227">Medium</button>'
-                 '<button class="kc-fp" data-f="sev:LOW" onclick="kcFil(this)" style="--c:#6f8f3f">Low</button>'
-                 '<span class="kc-fsep"></span>'
-                 '<button class="kc-fp kc-fp-cat" data-f="cat:Anomaly" onclick="kcFil(this)" style="--c:#c2702a">Anomaly</button>'
-                 '<button class="kc-fp kc-fp-cat" data-f="cat:Privileged" onclick="kcFil(this)" style="--c:#a8843c">Privileged</button>'
-                 '<button class="kc-fp kc-fp-cat" data-f="cat:Stale" onclick="kcFil(this)" style="--c:#5d7a86">Stale</button>'
-                 '<button class="kc-fp kc-fp-cat" data-f="cat:Trust" onclick="kcFil(this)" style="--c:#6f8f3f">Trust</button>')
+                 '<button class="kc-fp" data-f="sev:CRITICAL" onclick="kcFil(this)" style="--c:#bd4234">Critical</button>'
+                 '<button class="kc-fp" data-f="sev:HIGH" onclick="kcFil(this)" style="--c:#cb7a2f">High</button>'
+                 '<button class="kc-fp" data-f="sev:MEDIUM" onclick="kcFil(this)" style="--c:#cda52b">Medium</button>'
+                 '<button class="kc-fp" data-f="sev:LOW" onclick="kcFil(this)" style="--c:#74934a">Low</button>'
+                 '<span class="kc-fsep"></span>' + catpills)
         return ('<section class="kc-section" id="sec-findings">'
-                f'<h2 class="kc-h2">All findings <span class="kc-count">({len(self.findings)})</span></h2>'
+                f'<h2 class="kc-h2">Finding register <span class="kc-count">({len(self.findings)})</span></h2>'
                 f'<div class="kc-toolbar"><div class="kc-pills">{pills}</div><div class="kc-toolbar-r">'
                 '<input id="kc-q" type="search" placeholder="Search findings…" oninput="kcApply()">'
                 '<button class="kc-fp" onclick="kcAll(1)">Expand</button>'
                 '<button class="kc-fp" onclick="kcAll(0)">Collapse</button></div></div>'
                 '<div class="kc-showing" id="kc-showing"></div>'
                 '<table class="kc-table kc-ftable"><thead><tr><th style="width:28px"></th><th style="width:84px">Severity</th>'
-                '<th style="width:96px">Category</th><th style="width:44px">Mat</th><th style="width:190px">Rule</th>'
+                '<th style="width:160px">Operation</th><th style="width:190px">Rule</th>'
                 '<th>Title</th><th style="width:48px" class="kc-num">Pts</th></tr></thead>'
                 f'<tbody>{"".join(rows)}</tbody></table></section>')
 
@@ -5916,7 +6348,7 @@ class HTMLReporter:
         bars = ""
         for os, n in top:
             eol = any(x in os for x in ("XP","2003","2008","Vista","2000","Windows 7"))
-            col = "#b23a2e" if eol else "#5d7a86"
+            col = "#bd4234" if eol else "#5d7a86"
             bars += (f'<div class="kc-bar-row"><div class="kc-bar-l">{self._e(os)}</div>'
                      f'<div class="kc-bar-t"><div class="kc-bar-f" style="width:{n/omax*100:.0f}%;background:{col}"></div></div>'
                      f'<div class="kc-bar-n">{n}</div></div>')
@@ -5930,36 +6362,42 @@ class HTMLReporter:
         rosters = roster("Domain Admins", da) + roster("Enterprise Admins", ea) + roster("Schema Admins", sa)
         return ('<section class="kc-section" id="sec-inventory"><h2 class="kc-h2">🏰 Domain inventory</h2>'
                 f'<div class="kc-stat-grid">{cells}</div>'
-                + (f'<h3 class="kc-sub-h">Tier-0 privileged accounts</h3>{rosters}' if rosters else "")
-                + (f'<h3 class="kc-sub-h">Operating systems</h3><div class="kc-barchart">{bars}</div>' if bars else "")
+                + (f'<div class="kc-sub-h">Tier-0 privileged accounts</div>{rosters}' if rosters else "")
+                + (f'<div class="kc-sub-h">Operating systems</div><div class="kc-barchart">{bars}</div>' if bars else "")
                 + '</section>')
 
     def _appendix(self):
+        errs = ""
+        ce = getattr(self.data, "collect_errors", None)
+        if ce:
+            items = "".join(f"<li>{self._e(x)}</li>" for x in ce)
+            errs = ('<div class="kc-block"><div class="kc-bh">Collection notes</div>'
+                    f'<ul class="kc-fixlist">{items}</ul></div>')
         return ('<section class="kc-section" id="sec-appendix"><h2 class="kc-h2">Methodology &amp; scope</h2>'
                 '<div class="kc-bb">'
                 f'<p><strong>Tool.</strong> {TOOL_NAME} v{VERSION} — an offline, Linux-based Active Directory '
-                'security assessment over LDAP/LDAPS/SMB covering four risk categories (Anomaly, Privileged, '
-                'Stale, Trust) with classic and modern-escalation coverage (RBCD, constrained delegation, ADCS ESC, privileged '
-                'SID-history, computer accounts in privileged groups).</p>'
-                '<p><strong>Scoring.</strong> Each finding carries danger points within one of four categories '
-                '(Anomaly, Privileged, Stale, Trust). Category scores cap at 100; the global score is the worst '
-                'category. A separate CMMI maturity level (1–5) reflects programme maturity — the domain’s level '
-                'is the lowest still gated by a failing rule.</p>'
+                'security assessment over LDAP/LDAPS/SMB, oriented to internal penetration testing: ACL/'
+                'delegation control paths, ADCS (ESC1-4/8), SCCM, WSUS, Kerberoasting/AS-REP, GPP/LAPS, RBCD, '
+                'pre-staged computer accounts, coercion/relay exposure and password-policy/spray surface.</p>'
+                '<p><strong>Scoring.</strong> Two axes, not one gauge. <em>Exposure</em> (0–100) is set by the '
+                'easiest available path to Tier 0 — so a hardened domain scores low and a domain with a one-step '
+                'takeover scores high. <em>Hygiene debt</em> (0–100) is a prevalence-graded measure of '
+                'misconfiguration and stale objects. The A–F posture grade combines them, exposure-weighted.</p>'
                 '<p><strong>Limitations.</strong> Results reflect what the assessing account could read at scan '
                 'time. Some controls (host-local registry, CA web-enrollment) are inferred from GPO/LDAP state and '
-                'should be confirmed on the host. Point-in-time, authorised-testing use only.</p>'
+                'should be confirmed on the host. Point-in-time, authorized-testing use only.</p>'
+                f'{errs}'
                 f'<p class="kc-muted">Generated {self._e(self.ts)} against {self._e(self.dc_ip)} '
                 f'using {self._e(self.auth_mode or "n/a")} authentication.</p></div></section>')
 
     # ── assemble ──────────────────────────────────────────────────────────────
     def render(self):
-        body = (self._cover() + self._nav() + '<main class="kc-container">' +
-                self._exec_section() + self._maturity_section() + self._roadmap_section() +
-                self._paths_section() + self._attack_section() + self._gpp_section() +
-                self._adcs_section() + self._kerberoast_section() + self._acl_section() +
-                self._trusts_section() + self._findings_section() + self._inventory_section() +
-                self._appendix() + '</main>'
-                f'<footer class="kc-footer">{TOOL_NAME} v{VERSION} — authorised security assessment use only · '
+        body = (self._head() + self._nav() + '<main class="kc-container">' +
+                self._summary_section() + self._paths_section() + self._roadmap_section() +
+                self._gpp_section() + self._adcs_section() + self._kerberoast_section() +
+                self._acl_section() + self._attack_section() + self._trusts_section() +
+                self._findings_section() + self._inventory_section() + self._appendix() + '</main>'
+                f'<footer class="kc-footer">{TOOL_NAME} v{VERSION} — authorized security assessment use only · '
                 f'generated {self._e(self.ts)}</footer>'
                 '<button class="kc-top" onclick="kcJump(\'top\')" title="Back to top">↑</button>')
         return ('<!DOCTYPE html><html lang="en" data-theme="dark"><head><meta charset="utf-8">'
@@ -6073,20 +6511,21 @@ def main():
                 print(f"[!] SMB check error: {e}")
 
     # ── score ─────────────────────────────────────────────────────────────────
-    scorer = RiskScorer(findings)
+    scorer = RiskScorer(findings, data)
     scores = scorer.score()
 
     # ── print summary ─────────────────────────────────────────────────────────
-    total = scores.get("Total", 0)
-    label, _ = RiskScorer.risk_label(total)
+    sevc = defaultdict(int)
+    for f in findings:
+        sevc[f.severity] += 1
     print(f"\n{'='*60}")
-    print(f"  RESULTS: {label}  (Score: {total}/100)")
+    print(f"  POSTURE GRADE : {scores['grade']}  ({scores['grade_label']})")
+    print(f"  Exposure      : {scores['exposure']:3d}/100  (ease of reaching Tier 0)")
+    print(f"  Hygiene debt  : {scores['hygiene']:3d}/100  (misconfig & stale load)")
     print(f"{'='*60}")
-    print(f"  Anomaly   : {scores.get('Anomaly',0):3d}/100")
-    print(f"  Privileged: {scores.get('Privileged',0):3d}/100")
-    print(f"  Stale     : {scores.get('Stale',0):3d}/100")
-    print(f"  Trust     : {scores.get('Trust',0):3d}/100")
-    print(f"  Findings  : {len(findings)}")
+    print(f"  Findings : {len(findings)}  "
+          f"(CRIT {sevc['CRITICAL']} · HIGH {sevc['HIGH']} · "
+          f"MED {sevc['MEDIUM']} · LOW {sevc['LOW']})")
     print(f"{'='*60}")
 
     sev_order = {"CRITICAL":0,"HIGH":1,"MEDIUM":2,"LOW":3,"INFO":4}
@@ -6124,13 +6563,11 @@ def main():
             "tool": TOOL_NAME, "version": VERSION,
             "domain": args.domain, "dc_ip": args.dc_ip, "auth_mode": auth_mode,
             "timestamp": datetime.datetime.now().isoformat(),
-            "scores": scores,
-            "maturity": {"level": scores.get("Maturity"),
-                         "label": MATURITY_LABEL.get(scores.get("Maturity"), "")},
+            "scores": {k: scores[k] for k in ("grade","grade_label","exposure","hygiene","cat_counts") if k in scores},
             "findings": [
                 {"rule_id": f.rule_id, "title": f.title,
-                 "category": f.category, "severity": f.severity,
-                 "points": f.points, "maturity": f.maturity, "mitre": f.mitre,
+                 "category": f.category, "operation": op_category(f.rule_id, f.category),
+                 "severity": f.severity, "points": f.points, "mitre": f.mitre,
                  "details": f.details, "affected": f.affected}
                 for f in sorted_findings
             ]
@@ -6154,7 +6591,8 @@ def main():
         print(f"[+] CSV findings saved: {cpath}")
 
     print()
-    return 0 if total < 30 else 1
+    # exit non-zero when an exploitable path / poor grade is present (useful in CI)
+    return 0 if (scores.get("exposure", 0) < 35 and scores.get("grade") in ("A", "B")) else 1
 
 
 if __name__ == "__main__":

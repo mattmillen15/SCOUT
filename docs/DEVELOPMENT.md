@@ -10,9 +10,12 @@ an assessment box with only `pip install` deps. Major pieces, top to bottom:
 
 - **Constants & rule metadata** — `RULES` (id → `(title, category, points,
   severity)`), `RULE_DOCS` (per-rule description/why/technical/exploit/
-  remediation/refs), `RULE_MATURITY` (id → CMMI level 1–5, with a severity-based
-  default), `RULE_MITRE` (id → ATT&CK techniques), `RULE_SCALE` (id →
-  `(points_per_object, cap)` for graduated scoring).
+  remediation/refs), `RULE_MITRE` (id → ATT&CK techniques), `RULE_SCALE` (id →
+  `(points_per_object, cap)`), `EXPOSURE_WEIGHTS` / `HYGIENE_WEIGHTS` (the two
+  scoring axes), `OP_CATEGORY` (id → operational category used for report
+  grouping/filtering), and `SUPPRESSED_RULES` (non-actionable rules dropped at
+  `_add`). The internal A/P/S/T `category` is now used only as a fallback for
+  `op_category()`; scoring no longer keys off it.
 - **`ADConnection`** — auth + LDAP transport (ldap3 fast path, impacket Kerberos
   path). See "Authentication" below.
 - **`ADData`** — one collection pass over LDAP (domain, users, computers, groups
@@ -23,8 +26,9 @@ an assessment box with only `pip install` deps. Major pieces, top to bottom:
   details, affected)`.
 - **`SYSVOLChecker`, `ACLAnalyzer`, `SMBChecker`** — SMB/SYSVOL, ACL/DACL and
   SMB-signing checks (impacket).
-- **`RiskScorer`** — category caps + global = max; `maturity()` = lowest level
-  among failing rules.
+- **`RiskScorer`** — two axes: `exposure()` (easiest path to Tier 0, from
+  `EXPOSURE_WEIGHTS`) and `hygiene()` (prevalence-graded debt, from
+  `HYGIENE_WEIGHTS`), combined into an A–F `grade()`.
 - **`HTMLReporter`** — single-file interactive report (`_KC_CSS`/`_KC_JS` module
   strings hold the inline theme/JS; no external assets).
 - **`main()`** — arg parsing, orchestration, HTML/JSON/CSV output.
@@ -44,23 +48,33 @@ exported via `KRB5CCNAME` so the SMB/SYSVOL Kerberos logins reuse it.
 `impacket` 0.9.24's native LDAPS is TLS 1.0 only and lacks CBT, which is why the
 recommended hardened-DC path is Kerberos-over-389 rather than LDAPS.
 
-## Scoring & maturity
+## Scoring
 
-- Per category: `min(100, sum of triggered points)`; global score = the worst of
-  the four categories.
-- Graduated scoring: rules in `RULE_SCALE` scale points with affected-object
-  count up to a cap (so 1 vs 5,000 stale objects don't score the same).
-- Maturity: each rule has a level 1–5; achieved level = the lowest level still
-  gated by a failing rule. One unfixed level-1 issue pins the domain at level 1.
+Two axes, deliberately not a single saturating gauge (which always pinned at
+100):
+
+- **Exposure (0–100)** = the highest `EXPOSURE_WEIGHTS` value among triggered
+  rules (your *easiest* path to Tier 0), plus a small breadth bonus. A hardened
+  domain scores low; a one-step takeover (GPP/DCSync/ESC1) scores ~95–100.
+- **Hygiene debt (0–100)** = sum of `HYGIENE_WEIGHTS` contributions; `pct_users`/
+  `pct_comps` entries scale by the fraction of enabled objects affected.
+- **Grade (A–F)** = `RiskScorer.grade(exposure, hygiene)`, exposure-weighted.
+- `RULE_SCALE` still graduates per-finding `points` (used for the action-plan
+  "Risk ↓" and finding sort).
+
+There is intentionally no maturity/CMMI score — it tested as not useful for an
+offensive engagement.
 
 ## Adding a rule
 
 1. Add an entry to `RULES`.
-2. Add `RULE_DOCS[id]` (description/why/exploit/remediation/refs) and, where it
-   applies, `RULE_MITRE[id]` and a `RULE_MATURITY[id]` override.
+2. Add `RULE_DOCS[id]` (description/why/exploit/remediation/refs); add
+   `RULE_MITRE[id]`, an `EXPOSURE_WEIGHTS[id]` (if it's an attack path) and/or
+   `HYGIENE_WEIGHTS[id]`, and an `OP_CATEGORY[id]` for report grouping.
 3. Emit it from a check method via `self._add(id, details, affected)`. Prefer
    reusing already-collected `ADData`; only extend collection if necessary.
-4. If it is count-driven, add it to `RULE_SCALE`.
+4. Keep it actionable — if it isn't something an operator would act on during an
+   engagement, add it to `SUPPRESSED_RULES` instead (or don't add it).
 
 ## Known limitations
 
@@ -71,7 +85,11 @@ recommended hardened-DC path is Kerberos-over-389 rather than LDAPS.
 - Some host-local controls (RestrictRemoteSAM, DSRM logon, NTLM auditing) are
   inferred from GPO state in SYSVOL, not read from the host registry.
 - `sIDHistory`/SID/time decoding can differ between the ldap3 and impacket
-  backends; checks normalise defensively but full normalisation is pending.
+  backends; checks normalize defensively but full normalization is pending.
+- SCCM/WSUS coverage is the *exposure* surface readable from AD/SYSVOL (site
+  servers, MP/site codes, HTTP WUServer). Full exploitation (NAA recovery, PXE
+  secrets, relay) needs host/network interaction and is out of scope for a
+  read-only LDAP pass — the finding points the operator at the right tooling.
 
 ## Roadmap
 
@@ -90,8 +108,10 @@ Ordered roughly by value:
 
 ## Design notes
 
-The scoring model is a per-category 0–100 danger score with the global score
-taken as the worst category, plus a separate CMMI maturity level (the maturity
-ladder follows the Carnegie Mellon / ANSSI model: 1 = Initial … 5 = Optimizing).
-SCOUT is a self-contained tool with its own rule catalogue, checks and report —
-extend it freely.
+SCOUT is a self-contained, operator-oriented tool with its own rule catalog,
+checks, scoring (Exposure + Hygiene → A–F grade) and report. Findings are
+organized by operational category (Privilege Escalation, Credential Access,
+Lateral Movement, Persistence, Recon & Exposure, Hygiene & Legacy) rather than a
+compliance taxonomy, and watered-down/non-actionable rules are suppressed by
+design. Extend it freely — keep findings actionable and scored for real
+offensive risk.
