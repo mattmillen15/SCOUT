@@ -86,10 +86,23 @@ usable credentials are present, SCOUT transparently upgrades to Kerberos.
 | `--aes-key HEX` | Kerberos AES key |
 | `--ldaps` | Use LDAPS (636) |
 | `--dc-host FQDN` | DC FQDN for the Kerberos SPN (auto-resolved otherwise) |
-| `--no-smb` / `--no-adcs` | Skip SMB/SYSVOL or ADCS checks |
+| `--no-smb` / `--no-adcs` / `--no-paths` | Skip SMB/SYSVOL, ADCS, or control-path analysis |
+| `--accurate-logon` | Reconcile `lastLogon` across every DC for privileged-inactivity findings |
 | `-o FILE` | HTML report path (default `scout_<domain>_<ts>.html`) |
 | `--json` / `--csv` | Also write JSON / CSV findings |
 | `--operator` / `--scope` | Cover-page metadata |
+
+### NetExec module
+
+`integrations/nxc/scout.py` runs the engine as a NetExec `ldap` module, reusing
+nxc's authenticated connection (LDAP-only — no SMB/SYSVOL):
+
+```bash
+cp integrations/nxc/scout.py ~/.nxc/modules/scout.py
+export SCOUT_PATH=$PWD/scout.py
+nxc ldap <dc> -u user -p pass -M scout            # writes scout_<domain>.html
+nxc ldap <dc> -u user -p pass -M scout -o NO_PATHS=true JSON=true
+```
 
 ## Output
 

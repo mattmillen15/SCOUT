@@ -1793,6 +1793,16 @@ Examples:
     out.add_argument("--no-color",      action="store_true", help="Disable color output")
     return p
 
+def make_args(**overrides):
+    """A fully-defaulted args namespace (every CLI flag at its argparse default),
+    with overrides applied. Lets embedders — notably the NetExec module — drive
+    the engine without reconstructing the whole flag set."""
+    ns = build_parser().parse_args(["-d", overrides.get("domain", "example.local"),
+                                    "--dc-ip", overrides.get("dc_ip", "127.0.0.1")])
+    for k, v in overrides.items():
+        setattr(ns, k, v)
+    return ns
+
 # ─────────────────────────────────────────────────────────────────────────────
 # FINDING  (one rule trigger)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2104,15 +2114,20 @@ class ADConnection:
             self.args.dc_host = dc_fqdn
         # pull naming contexts AND functional levels from RootDSE (no ldap3
         # server.info on this path, so collection reads these from here).
+        self._load_rootdse_impacket()
+        return True
+
+    def _load_rootdse_impacket(self):
+        """Populate naming contexts + functional levels from RootDSE over the
+        impacket backend. Shared by the Kerberos path and adopt_impacket()."""
         try:
-            resp = ic.search(searchBase="", searchFilter="(objectClass=*)",
-                             scope=LDAPScope("baseObject"),
-                             attributes=["defaultNamingContext",
-                                         "configurationNamingContext",
-                                         "schemaNamingContext",
-                                         "rootDomainNamingContext",
-                                         "domainFunctionality",
-                                         "forestFunctionality"])
+            from impacket.ldap.ldapasn1 import Scope as LDAPScope
+            resp = self._impacket.search(
+                searchBase="", searchFilter="(objectClass=*)",
+                scope=LDAPScope("baseObject"),
+                attributes=["defaultNamingContext", "configurationNamingContext",
+                            "schemaNamingContext", "rootDomainNamingContext",
+                            "domainFunctionality", "forestFunctionality"])
             for entry in resp:
                 # impacket can return SearchResultReference/Done entries with no
                 # 'attributes' — guard per-entry so they don't abort the loop.
@@ -2133,7 +2148,7 @@ class ADConnection:
                         try: self.forest_func = int(v)
                         except ValueError: pass
         except Exception as e:
-            if self.args.verbose:
+            if getattr(self.args, "verbose", False):
                 print(f"[!] RootDSE read failed: {e}")
         if not self.base_dn:
             self.base_dn = ",".join(f"DC={p}" for p in self.args.domain.split("."))
@@ -2141,6 +2156,14 @@ class ADConnection:
             self.cfg_nc = f"CN=Configuration,{self.base_dn}"
         if not self.sch_nc:
             self.sch_nc = f"CN=Schema,{self.cfg_nc}"
+
+    def adopt_impacket(self, ldap_connection) -> bool:
+        """Reuse an already-authenticated impacket LDAPConnection (e.g. NetExec's
+        connection.ldap_connection) instead of binding ourselves — this is what
+        lets the engine run as an `nxc ldap -M scout` module (roadmap item 8).
+        All of SCOUT's impacket-backend search code keys off self._impacket."""
+        self._impacket = ldap_connection
+        self._load_rootdse_impacket()
         return True
 
     def _impacket_search(self, base: str, flt: str, attrs: List[str],

@@ -128,9 +128,12 @@ Status as of the control-path overhaul:
    `lastLogonTimestamp` (up to ~14 days stale) against the non-replicated
    `lastLogon` on every DC for the privileged-inactivity findings, clearing false
    "inactive"/"never logged on" admins. Off by default (extra per-DC binds).
-8. **Deferred.** A NetExec (`nxc ldap`) module that reuses the engine is a
-   separate deliverable — the engine is a monolith bound to its own
-   `ADConnection`, so a clean port needs refactoring and an nxc test rig.
+8. **Done.** `integrations/nxc/scout.py` is a NetExec `ldap` module that adopts
+   nxc's already-authenticated impacket LDAP connection
+   (`ADConnection.adopt_impacket()`) and runs the engine, writing SCOUT's HTML/
+   JSON report. LDAP-only (no SMB/SYSVOL). `make_args()` provides a fully
+   defaulted args namespace for embedders. Validated against a live DC:
+   `nxc ldap <dc> -u u -p p -M scout`.
 9. **Done.** `classify_trust()` classifies every trust (scope: intra-forest /
    forest / external / realm; transitivity; direction; SID-filtering; selective
    auth; TGT delegation) into a reachable-domains "Trust map" in the report, with
