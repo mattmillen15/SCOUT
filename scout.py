@@ -2113,6 +2113,7 @@ class ADData:
         self.sites:         List[Dict] = []
         self.subnets:       List[Dict] = []
         self.psoes:         List[Dict] = []
+        self.ous:           List[Dict] = []
         self.cert_templates:List[Dict] = []
         self.enrollment_svcs:List[Dict] = []
         self.dns_zones:     List[Dict] = []
@@ -2157,6 +2158,7 @@ class ADData:
             ("GPOs",                     self._collect_gpos),
             ("sites/subnets",            self._collect_sites),
             ("password settings objects",self._collect_psoes),
+            ("OUs / GPO links",          self._collect_ous),
         ]
         if not self.args.no_adcs:
             steps.append(("ADCS objects", self._collect_adcs))
@@ -2396,6 +2398,16 @@ class ADData:
             "msDS-MaximumPasswordAge","msDS-LockoutThreshold",
             "msDS-AppliesTo","msDS-PasswordHistoryLength",
             "msDS-PSOAppliesTo"])
+
+    # ── OUs / GPO links ───────────────────────────────────────────────────────
+
+    def _collect_ous(self):
+        # gPLink on OUs (and the domain root, already collected) lets the
+        # control-path analyzer resolve which GPOs actually apply to DCs/Tier-0
+        # rather than assuming every GPO reaches Tier 0.
+        self.ous = self.conn.paged_search(
+            self.base, "(objectClass=organizationalUnit)",
+            ["distinguishedName", "name", "gPLink", "gPOptions"])
 
     # ── ADCS ─────────────────────────────────────────────────────────────────
 
@@ -5435,6 +5447,8 @@ class ControlPathAnalyzer:
         self.conn = conn; self.data = data; self.args = args
         self.sid2name = {}; self.dn2sid = {}; self.adj = defaultdict(list); self.radj = defaultdict(list)
         self.medges = defaultdict(list)  # membership-only (member -> group)
+        self.sid2obj = {}   # sid -> ("user"|"computer"|"group", obj)
+        self.dn2obj = {}    # dn.lower() -> ("user"|"computer"|"group", obj)
 
     def run(self):
         if not HAS_IMPACKET_LDAP:
@@ -5459,14 +5473,19 @@ class ControlPathAnalyzer:
 
     def _index(self):
         d = self.data
-        for obj in list(d.users) + list(d.computers) + list(d.groups.values()):
-            sid = self._sid_of(obj); dn = obj.get("dn","")
-            if not sid:
-                continue
-            sam = get_str(obj["attrs"], "sAMAccountName") or dn_base(dn)
-            self.sid2name[sid] = sam
-            if dn:
-                self.dn2sid[dn.lower()] = sid
+        for kind, objs in (("user", d.users), ("computer", d.computers),
+                           ("group", list(d.groups.values()))):
+            for obj in objs:
+                sid = self._sid_of(obj); dn = obj.get("dn","")
+                sam = get_str(obj["attrs"], "sAMAccountName") or dn_base(dn)
+                if dn:
+                    self.dn2obj[dn.lower()] = (kind, obj)
+                if not sid:
+                    continue
+                self.sid2name[sid] = sam
+                self.sid2obj[sid] = (kind, obj)
+                if dn:
+                    self.dn2sid[dn.lower()] = sid
         # well-known + domain-relative broad principals
         self.sid2name.update({"S-1-1-0":"Everyone","S-1-5-11":"Authenticated Users",
                               "S-1-5-7":"Anonymous Logon"})
@@ -5521,23 +5540,56 @@ class ControlPathAnalyzer:
                     self._edge(self._sid_of(obj), gsid, "primary group", membership=True)
 
     def _acl_edges(self):
-        # bulk-read SDs for groups + privileged (adminCount) users; per-object for
-        # the domain root, AdminSDHolder and GPOs.
+        # Bulk-read SDs for groups, then for EVERY user and computer (roadmap 1 —
+        # objectClass=user matches computers too, so one paged query covers both).
+        # This catches paths routing through control over an arbitrary non-admin
+        # object (e.g. WriteDacl over a computer that is in a privileged group, or
+        # an RBCD/shadow-cred target), which the old admin-only read missed.
         for dn, sid, sd in self._bulk_sds("(objectClass=group)"):
             if sid:
                 self._add_acl_edges(sd, sid, "group")
-        for dn, sid, sd in self._bulk_sds("(&(objectCategory=person)(objectClass=user)(adminCount=1))"):
+        for dn, sid, sd in self._bulk_sds("(objectClass=user)"):
             if sid:
-                self._add_acl_edges(sd, sid, "admin user")
+                self._add_acl_edges(sd, sid, "object")
         # domain root (DCSync / takeover -> Tier 0)
         sd = self._fetch_one_sd(self.conn.base_dn)
         if sd:
             self._add_acl_edges(sd, self.domain_root, "domain root", dcsync=True)
-        # GPOs -> Tier 0 (editing a GPO ≈ SYSTEM on linked hosts). Bulk-read every
-        # GPO security descriptor in ONE paged query rather than one LDAP
-        # round-trip per GPO — the per-object fetch was the dominant control-path
-        # slowdown on large domains (hundreds of sequential searches).
-        gpo_by_dn = {g.get("dn","").lower(): g for g in self.data.gpos if g.get("dn")}
+        self._gpo_edges()
+
+    @staticmethod
+    def _parse_gplink(gplink: str) -> List[str]:
+        """Extract linked GPO DNs from a gPLink value:
+        [LDAP://cn={GUID},cn=policies,cn=system,DC=…;0][LDAP://…;2]."""
+        if not gplink:
+            return []
+        return [m.group(1).strip() for m in
+                re.finditer(r'\[LDAP://([^;\]]+);?\d*\]', gplink, re.I)]
+
+    def _gpo_edges(self):
+        """GPO control -> Tier 0, with real gPLink resolution (roadmap 1). A GPO
+        only gets a Tier-0 edge when it is actually linked to a container that
+        affects domain controllers (the domain root or the DCs' parent OU);
+        editing a GPO linked only to a workstation OU is SYSTEM on those hosts,
+        not an automatic path to DA. Every GPO SD is bulk-read in one query."""
+        d = self.data
+        gpo_by_dn = {g.get("dn", "").lower(): g for g in d.gpos if g.get("dn")}
+        # containers whose linked GPOs reach Tier 0: domain root + each DC's parent OU
+        tier0_containers = {self.domain_root}
+        for dc in d.dcs:
+            dcdn = dc.get("dn", "")
+            if "," in dcdn:
+                tier0_containers.add(dcdn.split(",", 1)[1].lower())
+        # GPO DN -> set of container DNs that link it
+        linked = defaultdict(set)
+        containers = []
+        if d.domain_obj:
+            containers.append((self.conn.base_dn, get_str(d.domain_obj["attrs"], "gPLink")))
+        for ou in getattr(d, "ous", []):
+            containers.append((ou.get("dn", ""), get_str(ou["attrs"], "gPLink")))
+        for cdn, gplink in containers:
+            for gdn in self._parse_gplink(gplink):
+                linked[gdn.lower()].add((cdn or "").lower())
         for dn, _sid, sd in self._bulk_sds("(objectClass=groupPolicyContainer)"):
             gpo = gpo_by_dn.get(dn.lower())
             if not sd or gpo is None:
@@ -5545,7 +5597,12 @@ class ControlPathAnalyzer:
             gnode = "GPO:" + dn.lower()
             self.sid2name[gnode] = "GPO " + (get_str(gpo["attrs"], "displayName") or dn_base(dn))
             self._add_acl_edges(sd, gnode, "gpo")
-            self._edge(gnode, self.domain_root, "applies to hosts")
+            link_cdns = linked.get(dn.lower(), set())
+            if any(c in tier0_containers for c in link_cdns):
+                self._edge(gnode, self.domain_root, "linked to DCs")
+            # GPOs not linked to a DC-affecting container intentionally get no
+            # Tier-0 edge — controlling them is still surfaced as a finding, but
+            # it is not a path to Domain Admin.
 
     def _add_acl_edges(self, sd, target_node, kind, dcsync=False):
         try:
@@ -5611,8 +5668,87 @@ class ControlPathAnalyzer:
             p = self._shortest(s)
             if p:
                 paths.append((self.sid2name.get(s, s), p, s in self.broad))
+        nodes, edges = self._build_node_registry(paths)
         self.data.control_paths = {"count": len(control), "broad": _dedup_keep_order(broad),
-                                   "paths": paths}
+                                   "paths": paths, "nodes": nodes, "edges": edges}
+
+    def _acct_info(self, kind, obj) -> Dict:
+        """Per-principal facts the report shows in the node drawer (PingCastle-
+        style): enabled, password age, last-logon age, kerberoastable, stale."""
+        a = obj["attrs"]
+        uac = get_int(a, "userAccountControl")
+        sam = get_str(a, "sAMAccountName") or dn_base(obj.get("dn", ""))
+        enabled = not uac_has(uac, UAC_ACCOUNTDISABLE)
+        pwd_age = days_since(filetime_to_dt(get_int(a, "pwdLastSet")))
+        logon_age = days_since(filetime_to_dt(get_int(a, "lastLogonTimestamp")))
+        spn = bool(get_list(a, "servicePrincipalName"))
+        stale = bool(enabled and (logon_age is None or logon_age > 90))
+        return {"sam": sam, "kind": kind, "enabled": enabled, "pwd_age": pwd_age,
+                "logon_age": logon_age, "spn": spn, "stale": stale}
+
+    def _node_meta(self, name) -> Dict:
+        """Metadata for one path node, keyed by its display name. Drives the
+        clickable node drawer + graph in the report."""
+        meta = {"label": name, "type": "object", "sid": "", "enabled": None,
+                "pwd_age": None, "logon_age": None, "spn": False, "stale": False,
+                "tier0": False, "members": [], "member_count": 0, "note": ""}
+        if name == "Domain root":
+            meta.update(type="domain", tier0=True,
+                        note="The domain head object. DCSync or takeover here is full domain compromise.")
+            return meta
+        if name.startswith("GPO "):
+            meta.update(type="gpo",
+                        note="Editing a linked GPO runs code as SYSTEM on every computer it applies to.")
+            return meta
+        if name in ("Everyone", "Authenticated Users", "Anonymous Logon",
+                    "Domain Users", "Domain Computers"):
+            meta.update(type="broad",
+                        note="Built-in broad principal — effectively every "
+                             "(authenticated) user in the domain.")
+            return meta
+        sid = self._name2sid.get(name, "")
+        meta["sid"] = sid
+        if sid in self.tier0_groups:
+            meta["tier0"] = True
+        ent = self.sid2obj.get(sid)
+        if not ent:
+            return meta
+        kind, obj = ent
+        meta["type"] = kind
+        if kind in ("user", "computer"):
+            info = self._acct_info(kind, obj)
+            meta.update(enabled=info["enabled"], pwd_age=info["pwd_age"],
+                        logon_age=info["logon_age"], spn=info["spn"], stale=info["stale"])
+        elif kind == "group":
+            mdns = get_list(obj["attrs"], "member")
+            meta["member_count"] = len(mdns)
+            members = []
+            for mdn in mdns[:80]:
+                me = self.dn2obj.get(mdn.lower())
+                if me:
+                    members.append(self._acct_info(me[0], me[1]))
+                else:
+                    members.append({"sam": dn_base(mdn), "kind": "external",
+                                    "enabled": None, "pwd_age": None,
+                                    "logon_age": None, "spn": False, "stale": False})
+            meta["members"] = members
+        return meta
+
+    def _build_node_registry(self, paths):
+        """Collect node metadata + the unique edge set across the emitted paths,
+        for the clickable drawer and the graph visual in the report."""
+        self._name2sid = {nm: sid for sid, nm in self.sid2name.items()}
+        nodes, edges, seen_edge = {}, [], set()
+        for _name, path, _broad in paths:
+            for src, label, dst in path:
+                for nm in (src, dst):
+                    if nm not in nodes:
+                        nodes[nm] = self._node_meta(nm)
+                ek = (src, label, dst)
+                if ek not in seen_edge:
+                    seen_edge.add(ek)
+                    edges.append({"src": src, "label": label, "dst": dst})
+        return nodes, edges
 
     def _shortest(self, start):
         from collections import deque
@@ -6164,6 +6300,39 @@ html[data-theme=light] .kc-nav{background:rgba(222,218,198,.96)}
 .kc-mini{display:inline-block;font-family:var(--mono);font-size:10px;background:var(--surface3);
   border:1px solid var(--border2);color:var(--deck);border-radius:3px;padding:1px 5px;margin:1px 2px}
 
+/* ── control-path: clickable nodes, graph, drawer ── */
+.kc-node.clk{cursor:pointer;transition:border-color .1s,color .1s}
+.kc-node.clk:hover,.kc-node.clk:focus{border-color:var(--accent);color:var(--accent);outline:none}
+.kc-node.clk[data-stale="1"]::after{content:"●";color:var(--warn);font-size:8px;margin-left:5px;transform:translateY(-1px)}
+.kc-graph-wrap{overflow:auto;border:1px solid var(--border);border-radius:var(--r-sm);
+  background:var(--surface2);padding:10px;margin-bottom:14px;max-height:560px}
+.kc-gnode{cursor:pointer} .kc-gnode rect{transition:stroke-width .1s}
+.kc-gnode:hover rect,.kc-gnode:focus rect{stroke-width:2.4;outline:none}
+.kc-drawer-ov{position:fixed;inset:0;background:rgba(8,9,5,.55);z-index:190;display:none}
+.kc-drawer-ov.open{display:block}
+.kc-drawer{position:fixed;top:0;right:-520px;width:480px;max-width:94vw;height:100%;
+  background:var(--surface);border-left:1px solid var(--border2);box-shadow:-6px 0 26px rgba(0,0,0,.42);
+  z-index:200;transition:right .18s ease;overflow:auto}
+.kc-drawer.open{right:0}
+.kc-dw-h{display:flex;align-items:center;gap:10px;padding:14px 18px;border-bottom:1px solid var(--border);
+  position:sticky;top:0;background:var(--surface)}
+.kc-dw-h .nm{font-size:16px;font-weight:800;word-break:break-word}
+.kc-dw-x{margin-left:auto;background:var(--surface2);border:1px solid var(--border2);color:var(--text);
+  width:30px;height:30px;border-radius:var(--r-sm);cursor:pointer;font-size:16px;flex-shrink:0}
+.kc-dw-x:hover{border-color:var(--accent);color:var(--accent)}
+.kc-dw-b{padding:14px 18px}
+.kc-dw-badge{display:inline-block;font-family:var(--mono);font-size:9.5px;letter-spacing:.06em;
+  text-transform:uppercase;padding:2px 7px;border-radius:3px;border:1px solid var(--border2);color:var(--muted);margin-right:5px}
+.kc-dw-badge.t0{background:var(--crit);color:#fff;border-color:var(--crit)}
+.kc-dw-note{color:var(--muted);font-size:12.5px;margin:8px 0 12px;line-height:1.55}
+.kc-dw-facts{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:12.5px;margin-bottom:10px}
+.kc-dw-facts dt{color:var(--faint);font-family:var(--mono);font-size:10.5px;text-transform:uppercase}
+.kc-dw-mt{width:100%;border-collapse:collapse;font-size:12px;margin-top:6px}
+.kc-dw-mt th{text-align:left;color:var(--deck);font-family:var(--mono);font-size:9.5px;text-transform:uppercase;
+  padding:5px 7px;border-bottom:1px solid var(--border)}
+.kc-dw-mt td{padding:5px 7px;border-bottom:1px solid var(--border)}
+.kc-dw-mt tr.stale td{background:rgba(205,165,43,.08)}
+
 /* roadmap */
 .kc-rm-tier{font-size:13px;letter-spacing:.05em;text-transform:uppercase;color:var(--deck);margin:18px 0 8px;font-weight:700}
 .kc-rm-desc{font-weight:400;font-size:12px;color:var(--muted);text-transform:none;letter-spacing:0}
@@ -6320,6 +6489,53 @@ document.addEventListener('DOMContentLoaded',function(){kcApply();
   function spy(){var y=window.scrollY+110,cur=null;secs.forEach(function(s){if(s.offsetTop<=y)cur=s.id;});
     Object.keys(links).forEach(function(k){links[k].classList.toggle('active',k===cur);});}
   window.addEventListener('scroll',spy);spy();});
+/* ── control-path node detail drawer (PingCastle-style drill-down) ── */
+function kcEsc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){
+  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+function kcAge(d){return d==null?'—':(d+'d');}
+function kcStat(v){return v===false?'<span class="kc-bad">disabled</span>':
+  (v===true?'<span class="kc-ok">enabled</span>':'—');}
+function kcNode(el){
+  var name=el.getAttribute('data-node');var m=(window.KC_NODES||{})[name];
+  var dw=document.getElementById('kc-drawer'),ov=document.getElementById('kc-drawer-ov');
+  var body=document.getElementById('kc-dw-body'),ttl=document.getElementById('kc-dw-name');
+  if(!dw||!body)return;ttl.textContent=name;
+  if(!m){body.innerHTML='<p class="kc-dw-note">No additional detail was collected for this node.</p>';}
+  else{
+    var h='<div style="margin-bottom:8px"><span class="kc-dw-badge'+(m.tier0?' t0':'')+'">'+kcEsc(m.type||'object')+'</span>';
+    if(m.tier0)h+='<span class="kc-dw-badge t0">Tier 0</span>';h+='</div>';
+    if(m.note)h+='<div class="kc-dw-note">'+kcEsc(m.note)+'</div>';
+    if(m.type==='user'||m.type==='computer'){
+      h+='<dl class="kc-dw-facts">'+
+         '<dt>Enabled</dt><dd>'+kcStat(m.enabled)+'</dd>'+
+         '<dt>Password age</dt><dd>'+kcAge(m.pwd_age)+'</dd>'+
+         '<dt>Last logon</dt><dd>'+(m.logon_age==null?'never / unknown':kcAge(m.logon_age))+'</dd>'+
+         '<dt>Kerberoastable</dt><dd>'+(m.spn?'<span class="kc-bad">yes (has SPN)</span>':'no')+'</dd>'+
+         '<dt>Stale</dt><dd>'+(m.stale?'<span class="kc-warn">yes (&gt;90d / never)</span>':'no')+'</dd>'+
+         (m.sid?'<dt>SID</dt><dd class="kc-mono" style="font-size:11px">'+kcEsc(m.sid)+'</dd>':'')+'</dl>';
+    }else if(m.type==='group'){
+      var mem=m.members||[];
+      h+='<div class="kc-dw-note">'+(m.member_count||0)+' direct member(s)'+
+         (mem.length<(m.member_count||0)?(' (showing first '+mem.length+')'):'')+'.</div>';
+      if(mem.length){
+        h+='<table class="kc-dw-mt"><thead><tr><th>Member</th><th>Status</th><th>Pwd age</th><th>Last logon</th><th>Flags</th></tr></thead><tbody>';
+        mem.forEach(function(mm){var fl=[];if(mm.spn)fl.push('kerberoastable');if(mm.stale)fl.push('stale');
+          h+='<tr'+(mm.stale?' class="stale"':'')+'><td>'+kcEsc(mm.sam)+'</td><td>'+kcStat(mm.enabled)+
+             '</td><td>'+kcAge(mm.pwd_age)+'</td><td>'+(mm.logon_age==null?'—':kcAge(mm.logon_age))+
+             '</td><td>'+kcEsc(fl.join(', '))+'</td></tr>';});
+        h+='</tbody></table>';
+      }
+      if(m.sid)h+='<div class="kc-mono" style="font-size:11px;color:var(--faint);margin-top:8px">'+kcEsc(m.sid)+'</div>';
+    }else if(m.sid){
+      h+='<dl class="kc-dw-facts"><dt>SID</dt><dd class="kc-mono" style="font-size:11px">'+kcEsc(m.sid)+'</dd></dl>';
+    }
+    body.innerHTML=h;
+  }
+  dw.classList.add('open');if(ov)ov.classList.add('open');dw.scrollTop=0;
+}
+function kcCloseDrawer(){var dw=document.getElementById('kc-drawer'),ov=document.getElementById('kc-drawer-ov');
+  if(dw)dw.classList.remove('open');if(ov)ov.classList.remove('open');}
+document.addEventListener('keydown',function(e){if(e.key==='Escape')kcCloseDrawer();});
 """
 
 
@@ -6571,6 +6787,105 @@ class HTMLReporter:
         ic = f'<span class="ic">{icon}</span>' if icon else ""
         return f'<span class="{cls}">{ic}{self._e(label)}</span>'
 
+    # ── control-path node registry / clickable nodes / graph ──────────────────
+    def _cp(self):
+        return getattr(self.data, "control_paths", None) or {}
+
+    def _cp_nodes(self):
+        return self._cp().get("nodes") or {}
+
+    def _pnode(self, name, kind=""):
+        """A clickable control-path node — opens the detail drawer (PingCastle-
+        style: group members, account enabled / pwd-age / stale, etc.)."""
+        meta = self._cp_nodes().get(name, {})
+        if not kind:
+            kind = "crown" if meta.get("tier0") else ("loot" if meta.get("type") == "gpo" else "")
+        cls = "kc-node clk" + (f" {kind}" if kind else "")
+        stale = ' data-stale="1"' if meta.get("stale") else ''
+        known = ' data-known="1"' if name in self._cp_nodes() else ''
+        return (f'<span class="{cls}" role="button" tabindex="0" data-node="{self._e(name)}"{stale}{known} '
+                f'onclick="kcNode(this)" onkeydown="if(event.key===\'Enter\'){{kcNode(this)}}">'
+                f'{self._e(name)}</span>')
+
+    def _node_registry_json(self):
+        import json as _json
+        nodes = self._cp_nodes()
+        return _json.dumps(nodes, default=str).replace("</", "<\\/")
+
+    def _control_graph_svg(self):
+        """Server-rendered layered graph of the control paths — the 'visual' an
+        operator can click into. No JS layout dependency; nodes are clickable."""
+        cp = self._cp(); edges = cp.get("edges") or []; meta = cp.get("nodes") or {}
+        if not edges:
+            return ""
+        names = list(meta.keys())
+        adj = defaultdict(set); radj = defaultdict(set)
+        for e in edges:
+            if e["src"] in meta and e["dst"] in meta:
+                adj[e["src"]].add(e["dst"]); radj[e["dst"]].add(e["src"])
+        # layer = longest distance from a source; relax with a cap to survive cycles
+        layer = {n: 0 for n in names}
+        for _ in range(len(names) + 1):
+            changed = False
+            for n in names:
+                if radj[n]:
+                    lv = 1 + max((layer[p] for p in radj[n]), default=0)
+                    if lv > layer[n] and lv <= len(names):
+                        layer[n] = lv; changed = True
+            if not changed:
+                break
+        layers = defaultdict(list)
+        for n in names:
+            layers[layer[n]].append(n)
+        for lv in layers:
+            layers[lv].sort()
+        maxlayer = max(layers) if layers else 0
+        rowmax = max((len(v) for v in layers.values()), default=1)
+        NW, NH, GX, GY, MX, MY = 168, 30, 66, 14, 14, 16
+        width = MX * 2 + (maxlayer + 1) * NW + maxlayer * GX
+        height = MY * 2 + rowmax * (NH + GY)
+        pos = {}
+        for lv, ns in layers.items():
+            x = MX + lv * (NW + GX)
+            total = len(ns) * (NH + GY) - GY
+            y0 = MY + (height - 2 * MY - total) / 2
+            for i, n in enumerate(ns):
+                pos[n] = (x, y0 + i * (NH + GY))
+        def col(n):
+            m = meta.get(n, {})
+            if m.get("tier0"): return ("rgba(189,66,52,.18)", "var(--crit)")
+            t = m.get("type", "")
+            if t == "group":   return ("var(--surface3)", "var(--accent2)")
+            if t == "gpo":     return ("var(--surface3)", "var(--accent)")
+            if t == "broad":   return ("rgba(203,122,47,.16)", "var(--high)")
+            if m.get("stale"): return ("var(--surface3)", "var(--warn)")
+            return ("var(--surface3)", "var(--border2)")
+        seg = ['<defs><marker id="kcarr" markerWidth="9" markerHeight="9" refX="8" refY="3" '
+               'orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="var(--accent)"/></marker></defs>']
+        for e in edges:
+            if e["src"] not in pos or e["dst"] not in pos:
+                continue
+            x1, y1 = pos[e["src"]]; x2, y2 = pos[e["dst"]]
+            sx, sy = x1 + NW, y1 + NH / 2; ex, ey = x2, y2 + NH / 2
+            mx, my = (sx + ex) / 2, (sy + ey) / 2
+            seg.append(f'<line x1="{sx:.0f}" y1="{sy:.0f}" x2="{ex:.0f}" y2="{ey:.0f}" '
+                       f'stroke="var(--border2)" stroke-width="1.3" marker-end="url(#kcarr)"/>')
+            seg.append(f'<text x="{mx:.0f}" y="{my-3:.0f}" text-anchor="middle" font-size="9" '
+                       f'fill="var(--muted)" font-family="var(--mono)">{self._e(e["label"])}</text>')
+        for n, (x, y) in pos.items():
+            fill, stroke = col(n)
+            lbl = n if len(n) <= 22 else n[:21] + "…"
+            seg.append(
+                f'<g class="kc-gnode" role="button" tabindex="0" data-node="{self._e(n)}" '
+                f'onclick="kcNode(this)" onkeydown="if(event.key===\'Enter\'){{kcNode(this)}}">'
+                f'<rect x="{x:.0f}" y="{y:.0f}" width="{NW}" height="{NH}" rx="6" fill="{fill}" '
+                f'stroke="{stroke}" stroke-width="1.4"/>'
+                f'<text x="{x+NW/2:.0f}" y="{y+NH/2+4:.0f}" text-anchor="middle" font-size="11.5" '
+                f'fill="var(--text)" font-family="var(--sans)">{self._e(lbl)}</text></g>')
+        return (f'<div class="kc-graph-wrap"><svg width="{width:.0f}" height="{height:.0f}" '
+                f'viewBox="0 0 {width:.0f} {height:.0f}" role="img" '
+                f'aria-label="Control-path graph to Tier 0">{"".join(seg)}</svg></div>')
+
     def _edge(self, label):
         return f'<span class="kc-edge">{self._e(label)}</span>'
 
@@ -6799,25 +7114,32 @@ class HTMLReporter:
                 '<th class="kc-num">Admin</th><th class="kc-num">Pwd age (d)</th>'
                 '<th class="kc-num">Last logon (d)</th><th>Flags</th></tr></thead>'
                 f'<tbody>{rows}</tbody></table></div></div>')
-        # control-path closure: shortest paths to Domain Admin (BloodHound-style)
-        cpaths = getattr(self.data, "control_paths", None) or {}
+        # control-path closure: shortest paths to Domain Admin (PingCastle /
+        # BloodHound-style). Nodes are clickable — click one to open the drawer
+        # with its members / account facts; the graph gives the visual overview.
+        cpaths = self._cp()
         cp = ""
         if cpaths.get("paths"):
             chains = ""
             for name, path, is_broad in cpaths["paths"]:
                 if not path:
                     continue
-                ne = [self._node(path[0][0], "attacker")]
+                ne = [self._pnode(path[0][0], "attacker")]
                 for k, (src, label, dst) in enumerate(path):
                     last = (k == len(path) - 1)
-                    ne += [label, self._node(dst, "crown" if last else "")]
+                    ne += [label, self._pnode(dst, "crown" if last else "")]
                 chains += self._chain(ne, "CRITICAL" if is_broad else "HIGH",
-                                      "via membership + ACL/owner edges")
+                                      "membership + ACL / ownership")
             extra = cpaths.get("count", 0) - len(cpaths["paths"])
             more = f'<p class="kc-sub">… and {extra} more principal(s) with a path to Tier-0.</p>' if extra > 0 else ""
-            cp = ('<div class="kc-sub-h">Shortest paths to Domain Admin '
+            graph = self._control_graph_svg()
+            graph_hdr = ('<div class="kc-sub-h">Control-path graph '
+                         '<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--faint)">'
+                         '— click any node for members / account detail</span></div>') if graph else ""
+            cp = (graph_hdr + graph +
+                  '<div class="kc-sub-h">Shortest paths to Domain Admin '
                   f'<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--faint)">'
-                  f'— {cpaths.get("count",0)} non-privileged principal(s) can reach Tier-0</span></div>'
+                  f'— {cpaths.get("count",0)} non-privileged principal(s) can reach Tier-0; click a node</span></div>'
                   f'{chains}{more}')
         if not blocks and not cp:
             return ""
@@ -6982,16 +7304,23 @@ class HTMLReporter:
 
     # ── assemble ──────────────────────────────────────────────────────────────
     def render(self):
+        drawer = ('<div class="kc-drawer-ov" id="kc-drawer-ov" onclick="kcCloseDrawer()"></div>'
+                  '<aside class="kc-drawer" id="kc-drawer" aria-label="Node detail">'
+                  '<div class="kc-dw-h"><span class="nm" id="kc-dw-name"></span>'
+                  '<button class="kc-dw-x" onclick="kcCloseDrawer()" title="Close">✕</button></div>'
+                  '<div class="kc-dw-b" id="kc-dw-body"></div></aside>')
         body = (self._head() + self._nav() + '<main class="kc-container">' +
                 self._summary_section() + self._paths_section() +
-                self._privileged_section() + self._findings_section() + '</main>'
+                self._privileged_section() + self._findings_section() + '</main>' + drawer +
                 f'<footer class="kc-footer">{TOOL_NAME} v{VERSION} — authorized security assessment use only · '
                 f'generated {self._e(self.ts)}</footer>'
                 '<button class="kc-top" onclick="kcJump(\'top\')" title="Back to top">↑</button>')
+        registry = '<script>window.KC_NODES=' + self._node_registry_json() + ';</script>'
         return ('<!DOCTYPE html><html lang="en" data-theme="dark"><head><meta charset="utf-8">'
                 '<meta name="viewport" content="width=device-width,initial-scale=1">'
                 f'<title>{TOOL_NAME} — {self._e(self.domain)}</title><style>' + _KC_CSS +
-                '</style></head><body>' + body + '<script>' + _KC_JS + '</script></body></html>')
+                '</style></head><body>' + body + registry +
+                '<script>' + _KC_JS + '</script></body></html>')
 
     def _remediation(self, rule_id):
         r = (RULE_DOCS.get(rule_id, {}) or {}).get("remediation")
