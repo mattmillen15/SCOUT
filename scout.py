@@ -4,10 +4,11 @@ SCOUT - Security Configuration Observation & Understanding Tool
 Active Directory security assessment for non-domain-joined Linux operators.
 
 Operator-oriented internal AD assessment: control-path / domain-dominance
-analysis, ADCS (ESC1-4/8), SCCM, WSUS, Kerberoasting/AS-REP, GPP/LAPS, RBCD,
-pre-staged computer accounts, coercion/relay and spray surface, with MITRE
-ATT&CK mapping. Scored on two axes — Exposure (easiest path to Tier 0) and
-Hygiene debt — combined into an A-F posture grade (not a saturating gauge).
+analysis, ADCS (ESC1-4/7/8/9), SCCM, WSUS, Kerberoasting/AS-REP, GPP/LAPS, RBCD,
+gMSA/dMSA & KDS, Entra/AAD-Connect indicators, pre-staged computer accounts,
+coercion/relay and spray surface, with MITRE ATT&CK mapping. Scored on two
+independent axes — Exposure (easiest path to Tier 0) and Hygiene debt — with a
+plain-English exposure verdict (no saturating gauge, no letter grade).
 Data is collected over LDAP/LDAPS; SMB/SYSVOL checks use impacket where
 available. Outputs an interactive single-file HTML report plus JSON and CSV.
 
@@ -342,6 +343,12 @@ RULES: Dict[str, Tuple[str, str, int, str]] = {
     "A-SCCM":                 ("SCCM/MECM site infrastructure exposed (relay / NAA / PXE attack surface)","Anomaly",40,"HIGH"),
     "A-Pre2kComputer":        ("Pre-created (pre-Windows 2000) computer accounts with a predictable password","Anomaly",50,"HIGH"),
     "A-WeakLockout":          ("No / weak account-lockout policy (password spraying viable)","Anomaly",25,"HIGH"),
+    # ── Added — managed-account / KDS / Entra / GPO-link coverage (roadmap) ────
+    "P-GMSAReadable":         ("gMSA/dMSA managed password readable by a broad principal","Privileged",50,"CRITICAL"),
+    "A-KDSRootKey":           ("KDS root key readable — offline gMSA password compromise (GoldenGMSA)","Anomaly",50,"CRITICAL"),
+    "A-AADConnectSync":       ("Entra/Azure AD Connect sync account present (DCSync-capable)","Anomaly",25,"HIGH"),
+    "A-SeamlessSSO":          ("Entra Seamless SSO computer account (AZUREADSSOACC$) key is stale","Anomaly",25,"HIGH"),
+    "S-OrphanedGPO":          ("Orphaned / unlinked GPOs present","Stale",5,"LOW"),
 }
 
 # Field/army palette — oxide red, rust, mustard/brass, olive drab, field gray.
@@ -493,6 +500,10 @@ RULE_MITRE: Dict[str, List[str]] = {
     "A-Pre2kComputer": ["T1078: Valid Accounts", "T1110: Brute Force"],
     "A-WeakLockout": ["T1110.003: Password Spraying"],
     "P-ExchangePrivEsc": ["T1222.001: ACL Modification", "T1098: Account Manipulation"],
+    "P-GMSAReadable": ["T1555: Credentials from Password Stores", "T1078: Valid Accounts"],
+    "A-KDSRootKey": ["T1555: Credentials from Password Stores", "T1098: Account Manipulation"],
+    "A-AADConnectSync": ["T1078.004: Cloud Accounts", "T1003.006: DCSync"],
+    "A-SeamlessSSO": ["T1550.003: Pass-the-Ticket", "T1078.004: Cloud Accounts"],
 }
 
 # ── Graduated scoring: rule_id -> (points_per_affected, cap). When present, a
@@ -548,7 +559,10 @@ OP_CATEGORY = {
     "A-CertEnrollHttp":"Privilege Escalation","A-CertCAManageLowPriv":"Privilege Escalation",
     "A-CertTemplateESC9":"Privilege Escalation","P-ControlPathDA":"Privilege Escalation",
     "P-ControlPathIndirectEveryone":"Privilege Escalation","P-ControlPathIndirectMany":"Privilege Escalation",
+    "P-GMSAReadable":"Privilege Escalation",
     # Credential access / harvesting
+    "A-KDSRootKey":"Credential Access","A-AADConnectSync":"Credential Access",
+    "A-SeamlessSSO":"Lateral Movement","S-OrphanedGPO":"Hygiene & Legacy",
     "P-GPPPassword":"Credential Access","A-LAPS-Not-Installed":"Credential Access",
     "A-LAPS-Joined-Computers":"Credential Access","A-LocalAdminPassword":"Credential Access",
     "A-ReversiblePwd":"Credential Access","S-Reversible":"Credential Access",
@@ -1451,6 +1465,62 @@ RULE_DOCS: Dict[str, Dict[str, Any]] = {
         "technical": "CN=System Management,CN=System,<domain> nTSecurityDescriptor grants GenericWrite/GenericAll/WriteDacl to Everyone/Authenticated Users/Domain Users/Computers.",
         "remediation": ["Restrict the container ACL to the SCCM site server(s) only."],
         "refs": ["https://github.com/garrettfoster13/sccmhunter"],
+    },
+    "P-GMSAReadable": {
+        "description": "A broad / low-privileged principal can read the managed password of a gMSA or dMSA.",
+        "why": "msDS-GroupMSAMembership controls who may retrieve msDS-ManagedPassword. If a non-Tier-0 principal is listed, they can read the gMSA/dMSA's current password (a derived NT hash / AES keys) and authenticate as that account — which is frequently highly privileged (SQL, AD CS, Exchange, scheduled tasks).",
+        "technical": "msDS-GroupMSAMembership (PrincipalsAllowedToRetrieveManagedPassword) DACL grants read to a broad SID (Everyone / Authenticated Users / Domain Users / Domain Computers / BUILTIN\\Users).",
+        "exploit": [
+            "nxc ldap <dc> -u user -p pass --gmsa",
+            "certipy/gMSADumper.py -u user -p pass -d domain -l <dc>",
+            "Use the recovered NT hash with pass-the-hash / getTGT.py.",
+        ],
+        "remediation": [
+            "Restrict msDS-GroupMSAMembership to the specific hosts/service identities that need the account.",
+        ],
+        "refs": ["https://github.com/micahvandeusen/gMSADumper"],
+    },
+    "A-KDSRootKey": {
+        "description": "The KDS root key material (msKds-RootKeyData) is readable in the current context.",
+        "why": "With the KDS root key an attacker computes the password of ANY gMSA in the forest offline (GoldenGMSA), with no further DC interaction — persistent access to every managed service account. Only Domain Admins / SYSTEM should ever read it.",
+        "technical": "CN=Master Root Keys,CN=Group Key Distribution Service,CN=Services,CN=Configuration — msKds-RootKeyData returned a value to a non-DA reader.",
+        "exploit": [
+            "GoldenGMSA.exe kdsinfo / gmsainfo / compute --sid <gmsa-sid>",
+        ],
+        "remediation": [
+            "Treat KDS root keys as Tier-0; verify only Domain Admins/SYSTEM can read CN=Master Root Keys and investigate the delegation that exposed it.",
+        ],
+        "refs": ["https://github.com/Semperis/GoldenGMSA"],
+    },
+    "A-AADConnectSync": {
+        "description": "An Entra/Azure AD Connect synchronization account (MSOL_*) is present in the domain.",
+        "why": "The on-prem AAD Connect sync account is granted directory-replication (DCSync) rights to support Password Hash Sync. Compromising the AD Connect server (or this account) yields DCSync — full credential extraction — and a pivot between on-prem AD and Entra ID.",
+        "technical": "User accounts named MSOL_<hex> (default AAD Connect naming). The AD Connect server stores the account's credentials in a recoverable form (DPAPI).",
+        "exploit": [
+            "On the AAD Connect host: AADInternals Get-AADIntSyncCredentials → recover MSOL_ password.",
+            "impacket-secretsdump 'DOMAIN/MSOL_xxx:pass@dc' -just-dc",
+        ],
+        "remediation": [
+            "Tier-0 the AD Connect server and the MSOL_ account; restrict logon; monitor its DCSync usage.",
+        ],
+        "refs": ["https://aadinternals.com/post/on-prem_admin/"],
+    },
+    "A-SeamlessSSO": {
+        "description": "The Entra Seamless SSO computer account AZUREADSSOACC$ has a stale Kerberos key.",
+        "why": "AZUREADSSOACC$ holds the key that signs Seamless SSO Kerberos tickets to Entra ID. Microsoft recommends rotating it every 30 days; a stale key lets an attacker who recovers it forge silver tickets to authenticate to Entra as any synced user.",
+        "technical": "Computer object AZUREADSSOACC$ with pwdLastSet older than the rotation window.",
+        "remediation": [
+            "Rotate the Seamless SSO key (Update-AzureADSSOForest) on a schedule; consider disabling Seamless SSO if unused.",
+        ],
+        "refs": ["https://learn.microsoft.com/entra/identity/hybrid/connect/how-to-connect-sso-faq"],
+    },
+    "S-OrphanedGPO": {
+        "description": "Group Policy Objects exist that are not linked to the domain, any OU, or any site.",
+        "why": "Unlinked GPOs apply to nothing, but they retain their settings and DACLs. They are a cleanup item, and one a defender should review — an attacker with edit + link rights could weaponize an unlinked GPO, and orphaned policies hide drift.",
+        "technical": "groupPolicyContainer objects whose DN appears in no gPLink across the domain root, OUs or sites.",
+        "remediation": [
+            "Review and delete GPOs that are intentionally unlinked; relink any that should be active.",
+        ],
     },
 }
 
@@ -2383,7 +2453,7 @@ class ADData:
     def _collect_sites(self):
         self.sites = self.conn.paged_search(
             f"CN=Sites,{self.cfg}",
-            "(objectClass=site)", ["cn","distinguishedName"])
+            "(objectClass=site)", ["cn","distinguishedName","gPLink"])
         self.subnets = self.conn.paged_search(
             f"CN=Subnets,CN=Sites,{self.cfg}",
             "(objectClass=subnet)", ["cn","siteObject","description"])
@@ -2499,7 +2569,134 @@ class CheckEngine:
         self._m_sccm()
         self._m_pre2k_computers()
         self._m_weak_lockout()
+        self._m_managed_accounts()
+        self._m_kds_root_key()
+        self._m_entra()
+        self._m_orphaned_gpos()
         self._m_control_paths()
+
+    def _m_managed_accounts(self):
+        """gMSA / dMSA whose managed password a broad principal may read (roadmap
+        item 2). msDS-GroupMSAMembership names who can retrieve msDS-ManagedPassword."""
+        if not HAS_IMPACKET_LDAP:
+            return
+        try:
+            objs = self.d.conn.paged_search(
+                self.d.base,
+                "(|(objectClass=msDS-GroupManagedServiceAccount)"
+                "(objectClass=msDS-DelegatedManagedServiceAccount))",
+                ["sAMAccountName", "msDS-GroupMSAMembership",
+                 "servicePrincipalName", "memberOf"])
+        except Exception:
+            objs = []
+        broad = self._broad_low_priv_sids()
+        affected = []
+        for o in objs:
+            a = o["attrs"]; sam = get_str(a, "sAMAccountName")
+            raw = a.get("msDS-GroupMSAMembership")
+            if isinstance(raw, list):
+                raw = raw[0] if raw else None
+            if not isinstance(raw, (bytes, bytearray)):
+                continue
+            try:
+                sd = _ldaptypes.SR_SECURITY_DESCRIPTOR(data=raw)
+            except Exception:
+                continue
+            dacl = sd.get("Dacl")
+            if not dacl:
+                continue
+            readers = []
+            for ace in dacl["Data"]:
+                try:
+                    if "DENIED" in ace["TypeName"].upper():
+                        continue
+                    sidstr = ace["Ace"]["Sid"].formatCanonical()
+                except Exception:
+                    continue
+                if sidstr in broad:
+                    readers.append(broad[sidstr])
+            if readers:
+                affected.append(f"{sam} ← {', '.join(_dedup_keep_order(readers))}")
+        if affected:
+            self._add("P-GMSAReadable",
+                      "A broad principal can retrieve these managed (gMSA/dMSA) "
+                      "passwords. Read the password, derive the NT hash and "
+                      "authenticate as the (often privileged) service account. "
+                      "Principal(s) after '←' can read it.",
+                      affected)
+
+    def _m_kds_root_key(self):
+        """KDS root key readability — GoldenGMSA offline compromise (roadmap 2)."""
+        base = (f"CN=Master Root Keys,CN=Group Key Distribution Service,"
+                f"CN=Services,{self.d.cfg}")
+        try:
+            keys = self.d.conn.paged_search(
+                base, "(objectClass=msKds-ProvRootKey)",
+                ["cn", "msKds-RootKeyData", "whenCreated"])
+        except Exception:
+            keys = []
+        readable = []
+        for k in keys:
+            raw = k["attrs"].get("msKds-RootKeyData")
+            if isinstance(raw, list):
+                raw = raw[0] if raw else None
+            if raw:   # we (current context) could read the secret material
+                readable.append(get_str(k["attrs"], "cn") or dn_base(k.get("dn", "")))
+        if readable:
+            self._add("A-KDSRootKey",
+                      "The KDS root key material is readable in the current "
+                      "context — every gMSA password in the forest can be computed "
+                      "offline (GoldenGMSA). Only Domain Admins/SYSTEM should read it.",
+                      readable)
+
+    def _m_entra(self):
+        """On-prem-readable Entra / AAD-Connect indicators (roadmap item 3)."""
+        msol = []
+        for u in self.d.users:
+            sam = get_str(u["attrs"], "sAMAccountName")
+            if sam.upper().startswith("MSOL_"):
+                msol.append(sam)
+        if msol:
+            self._add("A-AADConnectSync",
+                      "Azure AD Connect synchronization account(s) found. The "
+                      "on-prem sync account holds DCSync rights (for Password Hash "
+                      "Sync); compromising the AD Connect host recovers its "
+                      "credentials and bridges on-prem AD ⇄ Entra ID.",
+                      msol)
+        for c in self.d.computers:
+            sam = get_str(c["attrs"], "sAMAccountName")
+            if sam.upper().rstrip("$") == "AZUREADSSOACC":
+                age = days_since(filetime_to_dt(get_int(c["attrs"], "pwdLastSet")))
+                if age is not None and age > 90:
+                    self._add("A-SeamlessSSO",
+                              f"Entra Seamless SSO account {sam} key is {age} days "
+                              "old (recommended rotation: 30 days). A recovered "
+                              "stale key allows forging silver tickets to Entra ID "
+                              "as any synced user.",
+                              [f"{sam} (pwd {age}d old)"])
+
+    def _m_orphaned_gpos(self):
+        """OU/gPLink inventory — GPOs linked nowhere (roadmap item 5)."""
+        linked = set()
+        gplinks = []
+        if self.d.domain_obj:
+            gplinks.append(get_str(self.d.domain_obj["attrs"], "gPLink"))
+        for cont in list(getattr(self.d, "ous", [])) + list(self.d.sites):
+            gplinks.append(get_str(cont["attrs"], "gPLink"))
+        for gp in gplinks:
+            for gdn in ControlPathAnalyzer._parse_gplink(gp):
+                linked.add(gdn.lower())
+        orphaned = []
+        for g in self.d.gpos:
+            dn = g.get("dn", "")
+            if dn and dn.lower() not in linked:
+                orphaned.append(get_str(g["attrs"], "displayName") or dn_base(dn))
+        if orphaned:
+            self._add("S-OrphanedGPO",
+                      "These GPOs are not linked to the domain, any OU or any "
+                      "site — they apply to nothing but retain their settings and "
+                      "DACLs. Review and remove, or relink if they should be active.",
+                      orphaned)
 
     def _m_control_paths(self):
         cp = getattr(self.d, "control_paths", None) or {}
@@ -5981,7 +6178,8 @@ EXPOSURE_WEIGHTS = {
     "A-SCCM":72, "A-Pre2kComputer":78, "A-WeakLockout":40,
     "A-CertCAManageLowPriv":88, "A-CertTemplateESC9":80,
     "P-ControlPathDA":92, "P-ControlPathIndirectEveryone":95, "P-ControlPathIndirectMany":70,
-    "A-SCCMContainerACL":75,
+    "A-SCCMContainerACL":75, "P-GMSAReadable":88, "A-KDSRootKey":90,
+    "A-AADConnectSync":70, "A-SeamlessSSO":60,
 }
 
 # rule_id -> (mode, weight). mode 'flat' adds weight; mode 'pct_users'/'pct_comps'
@@ -6770,6 +6968,20 @@ class HTMLReporter:
                 'text-transform:none;letter-spacing:0;color:var(--faint)">— count per area; click to filter</span></div>'
                 f'<div class="kc-catstrip">{cards}</div>')
 
+    def _collection_notes(self):
+        """Surface per-query collection failures so an empty section can't be
+        mistaken for a clean result (roadmap item 6)."""
+        errs = getattr(self.data, "collect_errors", None) or []
+        if not errs:
+            return ""
+        items = "".join(f'<li>{self._e(e)}</li>' for e in errs[:30])
+        more = f'<li class="kc-more">… and {len(errs)-30} more</li>' if len(errs) > 30 else ""
+        return ('<div class="kc-block" style="border-left:3px solid var(--warn);'
+                'background:rgba(205,165,43,.08);padding:8px 12px;border-radius:0 var(--r-sm) var(--r-sm) 0;margin-top:14px">'
+                '<div class="kc-bh" style="color:var(--warn)">Collection notes — some queries failed; '
+                'affected areas may be under-reported</div>'
+                f'<ul class="kc-fixlist">{items}{more}</ul></div>')
+
     def _summary_section(self):
         return ('<section class="kc-section" id="sec-summary"><h2 class="kc-h2">Summary'
                 '<span class="tag">exposure = easiest path to Tier 0 · hygiene = misconfig load</span></h2>'
@@ -6779,7 +6991,8 @@ class HTMLReporter:
                 f'<div><div class="kc-narrative">{self._narrative()}</div>{self._key_risks()}</div>'
                 '</div>'
                 f'{self._category_strip()}'
-                f'{self._inventory_block()}</section>')
+                f'{self._inventory_block()}'
+                f'{self._collection_notes()}</section>')
 
     # ── Paths to Domain Dominance (control-path chains) ───────────────────────
     def _node(self, label, kind="", icon=""):

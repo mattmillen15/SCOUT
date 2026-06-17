@@ -80,13 +80,23 @@ as not useful for an offensive engagement.
 
 - `ControlPathAnalyzer` does a real transitive closure (membership + GenericAll/
   GenericWrite/WriteDacl/WriteOwner/Owner/DCSync edges, seeded from Tier-0). It
-  bulk-reads SDs for groups + adminCount users and per-object for the domain
-  root/GPOs; it does NOT yet read every user/computer SD, so paths that route
-  through control over an arbitrary non-admin object can be missed. GPO control
-  is modelled as "→ Tier 0" (approximation; doesn't yet check the GPO's link).
-- ADCS coverage is ESC1/2/3/4/7/8/9 + key strength. ESC6 (EDITF_ATTRIBUTE-
+  bulk-reads SDs for groups and for *every* user and computer (one paged
+  `(objectClass=user)` query covers both), plus the domain root and all GPOs. GPO
+  → Tier-0 edges are resolved via `gPLink` (domain root + OUs): a GPO only reaches
+  Tier-0 when it is linked to a DC-affecting container. Reading all object SDs is
+  the slowest stage; `--no-paths` skips the whole analysis. It emits a node
+  registry (type/enabled/pwd-age/logon-age/stale/SID + group members) that drives
+  the clickable graph + drawer in the report.
+- ADCS coverage is ESC1/2/3/4/7/8/9 + key strength. ESC1/2/3/9 are gated on
+  whether a broad/low-priv principal can actually enroll (parsed from the
+  template SD) to avoid EA/DA-only false positives. ESC6 (EDITF_ATTRIBUTE-
   SUBJECTALTNAME2) and ESC10/11 are CA/DC registry settings not exposed over
   LDAP, so they can't be confirmed read-only.
+- Managed accounts: gMSA/dMSA password-read ACL (`msDS-GroupMSAMembership`) and
+  KDS root-key readability (GoldenGMSA) are checked. Entra/AAD-Connect coverage
+  is the on-prem-readable surface only — the MSOL_ sync account (DCSync-capable)
+  and the Seamless SSO `AZUREADSSOACC$` key age; PHS/PTA enablement itself is a
+  cloud/host setting and can't be confirmed from a read-only LDAP pass.
 - Some host-local controls (RestrictRemoteSAM, DSRM logon, NTLM auditing) are
   inferred from GPO state in SYSVOL, not read from the host registry.
 - `sIDHistory`/SID/time decoding can differ between the ldap3 and impacket
@@ -98,18 +108,29 @@ as not useful for an offensive engagement.
 
 ## Roadmap
 
-Ordered roughly by value:
+Status as of the control-path overhaul:
 
-1. Extend control-path closure to all user/computer SDs (bulk, paged) and add
-   real GPO-link resolution so GPO→host→Tier-0 edges are precise.
-2. gMSA / dMSA managed-password read-ACL checks; KDS root key exposure.
-3. Deeper Entra/AAD-Connect inspection (PHS/PTA/Seamless SSO, sync-account priv).
-5. OU + `gPLink` inventory: GPO link/inheritance, orphaned/unlinked GPOs.
-6. Backend-agnostic normalisation of SID/time attributes; per-query failure
-   surfacing in the report (so "clean" can't mean "unscanned").
-7. `lastLogon` (per-DC) reconciliation with `lastLogonTimestamp` for accuracy.
-8. Port the assessment to a NetExec (`nxc ldap`) module that reuses the engine.
-9. Trust scope/transitivity classification and a reachable-domains map.
+1. **Done.** Control-path closure reads all user/computer SDs (bulk, paged) and
+   resolves `gPLink` so GPO→Tier-0 edges are precise (only DC-linked GPOs).
+2. **Done.** gMSA/dMSA managed-password read-ACL (`P-GMSAReadable`) and KDS
+   root-key readability (`A-KDSRootKey`, GoldenGMSA).
+3. **Partial.** Entra/AAD-Connect: MSOL_ sync account (`A-AADConnectSync`,
+   DCSync-capable) and Seamless SSO key staleness (`A-SeamlessSSO`) are detected
+   from on-prem AD. PHS/PTA enablement is a cloud/host setting, not confirmable
+   from a read-only LDAP pass — deliberately out of scope.
+5. **Done.** OU + `gPLink` inventory drives GPO-link resolution above and surfaces
+   orphaned/unlinked GPOs (`S-OrphanedGPO`).
+6. **Mostly done.** `to_text()` decodes the impacket backend's bytes so SID/time/
+   string values normalise across backends, and the report now surfaces per-query
+   collection failures ("Collection notes") so "clean" can't mean "unscanned".
+   Full per-attribute SID/time normalisation across edge cases is ongoing.
+7. **Deferred.** `lastLogon` (per-DC) reconciliation with `lastLogonTimestamp`
+   needs a query against every DC; heavy for marginal accuracy gain.
+8. **Deferred.** A NetExec (`nxc ldap`) module that reuses the engine is a
+   separate deliverable — the engine is a monolith bound to its own
+   `ADConnection`, so a clean port needs refactoring and an nxc test rig.
+9. **Not started.** Trust scope/transitivity classification and a
+   reachable-domains map.
 
 ## Design notes
 
