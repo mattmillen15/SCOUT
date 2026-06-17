@@ -2158,8 +2158,14 @@ class ADConnection:
                 generator=True)
             for entry in gen:
                 if entry.get("type") == "searchResEntry":
+                    # Use raw_attributes (always bytes), NOT attributes: with
+                    # get_info=DSA there is no schema, so ldap3 leaves objectSid /
+                    # other binary values as an undecoded str-of-bytes that
+                    # sid_to_str can't parse. raw_attributes gives bytes, matching
+                    # the impacket backend exactly — both paths now flow through
+                    # to_text()/sid_to_str()/get_int() uniformly.
                     results.append({"dn": entry["dn"],
-                                    "attrs": entry["attributes"]})
+                                    "attrs": entry["raw_attributes"]})
         except LDAPException as e:
             if self.args.verbose:
                 print(f"[!] LDAP search error ({base}, {flt}): {e}")
@@ -6085,15 +6091,23 @@ class ControlPathAnalyzer:
                 search_scope=ldap3.SUBTREE, attributes=["objectSid","nTSecurityDescriptor"],
                 controls=sdc(sdflags=0x05), paged_size=500, generator=True)
             for e in gen:
-                if e.get("type") != "searchResEntry":
+                # Per-entry guard: an object with an empty SD/SID list previously
+                # raised IndexError (sdb[0] on []) and, because the try wrapped the
+                # whole loop, aborted the ENTIRE read — dropping every edge after
+                # the first such object (e.g. the full user/computer SD closure).
+                try:
+                    if e.get("type") != "searchResEntry":
+                        continue
+                    raw = e.get("raw_attributes", {})
+                    sdb = raw.get("nTSecurityDescriptor") or []
+                    sdb = (sdb[0] if isinstance(sdb, list) else sdb) if sdb else None
+                    sraw = raw.get("objectSid") or []
+                    sraw = (sraw[0] if isinstance(sraw, list) else sraw) if sraw else None
+                    if sdb:
+                        sd = _ldaptypes.SR_SECURITY_DESCRIPTOR(); sd.fromString(sdb)
+                        out.append((e.get("dn", ""), sid_to_str(sraw) if sraw else "", sd))
+                except Exception:
                     continue
-                raw = e.get("raw_attributes", {})
-                sdb = raw.get("nTSecurityDescriptor", [None])
-                sdb = sdb[0] if isinstance(sdb, list) else sdb
-                sraw = raw.get("objectSid", [None]); sraw = sraw[0] if isinstance(sraw, list) else sraw
-                if sdb:
-                    sd = _ldaptypes.SR_SECURITY_DESCRIPTOR(); sd.fromString(sdb)
-                    out.append((e.get("dn",""), sid_to_str(sraw) if sraw else "", sd))
         except Exception as e:
             if self.args.verbose:
                 print(f"[!] bulk SD (ldap3) failed: {e}")
