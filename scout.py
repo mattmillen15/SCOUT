@@ -344,10 +344,10 @@ RULES: Dict[str, Tuple[str, str, int, str]] = {
     "A-WeakLockout":          ("No / weak account-lockout policy (password spraying viable)","Anomaly",25,"HIGH"),
 }
 
-# Field/army palette — oxide red, rust, mustard/brass, olive drab, field grey.
-SEV_COLOUR = {"CRITICAL":"#b23a2e","HIGH":"#c2702a","MEDIUM":"#c9a227",
+# Field/army palette — oxide red, rust, mustard/brass, olive drab, field gray.
+SEV_COLOR = {"CRITICAL":"#b23a2e","HIGH":"#c2702a","MEDIUM":"#c9a227",
               "LOW":"#6f8f3f","INFO":"#8a8f78"}
-CAT_COLOUR  = {"Anomaly":"#c2702a","Privileged":"#a8843c",
+CAT_COLOR  = {"Anomaly":"#c2702a","Privileged":"#a8843c",
                "Stale":"#5d7a86","Trust":"#6f8f3f"}
 
 # ── Maturity model (CMMI 1-5, ANSSI-style) ───────────────────────────────────
@@ -523,7 +523,7 @@ def scaled_points(rule_id: str, base_points: int, n_affected: int) -> int:
 #    (not the internal A/P/S/T taxonomy). Used only for report grouping/filtering.
 OPCAT_ORDER = ["Privilege Escalation", "Credential Access", "Lateral Movement",
                "Persistence", "Recon & Exposure", "Hygiene & Legacy"]
-OPCAT_COLOUR = {
+OPCAT_COLOR = {
     "Privilege Escalation":"#bd4234", "Credential Access":"#cb7a2f",
     "Lateral Movement":"#5d7a86", "Persistence":"#8a6d4f",
     "Recon & Exposure":"#6f8f3f", "Hygiene & Legacy":"#8c917a",
@@ -724,7 +724,7 @@ RULE_DOCS: Dict[str, Dict[str, Any]] = {
     },
     "A-PwdHistory": {
         "description": "Password history length is below the recommended value (24).",
-        "why": "Users can quickly cycle back to a previously-known password — minimising rotation's effectiveness against captured hashes.",
+        "why": "Users can quickly cycle back to a previously-known password — minimizing rotation's effectiveness against captured hashes.",
         "remediation": [
             "Set-ADDefaultDomainPasswordPolicy -PasswordHistoryCount 24",
         ],
@@ -1292,7 +1292,7 @@ RULE_DOCS: Dict[str, Dict[str, Any]] = {
             "getST.py -spn <target-spn> -impersonate Administrator 'DOMAIN/svc:pass'",
         ],
         "remediation": [
-            "Minimise constrained-delegation grants; prefer RBCD scoped to specific resources.",
+            "Minimize constrained-delegation grants; prefer RBCD scoped to specific resources.",
             "Add sensitive accounts to Protected Users and mark them 'account is sensitive and cannot be delegated'.",
         ],
     },
@@ -1311,7 +1311,7 @@ RULE_DOCS: Dict[str, Dict[str, Any]] = {
     },
     "S-SIDHistoryPrivileged": {
         "description": "Accounts carry a privileged or built-in SID in their sIDHistory.",
-        "why": "SID history is honoured at logon, so the account silently wields the privileges of the referenced SID (e.g. Enterprise Admins / Administrators) without appearing in any group. A classic stealth persistence backdoor.",
+        "why": "SID history is honored at logon, so the account silently wields the privileges of the referenced SID (e.g. Enterprise Admins / Administrators) without appearing in any group. A classic stealth persistence backdoor.",
         "technical": "Look for sIDHistory RIDs 512/516/518/519/520 or built-in S-1-5-32-544 etc., or any RID 500.",
         "exploit": ["Mimikatz sid::patch + sid::add to inject; the account then authenticates with hidden admin rights."],
         "remediation": [
@@ -1343,7 +1343,7 @@ RULE_DOCS: Dict[str, Dict[str, Any]] = {
         "technical": "Dangerous ACE (GenericAll/GenericWrite/WriteDacl/WriteOwner/WriteProperty) for Everyone/Authenticated Users/Domain Users/Computers on the pKICertificateTemplate object.",
         "exploit": [
             "certipy find -vulnerable -u user@domain -p pass",
-            "certipy template -template <tmpl> -u user@domain -p pass   # weaponise to ESC1",
+            "certipy template -template <tmpl> -u user@domain -p pass   # weaponize to ESC1",
             "certipy req -template <tmpl> -upn administrator@domain ...  # then auth",
         ],
         "remediation": [
@@ -1531,6 +1531,19 @@ def sid_to_str(raw) -> str:
     except Exception:
         return str(raw)
 
+def to_text(v) -> str:
+    """Backend-agnostic value -> str. The impacket/Kerberos backend returns every
+    attribute as raw bytes (see ADConnection._impacket_search), whereas ldap3
+    hands back decoded strings. str(b'SubCA') yields the literal "b'SubCA'", which
+    is how object names leaked into the report as b'...'. Decode bytes as UTF-8
+    (AD's directory string encoding) so both backends render identically."""
+    if isinstance(v, (bytes, bytearray)):
+        try:
+            return bytes(v).decode("utf-8")
+        except UnicodeDecodeError:
+            return bytes(v).decode("utf-8", "replace")
+    return str(v)
+
 def get_int(entry_attrs, attr: str, default=0) -> int:
     v = entry_attrs.get(attr)
     if v is None:
@@ -1548,15 +1561,15 @@ def get_str(entry_attrs, attr: str, default="") -> str:
         return default
     if isinstance(v, list):
         v = v[0] if v else default
-    return str(v) if v is not None else default
+    return to_text(v) if v is not None else default
 
 def get_list(entry_attrs, attr: str) -> List[str]:
     v = entry_attrs.get(attr)
     if v is None:
         return []
     if isinstance(v, (list, tuple)):
-        return [str(x) for x in v if x is not None]
-    return [str(v)]
+        return [to_text(x) for x in v if x is not None]
+    return [to_text(v)]
 
 def dn_base(dn: str) -> str:
     """Return the first RDN value from a DN."""
@@ -1605,7 +1618,7 @@ Examples:
                            "Best path when LDAP signing or channel binding is enforced.")
     auth.add_argument("--ccache",          metavar="FILE",
                       help="Reuse an existing Kerberos ccache (implies -k). "
-                           "Also honoured via the KRB5CCNAME env var.")
+                           "Also honored via the KRB5CCNAME env var.")
     auth.add_argument("--save-ccache",     metavar="FILE", nargs="?", const="__AUTO__",
                       help="Save the obtained TGT to a ccache for reuse "
                            "(optional path; defaults to <user>.ccache).")
@@ -1632,6 +1645,10 @@ Examples:
                       help="Skip SMB-based checks (signature, SMBv1, null session)")
     conn.add_argument("--no-adcs",   action="store_true",
                       help="Skip ADCS certificate template checks")
+    conn.add_argument("--no-paths",  action="store_true",
+                      help="Skip control-path (Tier-0 reachability) analysis. It "
+                           "bulk-reads security descriptors and runs a graph "
+                           "closure — the slowest stage on large domains.")
 
     out = p.add_argument_group("Output")
     out.add_argument("-o", "--output", metavar="FILE",
@@ -1645,7 +1662,7 @@ Examples:
     out.add_argument("--scope",    metavar="TEXT", default="",
                      help="Engagement scope note printed on the report cover")
     out.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
-    out.add_argument("--no-color",      action="store_true", help="Disable colour output")
+    out.add_argument("--no-color",      action="store_true", help="Disable color output")
     return p
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1665,8 +1682,8 @@ class Finding:
     mitre:    List[str] = field(default_factory=list)  # ["T1003.006: DCSync", …]
 
     @property
-    def sev_colour(self) -> str:
-        return SEV_COLOUR.get(self.severity, "#95a5a6")
+    def sev_color(self) -> str:
+        return SEV_COLOR.get(self.severity, "#95a5a6")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AD CONNECTION
@@ -1878,7 +1895,7 @@ class ADConnection:
 
         # Persist the TGT to a ccache and export KRB5CCNAME so the later SMB /
         # SYSVOL Kerberos logins transparently reuse this ticket. If the operator
-        # asked to keep it (--save-ccache) we honour their path; otherwise a temp
+        # asked to keep it (--save-ccache) we honor their path; otherwise a temp
         # file is used and cleaned up at exit.
         cc = CCache()
         cc.fromTGT(tgt, oldSessionKey, sessionKey)
@@ -3109,38 +3126,53 @@ class CheckEngine:
             has_any_eku      = self._ANY_PURPOSE_OID in ekus
             no_eku           = not ekus
 
+            # Enrollment-based escalations (ESC1/2/3/9) are only attacker-reachable
+            # if a broad / low-priv principal can actually enroll. When only Tier-0
+            # (EA/DA) hold the Enroll right, reporting is a false positive (issue
+            # #2). If the SD can't be parsed we still report, with a caveat.
+            enrollers, enroll_parsed = self._template_low_priv_enrollers(tmpl)
+            enroll_reachable = bool(enrollers) or not enroll_parsed
+            if enrollers:
+                enroll_note = " Low-priv enrollers: " + ", ".join(enrollers) + "."
+            elif not enroll_parsed:
+                enroll_note = " (Enrollment rights could not be verified — confirm who can enroll.)"
+            else:
+                enroll_note = ""
+
             # ESC1: enrollee supplies subject + auth EKU + no manager approval
             if (name_flag & self._CT_ENROLLEE_SUPPLIES_SUBJECT
                     and has_auth_eku
-                    and not manager_approval):
+                    and not manager_approval
+                    and enroll_reachable):
                 ca_names = [get_str(s["attrs"],"cn") for s in self.d.enrollment_svcs
                             if cn in get_list(s["attrs"],"certificateTemplates")]
                 self._add("A-CertTempCustomSubject",
                           f"ESC1: Template '{cn}' allows enrollee-supplied Subject/SAN "
                           f"with authentication EKU and no manager approval. Published on CA(s): "
-                          f"{', '.join(ca_names) or 'unknown'}. "
+                          f"{', '.join(ca_names) or 'unknown'}.{enroll_note} "
                           "Attack: request cert with arbitrary UPN (e.g., Domain Admin) and "
                           "use PKINIT to obtain a TGT. "
                           "certipy find -vulnerable / req -template <tmpl> -upn administrator@domain",
                           [cn] + ca_names)
 
             # ESC2: any purpose EKU (no EKU restriction) + no manager approval
-            if (has_any_eku or no_eku) and not manager_approval:
+            if (has_any_eku or no_eku) and not manager_approval and enroll_reachable:
                 ca_names = [get_str(s["attrs"],"cn") for s in self.d.enrollment_svcs
                             if cn in get_list(s["attrs"],"certificateTemplates")]
                 self._add("A-CertTempAnyPurpose",
                           f"ESC2: Template '{cn}' has Any Purpose EKU or no EKU restrictions "
-                          f"and no manager approval. Published on: {', '.join(ca_names) or 'unknown'}. "
+                          f"and no manager approval. Published on: {', '.join(ca_names) or 'unknown'}.{enroll_note} "
                           "Can be used as an enrollment agent or to authenticate as any user.",
                           [cn])
 
             # ESC3: Certificate Request Agent EKU without RA signature
-            if self._CERT_REQUEST_AGENT in ekus and ra_sig == 0 and not manager_approval:
+            if (self._CERT_REQUEST_AGENT in ekus and ra_sig == 0
+                    and not manager_approval and enroll_reachable):
                 ca_names = [get_str(s["attrs"],"cn") for s in self.d.enrollment_svcs
                             if cn in get_list(s["attrs"],"certificateTemplates")]
                 self._add("A-CertTempAgent",
                           f"ESC3: Template '{cn}' has Certificate Request Agent EKU with no "
-                          f"RA signature requirement. Published on: {', '.join(ca_names) or 'unknown'}. "
+                          f"RA signature requirement. Published on: {', '.join(ca_names) or 'unknown'}.{enroll_note} "
                           "Allows enrolling on behalf of any user — combine with ESC2 template "
                           "to impersonate Domain Admin.",
                           [cn])
@@ -3153,16 +3185,16 @@ class CheckEngine:
                           f"principal(s): {', '.join(esc4)}. They can reconfigure it "
                           "into an ESC1 (enrollee-supplied SAN + auth EKU) and then "
                           "impersonate any user. certipy template -template "
-                          f"{cn} ... to weaponise.",
+                          f"{cn} ... to weaponize.",
                           [f"{cn} writable by {p}" for p in esc4])
 
             # ESC9: no security extension on an auth template (weak cert mapping)
-            if (enroll_flag & self._CT_NO_SECURITY_EXTENSION) and has_auth_eku:
+            if (enroll_flag & self._CT_NO_SECURITY_EXTENSION) and has_auth_eku and enroll_reachable:
                 self._add("A-CertTemplateESC9",
                           f"ESC9: Template '{cn}' sets CT_FLAG_NO_SECURITY_EXTENSION with an "
-                          "authentication EKU — the issued cert omits the SID security "
-                          "extension, so AD falls back to weak (UPN) mapping. With write access "
-                          "to a victim's userPrincipalName this allows authenticating as them.",
+                          f"authentication EKU — the issued cert omits the SID security "
+                          f"extension, so AD falls back to weak (UPN) mapping. With write access "
+                          f"to a victim's userPrincipalName this allows authenticating as them.{enroll_note}",
                           [cn])
 
         # ESC7: low-privileged principal holds CA management rights
@@ -3182,8 +3214,14 @@ class CheckEngine:
     _ADS_WRITE_DACL    = 0x00040000
     _ADS_WRITE_OWNER   = 0x00080000
     _ADS_WRITE_PROP    = 0x00000020
+    _ADS_CONTROL_ACCESS= 0x00000100          # DS-Control-Access (extended right / enroll)
     _CT_NO_SECURITY_EXTENSION = 0x00080000   # msPKI-Enrollment-Flag bit
     _CA_MANAGE_RIGHTS  = 0x00000003          # ManageCA (0x1) | ManageCertificates (0x2)
+    # Extended-right GUIDs that grant certificate enrollment on a template.
+    _ENROLL_GUIDS = {
+        "0e10c968-78fb-11d2-90d4-00c04f79dc55",  # Certificate-Enrollment
+        "a05b8cc2-17bc-4802-a710-e7c15ab866a2",  # Certificate-AutoEnrollment
+    }
 
     def _esc7_ca_managers(self, svc) -> List[str]:
         """Low-privileged principals with CA management rights (ESC7)."""
@@ -3265,6 +3303,59 @@ class CheckEngine:
             if sidstr in broad and (mask & dangerous):
                 writers.append(broad[sidstr])
         return _dedup_keep_order(writers)
+
+    def _template_low_priv_enrollers(self, tmpl: Dict) -> Tuple[List[str], bool]:
+        """Which broad / low-privileged principals can ENROLL in this template.
+
+        Returns (principals, parsed_ok). The ESC1/2/3/9 escalations all require a
+        low-priv attacker to be able to enroll; if only Tier-0 (EA/DA) hold the
+        Enroll right the template is not attacker-reachable and reporting it is a
+        false positive (issue #2). parsed_ok is False when the security descriptor
+        could not be read/parsed, so the caller can fall back to reporting with a
+        caveat rather than silently dropping a possibly-real finding."""
+        if not HAS_IMPACKET_LDAP:
+            return [], False
+        raw = tmpl["attrs"].get("nTSecurityDescriptor")
+        if isinstance(raw, list):
+            raw = raw[0] if raw else None
+        if not isinstance(raw, (bytes, bytearray)):
+            return [], False
+        try:
+            sd = _ldaptypes.SR_SECURITY_DESCRIPTOR(data=raw)
+        except Exception:
+            return [], False
+        broad = self._broad_low_priv_sids()
+        dacl = sd.get("Dacl")
+        if not dacl:
+            return [], True
+        out: List[str] = []
+        for ace in dacl["Data"]:
+            try:
+                if ace["AceType"] not in (0x00, 0x05):  # ALLOWED / ALLOWED_OBJECT
+                    continue
+                mask = int(ace["Ace"]["Mask"]["Mask"])
+                sidstr = ace["Ace"]["Sid"].formatCanonical()
+            except Exception:
+                continue
+            if sidstr not in broad:
+                continue
+            # GenericAll always confers enrollment.
+            if mask & self._ADS_GENERIC_ALL:
+                out.append(broad[sidstr]); continue
+            # Control-access (extended right). For object ACEs it only grants
+            # enroll when the ObjectType is the Enroll/AutoEnroll GUID (or absent,
+            # which means "all extended rights" and therefore includes enroll).
+            if mask & self._ADS_CONTROL_ACCESS:
+                ot = ace["Ace"].get("ObjectType", b"") if ace["AceType"] == 0x05 else b""
+                if not ot or len(ot) != 16:
+                    out.append(broad[sidstr]); continue
+                try:
+                    guid = _guid_from_bytes(bytes(ot)).strip("{}").lower()
+                except Exception:
+                    guid = ""
+                if guid in self._ENROLL_GUIDS:
+                    out.append(broad[sidstr])
+        return _dedup_keep_order(out), True
 
     def _a_member_everyone(self):
         everyone_patterns = ["everyone","s-1-1-0","authenticated users",
@@ -5031,7 +5122,7 @@ class ACLAnalyzer:
         if not HAS_IMPACKET_LDAP:
             print("[!] impacket not available — skipping ACL analysis")
             return
-        print("[*] Analysing ACLs on high-value objects...")
+        print("[*] Analyzing ACLs on high-value objects...")
         self._build_broad_sids()
         # Domain root object
         self._check_object_acl(
@@ -5388,17 +5479,19 @@ class ControlPathAnalyzer:
         sd = self._fetch_one_sd(self.conn.base_dn)
         if sd:
             self._add_acl_edges(sd, self.domain_root, "domain root", dcsync=True)
-        # GPOs -> Tier 0 (editing a GPO ≈ SYSTEM on linked hosts)
-        for gpo in self.data.gpos[:200]:
-            gdn = gpo.get("dn","")
-            if not gdn:
+        # GPOs -> Tier 0 (editing a GPO ≈ SYSTEM on linked hosts). Bulk-read every
+        # GPO security descriptor in ONE paged query rather than one LDAP
+        # round-trip per GPO — the per-object fetch was the dominant control-path
+        # slowdown on large domains (hundreds of sequential searches).
+        gpo_by_dn = {g.get("dn","").lower(): g for g in self.data.gpos if g.get("dn")}
+        for dn, _sid, sd in self._bulk_sds("(objectClass=groupPolicyContainer)"):
+            gpo = gpo_by_dn.get(dn.lower())
+            if not sd or gpo is None:
                 continue
-            sd = self._fetch_one_sd(gdn)
-            if sd:
-                gnode = "GPO:" + gdn.lower()
-                self.sid2name[gnode] = "GPO " + (get_str(gpo["attrs"],"displayName") or dn_base(gdn))
-                self._add_acl_edges(sd, gnode, "gpo")
-                self._edge(gnode, self.domain_root, "applies to hosts")
+            gnode = "GPO:" + dn.lower()
+            self.sid2name[gnode] = "GPO " + (get_str(gpo["attrs"], "displayName") or dn_base(dn))
+            self._add_acl_edges(sd, gnode, "gpo")
+            self._edge(gnode, self.domain_root, "applies to hosts")
 
     def _add_acl_edges(self, sd, target_node, kind, dcsync=False):
         try:
@@ -5776,7 +5869,7 @@ class RiskScorer:
 
     @staticmethod
     def verdict(exposure: int) -> Tuple[str, str]:
-        """Plain-English read on the easiest path to Tier-0 (word, colour)."""
+        """Plain-English read on the easiest path to Tier-0 (word, color)."""
         if exposure >= 85: return "Domain compromisable", "#bd4234"
         if exposure >= 60: return "Tier-0 reachable",     "#cb7a2f"
         if exposure >= 35: return "Foothold-dependent",   "#cda52b"
@@ -5794,7 +5887,7 @@ class RiskScorer:
             "cat_counts": {c: cat_counts.get(c, 0) for c in ("Anomaly","Privileged","Stale","Trust")},
         }
 
-    # legacy 0-100 band colour, reused for the exposure/hygiene bars
+    # legacy 0-100 band color, reused for the exposure/hygiene bars
     @staticmethod
     def risk_label(score: int) -> Tuple[str, str]:
         if score >= 75: return "CRITICAL", "#bd4234"
@@ -6221,7 +6314,7 @@ class HTMLReporter:
         nonzero = [s for s in order if counts[s]]
         segs = []; start = -90.0
         if len(nonzero) == 1:
-            segs.append(f'<circle cx="{cx}" cy="{cy}" r="{r}" fill="none" stroke="{SEV_COLOUR[nonzero[0]]}" stroke-width="{w}"/>')
+            segs.append(f'<circle cx="{cx}" cy="{cy}" r="{r}" fill="none" stroke="{SEV_COLOR[nonzero[0]]}" stroke-width="{w}"/>')
         else:
             for s in nonzero:
                 sweep = counts[s] / total * 360; end = start + sweep
@@ -6229,7 +6322,7 @@ class HTMLReporter:
                 x1 = cx + r*math.cos(math.radians(start)); y1 = cy + r*math.sin(math.radians(start))
                 x2 = cx + r*math.cos(math.radians(end));   y2 = cy + r*math.sin(math.radians(end))
                 segs.append(f'<path d="M {x1:.2f} {y1:.2f} A {r} {r} 0 {large} 1 {x2:.2f} {y2:.2f}" '
-                            f'fill="none" stroke="{SEV_COLOUR[s]}" stroke-width="{w}"/>')
+                            f'fill="none" stroke="{SEV_COLOR[s]}" stroke-width="{w}"/>')
                 start = end
         if not nonzero:
             segs.append(f'<circle cx="{cx}" cy="{cy}" r="{r}" fill="none" stroke="var(--track)" stroke-width="{w}"/>')
@@ -6307,7 +6400,7 @@ class HTMLReporter:
         sc = self._sev_counts(); out = '<div class="kc-legend">'
         for s in ["CRITICAL","HIGH","MEDIUM","LOW","INFO"]:
             if sc.get(s,0):
-                out += f'<span><i style="background:{SEV_COLOUR[s]}"></i>{s.title()} {sc[s]}</span>'
+                out += f'<span><i style="background:{SEV_COLOR[s]}"></i>{s.title()} {sc[s]}</span>'
         return out + '</div>'
 
     def _meter(self, label, value, hint):
@@ -6372,7 +6465,7 @@ class HTMLReporter:
         for f in items:
             one = (self._doc(f.rule_id).get("description") or f.details or f.title)
             one = one if len(one) <= 130 else one[:127] + "…"
-            rows += (f'<li><span class="kc-dot" style="background:{f.sev_colour}"></span>'
+            rows += (f'<li><span class="kc-dot" style="background:{f.sev_color}"></span>'
                      f'<span style="flex:1"><a href="#f-{self._e(f.rule_id)}" onclick="kcJump(\'f-{self._e(f.rule_id)}\');return false"><strong>{self._e(f.title)}</strong></a> '
                      f'<span class="kc-kr-sub">{self._e(one)}</span></span></li>')
         return ('<div class="kc-keyrisks"><div class="kc-sub-h">Key risks at a glance</div>'
@@ -6392,10 +6485,10 @@ class HTMLReporter:
                 sev_by_cat[oc][f.severity] += 1; tot[oc] += 1
         cards = ""
         for cat in OPCAT_ORDER:
-            n = tot.get(cat,0); ccol = OPCAT_COLOUR.get(cat,"#888")
+            n = tot.get(cat,0); ccol = OPCAT_COLOR.get(cat,"#888")
             bd = sev_by_cat[cat]
             chips = "".join(
-                f'<span style="color:{SEV_COLOUR[s]};font-family:var(--mono);font-size:10.5px;margin-right:8px">{bd[s]} {s[:4].lower()}</span>'
+                f'<span style="color:{SEV_COLOR[s]};font-family:var(--mono);font-size:10.5px;margin-right:8px">{bd[s]} {s[:4].lower()}</span>'
                 for s in ("CRITICAL","HIGH","MEDIUM","LOW","INFO") if bd.get(s))
             cards += (f'<div class="kc-cat-card kc-clickable" style="border-top-color:{ccol}" '
                       f'onclick="kcCatJump(\'{self._e(cat)}\')" title="Filter the Findings table to {self._e(cat)}">'
@@ -6431,13 +6524,13 @@ class HTMLReporter:
         row = ""
         for i, part in enumerate(nodes_edges):
             row += part if i % 2 == 0 else self._edge(part)
-        meta = f'<div class="kc-chain-meta"><span class="kc-sev-pill" style="background:{SEV_COLOUR.get(sev,"#888")}">{sev}</span>' \
+        meta = f'<div class="kc-chain-meta"><span class="kc-sev-pill" style="background:{SEV_COLOR.get(sev,"#888")}">{sev}</span>' \
                + (f'<span class="kc-chain-tool">{self._e(tool)}</span>' if tool else "") + '</div>'
         scls = {"CRITICAL":"", "HIGH":"sev-high", "MEDIUM":"sev-medium"}.get(sev, "sev-medium")
         return f'<div class="kc-chain {scls}"><div class="kc-chain-row">{row}</div>{meta}</div>'
 
     def _build_paths(self):
-        """Synthesise attacker -> … -> Tier 0 chains from the findings + ACL data.
+        """Synthesize attacker -> … -> Tier 0 chains from the findings + ACL data.
         Returns list of (severity, html, rule_id)."""
         chains = []
         DA = self._node("Domain Admin", "crown", "♛")
@@ -6485,7 +6578,7 @@ class HTMLReporter:
             add("CRITICAL", [self._node("SYSTEM on "+m,"attacker","☣"), "machine secret", self._node(m), "member of", DA], "", "P-ComputerInPrivGroup")
         if has("S-SIDHistoryPrivileged"):
             who = (aff("S-SIDHistoryPrivileged") or ["account"])[0].split()[0]
-            add("CRITICAL", [self._node(who,"attacker","☣"), "SID history", self._node("privileged SID","crown","🔑"), "honoured at logon", DA], "", "S-SIDHistoryPrivileged")
+            add("CRITICAL", [self._node(who,"attacker","☣"), "SID history", self._node("privileged SID","crown","🔑"), "honored at logon", DA], "", "S-SIDHistoryPrivileged")
         if has("P-RBCD-Dangerous"):
             add("CRITICAL", [self._node("controlled principal","attacker","☣"), "RBCD", self._node("Domain controller","crown","♛"), "S4U impersonate", DA], "rbcd.py + getST.py", "P-RBCD-Dangerous")
         elif has("P-RBCD"):
@@ -6714,7 +6807,7 @@ class HTMLReporter:
                                                  self._SEV_ORDER.get(f.severity,9), f.rule_id))
         rows = []; seen_rid = set()
         for i, f in enumerate(sf):
-            oc = self._opcat(f); oc_col = OPCAT_COLOUR.get(oc,"#888")
+            oc = self._opcat(f); oc_col = OPCAT_COLOR.get(oc,"#888")
             anchor = f"f-{f.rule_id}" if f.rule_id not in seen_rid else f"f-{f.rule_id}-{i}"
             seen_rid.add(f.rule_id)
             rows.append(
@@ -6722,7 +6815,7 @@ class HTMLReporter:
                 f'data-cat="{self._e(oc)}" onclick="kcTog({i})" tabindex="0" role="button" '
                 f'onkeydown="if(event.key===\'Enter\'||event.key===\' \'){{event.preventDefault();kcTog({i})}}">'
                 f'<td><span id="ic-{i}" class="kc-toggle">+</span></td>'
-                f'<td><span class="kc-sev-pill" style="background:{f.sev_colour}">{self._e(f.severity)}</span></td>'
+                f'<td><span class="kc-sev-pill" style="background:{f.sev_color}">{self._e(f.severity)}</span></td>'
                 f'<td><span class="kc-cat-pill" style="background:{oc_col}">{self._e(oc)}</span></td>'
                 f'<td><code>{self._e(f.rule_id)}</code></td><td><strong>{self._e(f.title)}</strong></td>'
                 f'<td class="kc-num">{f.points}</td></tr>'
@@ -6730,7 +6823,7 @@ class HTMLReporter:
                 f'<td colspan="5"><div class="kc-panel">{self._finding_panel(f)}</div></td></tr>')
         catpills = "".join(
             f'<button class="kc-fp kc-fp-cat" data-f="cat:{self._e(c)}" onclick="kcFil(this)" '
-            f'style="--c:{OPCAT_COLOUR[c]}">{self._e(c)}</button>' for c in OPCAT_ORDER)
+            f'style="--c:{OPCAT_COLOR[c]}">{self._e(c)}</button>' for c in OPCAT_ORDER)
         pills = ('<button class="kc-fp kc-fp-on" data-f="sev:" onclick="kcFil(this)">All</button>'
                  '<button class="kc-fp" data-f="sev:CRITICAL" onclick="kcFil(this)" style="--c:#bd4234">Critical</button>'
                  '<button class="kc-fp" data-f="sev:HIGH" onclick="kcFil(this)" style="--c:#cb7a2f">High</button>'
@@ -6901,12 +6994,15 @@ def main():
             traceback.print_exc()
 
     # ── control-path graph closure (who can become DA) ────────────────────────
-    try:
-        ControlPathAnalyzer(ad_conn, data, args).run()
-    except Exception as e:
-        if args.verbose:
-            print(f"[!] control-path analysis error: {e}")
-            traceback.print_exc()
+    if args.no_paths:
+        print("[*] Skipping control-path analysis (--no-paths).")
+    else:
+        try:
+            ControlPathAnalyzer(ad_conn, data, args).run()
+        except Exception as e:
+            if args.verbose:
+                print(f"[!] control-path analysis error: {e}")
+                traceback.print_exc()
 
     # ── run checks ───────────────────────────────────────────────────────────
     print("[*] Running security checks...")
@@ -6950,13 +7046,13 @@ def main():
     sorted_findings = sorted(findings,
         key=lambda f:(sev_order.get(f.severity,5),f.category))
     for f in sorted_findings:
-        colour_map = {"CRITICAL":"\033[91m","HIGH":"\033[93m",
+        color_map = {"CRITICAL":"\033[91m","HIGH":"\033[93m",
                       "MEDIUM":"\033[33m","LOW":"\033[32m","INFO":"\033[36m"}
         reset = "\033[0m"
         if args.no_color:
-            colour_map = defaultdict(str)
+            color_map = defaultdict(str)
             reset = ""
-        c = colour_map.get(f.severity,"")
+        c = color_map.get(f.severity,"")
         print(f"  {c}[{f.severity:8s}]{reset} [{f.rule_id}] {f.title}")
         if f.details and args.verbose:
             print(f"           {f.details[:120]}")
@@ -7009,8 +7105,9 @@ def main():
         print(f"[+] CSV findings saved: {cpath}")
 
     print()
-    # exit non-zero when an exploitable path / poor grade is present (useful in CI)
-    return 0 if (scores.get("exposure", 0) < 35 and scores.get("grade") in ("A", "B")) else 1
+    # exit non-zero when a Tier-0 path is exposed (useful in CI gating). The
+    # letter grade was removed from scoring, so key off exposure alone.
+    return 0 if scores.get("exposure", 0) < 35 else 1
 
 
 if __name__ == "__main__":
