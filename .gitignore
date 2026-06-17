@@ -1,0 +1,31 @@
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ── SCOUT outputs (assessment data — never commit client results) ──
+scout_*.html
+scout_*.json
+scout_*.csv
+*.report.html
+
+# ── Kerberos / credential material ──
+*.ccache
+*.kirbi
+krb5cc_*
+scout_*.conf
+*.keytab
+
+# ── third-party reference material / large binaries (don't redistribute) ──
+*.exe
+*.pdf
+
+# ── editor / OS noise ──
+.DS_Store
+*.swp
+*.log
+.idea/
+.vscode/
