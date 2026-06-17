@@ -52,7 +52,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 try:
     import ldap3
-    from ldap3 import ALL, NTLM, SASL, GSSAPI, SIMPLE, Server, Connection, AUTO_BIND_NO_TLS, AUTO_BIND_TLS_BEFORE_BIND
+    from ldap3 import ALL, DSA, NTLM, SASL, GSSAPI, SIMPLE, Server, Connection, AUTO_BIND_NO_TLS, AUTO_BIND_TLS_BEFORE_BIND
     from ldap3.core.exceptions import LDAPException, LDAPBindError, LDAPSocketOpenError
     from ldap3.protocol.microsoft import security_descriptor_control
 except ImportError:
@@ -1793,7 +1793,7 @@ class ADConnection:
         # even when reverse DNS / PTR records are absent.
         try:
             probe = Server(self.args.dc_ip, port=self._ldap_port() if not self.args.ldaps else 389,
-                           use_ssl=False, get_info=ALL, connect_timeout=self.args.timeout)
+                           use_ssl=False, get_info=DSA, connect_timeout=self.args.timeout)
             conn = Connection(probe)
             if conn.open() is not False and probe.info:
                 dh = probe.info.other.get("dnsHostName")
@@ -1819,8 +1819,13 @@ class ADConnection:
         # disables cert/hostname validation — avoids PROTOCOL_TLS_CLIENT's
         # strict defaults that cause connection resets against self-signed DCs.
         tls = ldap3.Tls(validate=ssl.CERT_NONE) if self.args.ldaps else None
+        # get_info=DSA (RootDSE only), NOT ALL: loading the SCHEMA makes ldap3
+        # validate every requested attribute against it and fail the whole search
+        # with LDAPAttributeError if any is absent (e.g. the LAPS attributes on a
+        # domain without LAPS → 0 computers collected). SCOUT never uses the
+        # schema; it only needs RootDSE naming contexts + functional levels.
         return Server(self.args.dc_ip, port=port, use_ssl=self.args.ldaps,
-                      tls=tls, get_info=ALL, connect_timeout=self.args.timeout)
+                      tls=tls, get_info=DSA, connect_timeout=self.args.timeout)
 
     def connect(self) -> bool:
         """Establish an authenticated LDAP session, choosing the most robust
@@ -1892,17 +1897,24 @@ class ADConnection:
         return True
 
     def _do_bind(self) -> None:
+        # check_names=False is essential: with the schema loaded (get_info=ALL),
+        # ldap3 otherwise validates every REQUESTED attribute against the schema
+        # and raises LDAPAttributeError for the whole search if any is absent.
+        # On a domain without LAPS, requesting ms-Mcs-AdmPwdExpirationTime made
+        # the entire computer search fail -> 0 computers collected, silently.
+        # Disabling the check makes ldap3 behave like raw LDAP / the impacket
+        # backend: ask for anything, the server returns what exists.
         if self.args.null_session:
-            self.conn = Connection(self.server, auto_bind=True)
+            self.conn = Connection(self.server, auto_bind=True, check_names=False)
         elif self.args.hashes:
             lm, nt = self._parse_hashes()
             user = f"{self.args.domain}\\{self.args.username}"
             self.conn = Connection(self.server, user=user, password=f"{lm}:{nt}",
-                                   authentication=NTLM, auto_bind=True)
+                                   authentication=NTLM, auto_bind=True, check_names=False)
         elif self.args.username and self.args.password is not None:
             user = f"{self.args.domain}\\{self.args.username}"
             self.conn = Connection(self.server, user=user, password=self.args.password,
-                                   authentication=NTLM, auto_bind=True)
+                                   authentication=NTLM, auto_bind=True, check_names=False)
         else:
             raise ValueError("No credentials supplied and --null-session not set.")
 
@@ -2157,6 +2169,52 @@ class ADConnection:
         r = self.paged_search(base, flt, attrs, page_size=5)
         return r[0] if r else None
 
+    def fetch_sd(self, dn: str, sdflags: int = 0x07) -> Optional[bytes]:
+        """Backend-agnostic single-object nTSecurityDescriptor read, with the
+        LDAP_SERVER_SD_FLAGS control so the DACL is returned. Returns raw SD
+        bytes or None. Centralizing this means checks no longer reach into the
+        ldap3-only `self.conn` API directly (which silently did nothing on the
+        Kerberos/impacket backend — e.g. the DNS-zone and OU ACL checks)."""
+        if getattr(self, "_impacket", None):
+            try:
+                from impacket.ldap.ldapasn1 import Control, Scope as LDAPScope
+                from pyasn1.codec.ber import encoder
+                from pyasn1.type import univ
+                ctrl = Control(); ctrl["controlType"] = "1.2.840.113556.1.4.801"
+                seq = univ.Sequence(); seq.setComponentByPosition(0, univ.Integer(sdflags))
+                ctrl["controlValue"] = encoder.encode(seq)
+                res = self._impacket.search(
+                    searchBase=dn, searchFilter="(objectClass=*)",
+                    scope=LDAPScope("baseObject"), attributes=["nTSecurityDescriptor"],
+                    searchControls=[ctrl])
+                for entry in res:
+                    try:
+                        for attr in entry["attributes"]:
+                            if str(attr["type"]) == "nTSecurityDescriptor" and attr["vals"]:
+                                return bytes(attr["vals"][0])
+                    except Exception:
+                        continue
+            except Exception as e:
+                if self.args.verbose:
+                    print(f"[!] fetch_sd (impacket) failed for {dn}: {e}")
+            return None
+        try:
+            from ldap3.protocol.microsoft import security_descriptor_control as sdc
+            # NOTE: security_descriptor_control() returns a list already; pass it
+            # directly (controls=...), never wrapped in [ ].
+            self.conn.search(dn, "(objectClass=*)", ldap3.BASE,
+                             attributes=["nTSecurityDescriptor"],
+                             controls=sdc(sdflags=sdflags))
+            for entry in self.conn.response:
+                if entry.get("type") == "searchResEntry":
+                    raw = entry.get("raw_attributes", {}).get("nTSecurityDescriptor", [])
+                    if raw:
+                        return raw[0] if isinstance(raw, list) else raw
+        except Exception as e:
+            if self.args.verbose:
+                print(f"[!] fetch_sd (ldap3) failed for {dn}: {e}")
+        return None
+
 # ─────────────────────────────────────────────────────────────────────────────
 # AD DATA COLLECTOR
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2352,7 +2410,7 @@ class ADData:
             "msDS-AllowedToDelegateTo","msDS-AllowedToActOnBehalfOfOtherIdentity",
             "ms-Mcs-AdmPwdExpirationTime","msLAPS-PasswordExpirationTime",
             "distinguishedName","msDS-IsRODC","primaryGroupID","whenCreated",
-            "objectSid","name","dNSHostName","logonCount"])
+            "objectSid","name","logonCount"])
 
     # ── groups ────────────────────────────────────────────────────────────────
 
@@ -3315,20 +3373,13 @@ class CheckEngine:
         risky_zones: List[str] = []
         for z in self.d.dns_zones:
             zname = get_str(z["attrs"], "name") or z["dn"]
-            # Re-fetch zone with SACL/DACL flags so the DACL is actually returned
+            # Re-fetch zone SD with the DACL flag (backend-agnostic — the old
+            # direct ldap3 search did nothing on the Kerberos/impacket backend).
             try:
-                ctl = security_descriptor_control(sdflags=0x07)
-                self.d.conn.conn.search(
-                    z["dn"], "(objectClass=*)",
-                    attributes=["nTSecurityDescriptor"],
-                    controls=ctl)
-                entries = self.d.conn.conn.entries
-                if not entries:
-                    continue
-                sd_raw = entries[0]["nTSecurityDescriptor"].raw_values
+                sd_raw = self.d.conn.fetch_sd(z["dn"])
                 if not sd_raw:
                     continue
-                sd = _ldaptypes.SR_SECURITY_DESCRIPTOR(data=sd_raw[0])
+                sd = _ldaptypes.SR_SECURITY_DESCRIPTOR(data=sd_raw)
                 dacl = sd["Dacl"]
                 if not dacl:
                     continue
@@ -3863,19 +3914,30 @@ class CheckEngine:
                       with_mail[:20])
 
     def _p_admin_pwd_age(self):
-        for grpname in ["Domain Admins","Administrators","Enterprise Admins"]:
+        # Dedup by account across the three groups, then emit ONE finding with an
+        # affected list — previously this added a separate finding per admin,
+        # flooding the report (e.g. 16 identical HIGH entries) and inflating the
+        # finding count.
+        members = {}
+        for grpname in ["Domain Admins", "Administrators", "Enterprise Admins"]:
             for m in self.d.priv_group_members.get(grpname, []):
-                uac = get_int(m["attrs"], "userAccountControl")
-                if uac_has(uac, UAC_ACCOUNTDISABLE):
-                    continue
-                pls = filetime_to_dt(get_int(m["attrs"], "pwdLastSet"))
-                age = days_since(pls)
-                if age is None or age > 90:
-                    sam = get_str(m["attrs"], "sAMAccountName")
-                    age_str = f"{age} days" if age is not None else "NEVER"
-                    self._add("P-AdminPwdTooOld",
-                              f"{sam} ({grpname}): password last set {age_str} ago.",
-                              [sam])
+                sam = get_str(m["attrs"], "sAMAccountName") or dn_base(m.get("dn", ""))
+                members.setdefault(sam, (grpname, m))
+        affected = []
+        for sam, (grpname, m) in members.items():
+            if uac_has(get_int(m["attrs"], "userAccountControl"), UAC_ACCOUNTDISABLE):
+                continue
+            age = days_since(filetime_to_dt(get_int(m["attrs"], "pwdLastSet")))
+            if age is None or age > 90:
+                age_str = f"{age} days" if age is not None else "NEVER"
+                affected.append(f"{sam} ({grpname}): password last set {age_str} ago")
+        if affected:
+            self._add("P-AdminPwdTooOld",
+                      f"{len(affected)} privileged account(s) have a password older "
+                      "than 90 days. Long-lived Tier-0 credentials are prime targets "
+                      "for offline cracking and replay — rotate them and prefer gMSA "
+                      "for service identities.",
+                      affected)
 
     def _p_inactive_admins(self):
         affected = []
@@ -4091,16 +4153,10 @@ class CheckEngine:
             if not (len(parts) == 1 or is_dc_ou):
                 continue
             try:
-                ctl = security_descriptor_control(sdflags=0x07)
-                self.d.conn.conn.search(dn, "(objectClass=*)",
-                    attributes=["nTSecurityDescriptor"], controls=ctl)
-                entries = self.d.conn.conn.entries
-                if not entries:
-                    continue
-                sd_raw = entries[0]["nTSecurityDescriptor"].raw_values
+                sd_raw = self.d.conn.fetch_sd(dn)
                 if not sd_raw:
                     continue
-                sd = _ldaptypes.SR_SECURITY_DESCRIPTOR(data=sd_raw[0])
+                sd = _ldaptypes.SR_SECURITY_DESCRIPTOR(data=sd_raw)
                 dacl = sd["Dacl"]
                 if not dacl:
                     continue
@@ -5491,47 +5547,9 @@ class ACLAnalyzer:
         return None
 
     def _fetch_sd(self, dn: str) -> Optional[bytes]:
-        if getattr(self.conn, "_impacket", None):
-            return self._fetch_sd_impacket(dn)
-        try:
-            from ldap3.protocol.microsoft import security_descriptor_control as sdc
-            sdctrl = sdc(sdflags=0x07)  # Owner+Group+DACL
-            self.conn.conn.search(
-                dn, "(objectClass=*)", ldap3.BASE,
-                attributes=["nTSecurityDescriptor"],
-                controls=[sdctrl])
-            for entry in self.conn.conn.response:
-                if entry.get("type") == "searchResEntry":
-                    raw_list = entry.get("raw_attributes", {}).get(
-                        "nTSecurityDescriptor", [])
-                    if raw_list:
-                        return raw_list[0] if isinstance(raw_list, list) else raw_list
-        except Exception:
-            pass
-        return None
-
-    def _fetch_sd_impacket(self, dn: str) -> Optional[bytes]:
-        try:
-            from impacket.ldap.ldapasn1 import Control, Scope as LDAPScope
-            from pyasn1.codec.ber import encoder
-            from pyasn1.type import univ
-            ctrl = Control()
-            ctrl["controlType"] = "1.2.840.113556.1.4.801"
-            seq = univ.Sequence()
-            seq.setComponentByPosition(0, univ.Integer(0x07))
-            ctrl["controlValue"] = encoder.encode(seq)
-            results = self.conn._impacket.search(
-                searchBase=dn, searchFilter="(objectClass=*)",
-                scope=LDAPScope("baseObject"),
-                attributes=["nTSecurityDescriptor"],
-                searchControls=[ctrl])
-            for entry in results:
-                for attr in entry["attributes"]:
-                    if str(attr["type"]) == "nTSecurityDescriptor" and attr["vals"]:
-                        return bytes(attr["vals"][0])
-        except Exception:
-            pass
-        return None
+        # Delegate to the backend-agnostic reader on ADConnection (the fixed
+        # SD-control logic lives in one place now).
+        return self.conn.fetch_sd(dn)
 
     def _parse_dacl(self, raw_sd: bytes):
         try:
@@ -5741,9 +5759,16 @@ class ControlPathAnalyzer:
         if d.domain_obj:
             dsid = self._sid_of(d.domain_obj)
         self.dsid = dsid
-        # Tier-0 seeds (group SIDs + domain root DN)
+        # Tier-0 seeds (group SIDs + domain root DN). 516/521/498 (Domain
+        # Controllers / Read-only DCs / Enterprise Read-only DCs) are Tier-0 too:
+        # without them, the DCs' legitimate, by-design DCSync rights on the domain
+        # root were reported as a "non-privileged principal -> DA" control path
+        # (e.g. "Domain Controllers --[DCSync]--> Domain root"). Seeding them also
+        # folds DC machine accounts into the admin membership-closure so they are
+        # not themselves flagged as control-path principals.
         self.seeds = set()
-        for rid in (512, 519, 518, 548, 551, 549, 550, 520):   # DA/EA/Schema/AcctOp/BackupOp/SrvOp/PrintOp/GPCreator
+        for rid in (512, 519, 518, 548, 551, 549, 550, 520,    # DA/EA/Schema/AcctOp/BackupOp/SrvOp/PrintOp/GPCreator
+                    516, 521, 498):                            # Domain Controllers / RODC / Enterprise RODC
             if dsid:
                 self.seeds.add(f"{dsid}-{rid}")
         self.seeds |= {"S-1-5-32-544", "S-1-5-32-548", "S-1-5-32-551", "S-1-5-32-549", "S-1-5-32-550"}
@@ -6053,10 +6078,12 @@ class ControlPathAnalyzer:
             return out
         try:
             from ldap3.protocol.microsoft import security_descriptor_control as sdc
+            # security_descriptor_control() returns a list already — pass it
+            # directly, not wrapped in [ ] (see _fetch_sd note above).
             gen = self.conn.conn.extend.standard.paged_search(
                 search_base=self.conn.base_dn, search_filter=ldap_filter,
                 search_scope=ldap3.SUBTREE, attributes=["objectSid","nTSecurityDescriptor"],
-                controls=[sdc(sdflags=0x05)], paged_size=500, generator=True)
+                controls=sdc(sdflags=0x05), paged_size=500, generator=True)
             for e in gen:
                 if e.get("type") != "searchResEntry":
                     continue
