@@ -2652,6 +2652,55 @@ class CheckEngine:
         dcdns = {d["dn"] for d in self.d.dcs}
         return dn in dcdns
 
+    def _sid_index(self) -> Dict[str, str]:
+        """objectSid -> sAMAccountName for every collected user/computer/group,
+        plus well-known SIDs. Used to resolve the principals named inside a
+        security descriptor (e.g. an RBCD allow-list) to readable names."""
+        if getattr(self, "_sid_idx_cache", None) is not None:
+            return self._sid_idx_cache
+        idx: Dict[str, str] = {}
+        for obj in self.d.users + self.d.computers + list(self.d.groups.values()):
+            raw = obj["attrs"].get("objectSid")
+            if isinstance(raw, list):
+                raw = raw[0] if raw else None
+            s = sid_to_str(raw) if raw else ""
+            if s:
+                idx[s] = get_str(obj["attrs"], "sAMAccountName") or dn_base(obj.get("dn", ""))
+        idx.setdefault("S-1-1-0", "Everyone")
+        idx.setdefault("S-1-5-11", "Authenticated Users")
+        idx.setdefault("S-1-5-7", "Anonymous Logon")
+        self._sid_idx_cache = idx
+        return idx
+
+    def _rbcd_allowed_principals(self, a) -> List[str]:
+        """Principals named in msDS-AllowedToActOnBehalfOfOtherIdentity — i.e. the
+        accounts that can already use S4U to impersonate any user TO this object.
+        These are the specific principals an operator needs (issue #4); the bare
+        target name alone doesn't say who holds the delegation."""
+        raw = a.get("msDS-AllowedToActOnBehalfOfOtherIdentity")
+        if isinstance(raw, list):
+            raw = raw[0] if raw else None
+        if not isinstance(raw, (bytes, bytearray)) or not HAS_IMPACKET_LDAP:
+            return []
+        try:
+            sd = _ldaptypes.SR_SECURITY_DESCRIPTOR(data=raw)
+        except Exception:
+            return []
+        idx = self._sid_index()
+        out: List[str] = []
+        dacl = sd.get("Dacl")
+        if not dacl:
+            return []
+        for ace in dacl["Data"]:
+            try:
+                if "DENIED" in ace["TypeName"].upper():
+                    continue
+                sidstr = ace["Ace"]["Sid"].formatCanonical()
+            except Exception:
+                continue
+            out.append(idx.get(sidstr, sidstr))
+        return _dedup_keep_order(out)
+
     def _m_rbcd(self):
         dc_dns = {d["dn"] for d in self.d.dcs}
         normal, dangerous = [], []
@@ -2661,23 +2710,28 @@ class CheckEngine:
                and not get_str(a, "msDS-AllowedToActOnBehalfOfOtherIdentity"):
                 continue
             sam = get_str(a, "sAMAccountName")
+            allowed = self._rbcd_allowed_principals(a)
+            who = ", ".join(allowed) if allowed else "principals unreadable from SD"
+            entry = f"{sam} ← {who}"
             if obj["dn"] in dc_dns:
-                dangerous.append(sam)
+                dangerous.append(entry)
             else:
-                normal.append(sam)
+                normal.append(entry)
         if dangerous:
             self._add("P-RBCD-Dangerous",
                       "Resource-based constrained delegation is configured on a "
-                      "domain controller object. Anyone able to write that SD can "
-                      "impersonate any user to the DC (instant domain compromise).",
+                      "domain controller object. The principal(s) named in the SD "
+                      "(shown after '←') can use S4U to impersonate any user to the "
+                      "DC — instant domain compromise. Investigate how it was set; "
+                      "if you control a named principal, exploit it directly.",
                       dangerous)
         if normal:
             self._add("P-RBCD",
                       "These accounts have msDS-AllowedToActOnBehalfOfOtherIdentity "
-                      "set (resource-based constrained delegation). If an attacker "
-                      "controls an allowed principal (or can add one via "
-                      "MachineAccountQuota) they impersonate any user to the host. "
-                      "Validate every configured delegation.",
+                      "set (resource-based constrained delegation). The principal(s) "
+                      "after '←' can impersonate any user to the host; if you control "
+                      "one (or can add one via MachineAccountQuota) you take over the "
+                      "host. Validate every configured delegation.",
                       normal)
 
     def _m_constrained_delegation(self):
@@ -6071,6 +6125,7 @@ html[data-theme=light] .kc-nav{background:rgba(222,218,198,.96)}
   border-radius:14px;padding:4px 11px;font-size:12.5px;font-weight:600;white-space:nowrap}
 .kc-node.attacker{border-color:var(--high);color:var(--high)}
 .kc-node.crown{border-color:var(--crit);background:rgba(189,66,52,.14);color:var(--crit);font-weight:700}
+.kc-node.loot{border-color:var(--accent);color:var(--accent)}
 .kc-node .ic{font-size:12px;opacity:.85}
 .kc-edge{display:inline-flex;flex-direction:column;align-items:center;color:var(--muted);
   font-family:var(--mono);font-size:9px;letter-spacing:.03em;text-transform:uppercase;padding:0 4px;min-width:54px}
@@ -6533,18 +6588,22 @@ class HTMLReporter:
         """Synthesize attacker -> … -> Tier 0 chains from the findings + ACL data.
         Returns list of (severity, html, rule_id)."""
         chains = []
-        DA = self._node("Domain Admin", "crown", "♛")
-        DOM = self._node("Domain compromise", "crown", "♛")
-        any_user = self._node("Any domain user", "attacker", "☣")
-        unauth = self._node("Unauthenticated", "attacker", "☣")
+        # Node convention (no emoji — they rendered inconsistently and looked
+        # unprofessional): "attacker" = a principal/host you control, "loot" = a
+        # secret/certificate you capture, "crown" = Tier-0 / Domain Admin. Plain
+        # nodes are ordinary AD objects on the route.
+        DA = self._node("Domain Admin", "crown")
+        DOM = self._node("Domain compromise", "crown")
+        any_user = self._node("Any domain user", "attacker")
+        unauth = self._node("Unauthenticated", "attacker")
         add = lambda sev, nodes, tool, rid: chains.append((sev, self._chain(nodes, sev, tool), rid))
 
         for a in self.data.acl_findings:
             t = a.get("type",""); who = a.get("sid_name") or a.get("sid") or "principal"
             right = a.get("right",""); obj = a.get("object","")
-            n_who = self._node(who, "attacker", "☣")
+            n_who = self._node(who, "attacker")
             if t == "dcsync":
-                add("CRITICAL", [n_who, "DS-Repl", self._node("NTDS secrets","crown","🔑"), "dump", DOM], "secretsdump.py -just-dc", "P-DCSync")
+                add("CRITICAL", [n_who, "DCSync", self._node("NTDS secrets","loot"), "dump hashes", DOM], "secretsdump.py -just-dc", "P-DCSync")
             elif t in ("dangerous_acl","owner"):
                 add("CRITICAL", [n_who, right or "WriteDACL", self._node(obj or "Domain root"), "grant DCSync", DOM], "dacledit / secretsdump", "P-DangerousACLDomain")
             elif t == "gpo_write":
@@ -6559,50 +6618,75 @@ class HTMLReporter:
 
         if has("P-DCSync") and not any(r == "P-DCSync" for _,_,r in chains):
             who = (aff("P-DCSync") or ["non-admin principal"])[0]
-            add("CRITICAL", [self._node(who.split()[0],"attacker","☣"), "DCSync", self._node("NTDS secrets","crown","🔑"), "dump", DOM], "secretsdump.py -just-dc", "P-DCSync")
+            add("CRITICAL", [self._node(who.split()[0],"attacker"), "DCSync", self._node("NTDS secrets","loot"), "dump hashes", DOM], "secretsdump.py -just-dc", "P-DCSync")
         if has("P-GPPPassword"):
-            add("CRITICAL", [any_user, "read SYSVOL", self._node("GPP cpassword","crown","🔑"), "AES-decrypt", self._node("Local admin creds")], "gpp-decrypt", "P-GPPPassword")
+            add("CRITICAL", [any_user, "read SYSVOL", self._node("GPP cpassword","loot"), "AES-decrypt", self._node("Local admin creds","loot")], "gpp-decrypt", "P-GPPPassword")
         if has("A-CertTempCustomSubject"):
             tmpl = (aff("A-CertTempCustomSubject") or ["vuln template"])[0]
-            add("CRITICAL", [any_user, "ESC1 enrol", self._node(tmpl), "SAN=DA", self._node("DA certificate","crown","📜"), "PKINIT", DA], "certipy req -upn administrator@…", "A-CertTempCustomSubject")
+            add("CRITICAL", [any_user, "ESC1 enroll", self._node(tmpl), "SAN = DA", self._node("DA certificate","loot"), "PKINIT", DA], "certipy req -upn administrator@…", "A-CertTempCustomSubject")
         if has("A-CertTemplateESC4"):
             tmpl = (aff("A-CertTemplateESC4") or ["template"])[0].split()[0]
-            add("CRITICAL", [any_user, "ESC4 WriteDACL", self._node(tmpl), "make ESC1", self._node("DA certificate","crown","📜"), "PKINIT", DA], "certipy template", "A-CertTemplateESC4")
+            add("CRITICAL", [any_user, "ESC4 WriteDACL", self._node(tmpl), "make ESC1", self._node("DA certificate","loot"), "PKINIT", DA], "certipy template", "A-CertTemplateESC4")
         if has("A-CertEnrollHttp"):
-            add("CRITICAL", [self._node("Coerced DC$","attacker","☣"), "NTLM relay", self._node("ADCS web enrol (ESC8)"), "issue", self._node("DC certificate","crown","📜"), "DCSync", DOM], "PetitPotam + ntlmrelayx", "A-CertEnrollHttp")
+            add("CRITICAL", [self._node("Coerced DC$","attacker"), "NTLM relay", self._node("ADCS web enrollment (ESC8)"), "issue", self._node("DC certificate","loot"), "DCSync", DOM], "PetitPotam + ntlmrelayx", "A-CertEnrollHttp")
         if has("P-ServiceDomainAdmin") or has("S-KerberoastableAdmin"):
             svc = (aff("S-KerberoastableAdmin") or aff("P-ServiceDomainAdmin") or ["svc_admin"])[0].split()[0]
-            add("CRITICAL", [any_user, "Kerberoast", self._node(svc), "crack RC4", self._node("svc password","crown","🔑"), "member of", DA], "GetUserSPNs.py -request → hashcat -m 13100", "S-KerberoastableAdmin")
+            add("CRITICAL", [any_user, "Kerberoast", self._node(svc), "crack RC4", self._node("Service password","loot"), "member of", DA], "GetUserSPNs.py -request → hashcat -m 13100", "S-KerberoastableAdmin")
         if has("P-ComputerInPrivGroup"):
             m = (aff("P-ComputerInPrivGroup") or ["WS$"])[0].split()[0]
-            add("CRITICAL", [self._node("SYSTEM on "+m,"attacker","☣"), "machine secret", self._node(m), "member of", DA], "", "P-ComputerInPrivGroup")
+            add("CRITICAL", [self._node("SYSTEM on "+m,"attacker"), "machine secret", self._node(m), "member of", DA], "", "P-ComputerInPrivGroup")
         if has("S-SIDHistoryPrivileged"):
             who = (aff("S-SIDHistoryPrivileged") or ["account"])[0].split()[0]
-            add("CRITICAL", [self._node(who,"attacker","☣"), "SID history", self._node("privileged SID","crown","🔑"), "honored at logon", DA], "", "S-SIDHistoryPrivileged")
+            add("CRITICAL", [self._node(who,"attacker"), "SID history", self._node("Privileged SID","loot"), "honored at logon", DA], "", "S-SIDHistoryPrivileged")
         if has("P-RBCD-Dangerous"):
-            add("CRITICAL", [self._node("controlled principal","attacker","☣"), "RBCD", self._node("Domain controller","crown","♛"), "S4U impersonate", DA], "rbcd.py + getST.py", "P-RBCD-Dangerous")
+            # Name the principal that actually holds the delegation over the DC —
+            # the finding evidence is "DC$ ← <principal(s)>" (issue #4).
+            ev = (aff("P-RBCD-Dangerous") or [""])[0]
+            who = ev.split("←", 1)[1].strip().split(",")[0].strip() if "←" in ev else ""
+            who = who or "controlled principal"
+            add("CRITICAL", [self._node(who,"attacker"), "RBCD S4U", self._node("Domain controller"), "impersonate any user", DA], "getST.py -spn cifs/dc -impersonate Administrator", "P-RBCD-Dangerous")
         elif has("P-RBCD"):
-            tgt = (aff("P-RBCD") or ["host"])[0]
-            add("HIGH", [self._node("controlled / new machine","attacker","☣"), "RBCD", self._node(tgt), "S4U impersonate", self._node("any user on host")], "rbcd.py", "P-RBCD")
+            tgt = (aff("P-RBCD") or ["host"])[0].split("←")[0].strip() or "host"
+            add("HIGH", [self._node("controlled / new machine","attacker"), "RBCD S4U", self._node(tgt), "impersonate any user", self._node("Host compromise")], "rbcd.py + getST.py", "P-RBCD")
         if has("P-UnconstrainedDelegation"):
             h = (aff("P-UnconstrainedDelegation") or ["host"])[0]
-            add("CRITICAL", [self._node("Coerced DC$","attacker","☣"), "auth to", self._node(h+" (unconstrained)"), "capture TGT", DA], "printerbug.py + krbrelayx", "P-UnconstrainedDelegation")
-        if has("P-MachineAccountQuota") and (has("P-RBCD") or not chains):
-            add("HIGH", [any_user, "MAQ>0: add machine", self._node("attacker computer"), "RBCD/shadow-cred", self._node("target host")], "addcomputer.py", "P-MachineAccountQuota")
+            add("CRITICAL", [self._node("Coerced DC$","attacker"), "authenticates to", self._node(h+" (unconstrained)"), "capture TGT", DA], "printerbug.py + krbrelayx", "P-UnconstrainedDelegation")
+        # MAQ is only a Tier-0 path when the target's RBCD attribute can actually
+        # be written: via an existing controllable RBCD, or an NTLM relay to the
+        # directory (LDAP signing / LDAPS channel binding NOT enforced). When the
+        # DC enforces signing + channel binding and no write primitive exists, MAQ
+        # alone is not exploitable (issue #4) — it remains a finding, not a path.
+        relay_viable = (has("A-DCLdapSign") or has("A-LDAPSigningDisabled")
+                        or has("A-DCLdapsChannelBinding"))
+        if has("P-MachineAccountQuota") and has("P-RBCD"):
+            add("HIGH", [any_user, "add machine (MAQ)", self._node("attacker computer"),
+                         "configure RBCD on target", self._node("RBCD-enabled host"),
+                         "S4U impersonate", self._node("Host compromise")],
+                "addcomputer.py + rbcd.py + getST.py", "P-MachineAccountQuota")
+        elif has("P-MachineAccountQuota") and relay_viable:
+            add("HIGH", [any_user, "add machine (MAQ)", self._node("attacker computer"),
+                         "coerce + relay to LDAP", self._node("write RBCD on target"),
+                         "S4U impersonate", self._node("Host compromise")],
+                "addcomputer.py + ntlmrelayx --delegate-access", "P-MachineAccountQuota")
         if has("A-DnsZoneAUCreateChild"):
-            add("HIGH", [any_user, "ADIDNS write", self._node("wpad / * record"), "coerce + relay", self._node("victim creds")], "dnstool.py + Responder", "A-DnsZoneAUCreateChild")
+            add("HIGH", [any_user, "ADIDNS write", self._node("wpad / * record"), "coerce + relay", self._node("Victim credentials","loot")], "dnstool.py + Responder", "A-DnsZoneAUCreateChild")
         if has("S-NoPreAuthAdmin") or has("S-NoPreAuth"):
             who = (aff("S-NoPreAuthAdmin") or aff("S-NoPreAuth") or ["account"])[0].split()[0]
-            sev = "CRITICAL" if has("S-NoPreAuthAdmin") else "HIGH"
-            add(sev, [unauth, "AS-REP roast", self._node(who), "crack", self._node("password","crown","🔑")], "GetNPUsers.py → hashcat -m 18200", "S-NoPreAuthAdmin" if has("S-NoPreAuthAdmin") else "S-NoPreAuth")
+            admin = has("S-NoPreAuthAdmin")
+            sev = "CRITICAL" if admin else "HIGH"
+            nodes = [unauth, "AS-REP roast", self._node(who), "crack hash", self._node("Cracked password","loot")]
+            if admin:
+                nodes += ["member of", DA]
+            add(sev, nodes, "GetNPUsers.py → hashcat -m 18200",
+                "S-NoPreAuthAdmin" if admin else "S-NoPreAuth")
         if has("A-Pre2kComputer"):
             m = (aff("A-Pre2kComputer") or ["HOST$"])[0].split()[0]
-            add("HIGH", [unauth, "default pwd", self._node(m), "auth as computer", self._node("foothold + TGT","crown","🔑")], "pre2k auth / getTGT.py", "A-Pre2kComputer")
+            add("HIGH", [unauth, "guess default password", self._node(m), "authenticate as "+m, self._node("Domain foothold")], "pre2k auth / getTGT.py", "A-Pre2kComputer")
         if has("A-WeakLockout"):
-            add("HIGH", [unauth, "password spray", self._node("no-lockout policy"), "valid creds", self._node("domain foothold","crown","🔑")], "nxc smb --continue-on-success / kerbrute", "A-WeakLockout")
+            add("HIGH", [unauth, "password spray", self._node("No lockout policy"), "valid credentials", self._node("Domain foothold")], "nxc smb --continue-on-success / kerbrute", "A-WeakLockout")
         if has("A-SCCM"):
             h = (aff("A-SCCM") or ["SCCM site server"])[0].split()[0]
-            add("HIGH", [self._node("Coerced/relayed auth","attacker","☣"), "NTLM relay", self._node(h+" (MP/site)"), "NAA / site DB", self._node("privileged creds","crown","🔑")], "SharpSCCM / sccmhunter / ntlmrelayx", "A-SCCM")
+            add("HIGH", [self._node("Coerced / relayed auth","attacker"), "NTLM relay", self._node(h+" (MP / site)"), "NAA / site DB", self._node("Privileged credentials","loot")], "SharpSCCM / sccmhunter / ntlmrelayx", "A-SCCM")
         return chains
 
     def _inline_path(self, rule_id):
@@ -6723,10 +6807,10 @@ class HTMLReporter:
             for name, path, is_broad in cpaths["paths"]:
                 if not path:
                     continue
-                ne = [self._node(path[0][0], "attacker", "☣")]
+                ne = [self._node(path[0][0], "attacker")]
                 for k, (src, label, dst) in enumerate(path):
                     last = (k == len(path) - 1)
-                    ne += [label, self._node(dst, "crown" if last else "", "♛" if last else "")]
+                    ne += [label, self._node(dst, "crown" if last else "")]
                 chains += self._chain(ne, "CRITICAL" if is_broad else "HIGH",
                                       "via membership + ACL/owner edges")
             extra = cpaths.get("count", 0) - len(cpaths["paths"])
