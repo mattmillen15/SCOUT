@@ -124,13 +124,17 @@ Status as of the control-path overhaul:
    string values normalise across backends, and the report now surfaces per-query
    collection failures ("Collection notes") so "clean" can't mean "unscanned".
    Full per-attribute SID/time normalisation across edge cases is ongoing.
-7. **Deferred.** `lastLogon` (per-DC) reconciliation with `lastLogonTimestamp`
-   needs a query against every DC; heavy for marginal accuracy gain.
+7. **Done (opt-in).** `--accurate-logon` reconciles the replicated
+   `lastLogonTimestamp` (up to ~14 days stale) against the non-replicated
+   `lastLogon` on every DC for the privileged-inactivity findings, clearing false
+   "inactive"/"never logged on" admins. Off by default (extra per-DC binds).
 8. **Deferred.** A NetExec (`nxc ldap`) module that reuses the engine is a
    separate deliverable — the engine is a monolith bound to its own
    `ADConnection`, so a clean port needs refactoring and an nxc test rig.
-9. **Not started.** Trust scope/transitivity classification and a
-   reachable-domains map.
+9. **Done.** `classify_trust()` classifies every trust (scope: intra-forest /
+   forest / external / realm; transitivity; direction; SID-filtering; selective
+   auth; TGT delegation) into a reachable-domains "Trust map" in the report, with
+   per-trust cross-domain risk notes.
 
 ## Design notes
 

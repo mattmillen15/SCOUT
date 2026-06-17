@@ -104,6 +104,8 @@ UAC_TRUSTED_TO_AUTH        = 0x01000000  # protocol transition
 UAC_PARTIAL_SECRETS        = 0x04000000  # RODC
 
 # ── Trust attributes ──────────────────────────────────────────────────────────
+TRUST_ATTR_NON_TRANSITIVE   = 0x00000001
+TRUST_ATTR_UPLEVEL_ONLY     = 0x00000002
 TRUST_ATTR_QUARANTINED      = 0x00000004  # SID filtering
 TRUST_ATTR_FOREST           = 0x00000008
 TRUST_ATTR_CROSS_ORG        = 0x00000010  # selective auth
@@ -112,6 +114,8 @@ TRUST_ATTR_TREAT_EXTERNAL   = 0x00000040
 TRUST_ATTR_RC4              = 0x00000080
 TRUST_ATTR_TGT_DELEGATION   = 0x00000800
 TRUST_TYPE_DOWNLEVEL        = 1
+TRUST_TYPE_UPLEVEL          = 2
+TRUST_TYPE_MIT              = 3
 TRUST_DIR_DISABLED          = 0
 TRUST_DIR_INBOUND           = 1
 TRUST_DIR_OUTBOUND          = 2
@@ -1646,6 +1650,54 @@ def dn_base(dn: str) -> str:
     m = re.match(r'^[^=]+=([^,]+)', dn or "")
     return m.group(1) if m else dn
 
+def classify_trust(attrs: Dict) -> Dict:
+    """Classify a trustedDomain object's scope / transitivity / direction and the
+    cross-domain risks it carries (roadmap item 9). Factual, derived purely from
+    trustAttributes / trustDirection / trustType."""
+    name = (get_str(attrs, "trustPartner") or get_str(attrs, "name")
+            or get_str(attrs, "flatName"))
+    ta = get_int(attrs, "trustAttributes")
+    tdir = get_int(attrs, "trustDirection")
+    ttype = get_int(attrs, "trustType")
+    direction = {0: "Disabled", 1: "Inbound", 2: "Outbound",
+                 3: "Bidirectional"}.get(tdir, f"?({tdir})")
+    if ta & TRUST_ATTR_WITHIN_FOREST:
+        scope = "Intra-forest"
+    elif ta & TRUST_ATTR_FOREST:
+        scope = "Forest"
+    elif ttype == TRUST_TYPE_MIT:
+        scope = "Realm (MIT)"
+    elif ta & TRUST_ATTR_TREAT_EXTERNAL:
+        scope = "External (treat-as-external)"
+    else:
+        scope = "External"
+    # External (non-forest, non-intra-forest) trusts are non-transitive; otherwise
+    # honor the explicit NON_TRANSITIVE bit.
+    intra_or_forest = bool(ta & (TRUST_ATTR_WITHIN_FOREST | TRUST_ATTR_FOREST))
+    transitive = (not (ta & TRUST_ATTR_NON_TRANSITIVE)) if intra_or_forest else False
+    sid_filtering = bool(ta & TRUST_ATTR_QUARANTINED) or bool(ta & TRUST_ATTR_WITHIN_FOREST)
+    selective_auth = bool(ta & TRUST_ATTR_CROSS_ORG)
+    tgt_delegation = bool(ta & TRUST_ATTR_TGT_DELEGATION)
+    risks = []
+    # Inbound/Bidirectional = the partner's principals can authenticate INTO this
+    # domain; without SID filtering that enables SID-history injection from the
+    # partner to escalate here.
+    exposes_us = tdir in (TRUST_DIR_INBOUND, TRUST_DIR_BIDIRECT)
+    if exposes_us and not sid_filtering:
+        risks.append("SID filtering off + inbound — SID-history injection from "
+                     f"'{name}' can escalate into this domain")
+    if tgt_delegation:
+        risks.append("TGT delegation enabled — unconstrained host in the trusted "
+                     "domain can capture this domain's TGTs")
+    if scope.startswith("External") and transitive:
+        risks.append("transitive external trust — widens the reachable surface")
+    return {"name": name, "direction": direction, "scope": scope,
+            "transitive": transitive, "sid_filtering": sid_filtering,
+            "selective_auth": selective_auth, "tgt_delegation": tgt_delegation,
+            "type": {1: "Downlevel (NT4)", 2: "Uplevel (AD)", 3: "MIT",
+                     4: "DCE"}.get(ttype, str(ttype)),
+            "risks": risks}
+
 def check_port(host: str, port: int, timeout: float = 3.0) -> bool:
     try:
         s = socket.create_connection((host, port), timeout=timeout)
@@ -1719,6 +1771,12 @@ Examples:
                       help="Skip control-path (Tier-0 reachability) analysis. It "
                            "bulk-reads security descriptors and runs a graph "
                            "closure — the slowest stage on large domains.")
+    conn.add_argument("--accurate-logon", action="store_true",
+                      help="For privileged-inactivity findings, reconcile the "
+                           "(replicated, up-to-14-days-stale) lastLogonTimestamp "
+                           "against the non-replicated lastLogon on EVERY DC and "
+                           "use the most recent. Extra per-DC queries; clears "
+                           "false 'inactive'/'never logged on' admin findings.")
 
     out = p.add_argument_group("Output")
     out.add_argument("-o", "--output", metavar="FILE",
@@ -2243,6 +2301,7 @@ class ADData:
         self.dcs:           List[Dict] = []
         self.rodcs:         List[Dict] = []
         self.trusts:        List[Dict] = []
+        self.trust_map:     List[Dict] = []   # classified trusts (scope/transitivity/risks)
         self.gpos:          List[Dict] = []
         self.sites:         List[Dict] = []
         self.subnets:       List[Dict] = []
@@ -3888,11 +3947,73 @@ class CheckEngine:
         self._p_unprotected_ous()
         self._p_everyone_privs()
 
+    def _priv_last_logon_map(self) -> Dict[str, int]:
+        """Roadmap item 7: max non-replicated lastLogon per privileged account
+        across ALL DCs. lastLogonTimestamp replicates but lags up to ~14 days, so
+        an admin who only ever logs on to one DC can look stale/never-logged-on.
+        Only runs under --accurate-logon (extra per-DC binds). Cached."""
+        if getattr(self, "_pll_cache", None) is not None:
+            return self._pll_cache
+        cache: Dict[str, int] = {}
+        if not getattr(self.args, "accurate_logon", False):
+            self._pll_cache = cache
+            return cache
+        from ldap3.utils.conv import escape_filter_chars
+        sams = set()
+        for members in self.d.priv_group_members.values():
+            for m in members:
+                s = get_str(m["attrs"], "sAMAccountName")
+                if s:
+                    sams.add(s)
+        if not sams:
+            self._pll_cache = cache
+            return cache
+        flt = "(|" + "".join(f"(sAMAccountName={escape_filter_chars(s)})" for s in sams) + ")"
+        hosts = [get_str(d["attrs"], "dNSHostName") for d in self.d.dcs
+                 if get_str(d["attrs"], "dNSHostName")] or [self.args.dc_ip]
+        import copy
+        for host in _dedup_keep_order(hosts):
+            try:
+                a = copy.copy(self.args)
+                a.dc_ip = host; a.dc_host = host
+                sub = ADConnection(a)
+                if not sub.connect():
+                    continue
+                for r in sub.paged_search(self.d.base, flt, ["sAMAccountName", "lastLogon"]):
+                    sam = get_str(r["attrs"], "sAMAccountName").lower()
+                    ll = get_int(r["attrs"], "lastLogon")
+                    if ll > cache.get(sam, 0):
+                        cache[sam] = ll
+            except Exception as e:
+                if self.args.verbose:
+                    print(f"[!] --accurate-logon: DC {host} query failed: {e}")
+        self._pll_cache = cache
+        return cache
+
+    def _reconciled_logon_age(self, m) -> Optional[int]:
+        """Newest logon age (days) for an account: min of lastLogonTimestamp age
+        and the per-DC lastLogon age (when --accurate-logon). None = never."""
+        llt = get_int(m["attrs"], "lastLogonTimestamp")
+        best = llt
+        sam = get_str(m["attrs"], "sAMAccountName").lower()
+        ll = self._priv_last_logon_map().get(sam, 0)
+        if ll > best:
+            best = ll
+        return days_since(filetime_to_dt(best))
+
+    @staticmethod
+    def _is_user_account(m) -> bool:
+        """True for a real user/computer account, False for a nested GROUP. Group
+        members of a privileged group have no userAccountControl, so they were
+        wrongly counted as 'admin accounts' and flagged inactive/never-logged-on."""
+        return bool(m["attrs"].get("userAccountControl"))
+
     def _p_admin_count(self):
         da = self.d.priv_group_members.get("Domain Admins", [])
         active_admins = [m for m in da
-                         if not uac_has(get_int(m["attrs"],"userAccountControl"),
-                                        UAC_ACCOUNTDISABLE)]
+                         if self._is_user_account(m)
+                         and not uac_has(get_int(m["attrs"],"userAccountControl"),
+                                         UAC_ACCOUNTDISABLE)]
         threshold = 5
         if len(active_admins) > threshold:
             names = [get_str(m["attrs"],"sAMAccountName") for m in active_admins]
@@ -3900,11 +4021,11 @@ class CheckEngine:
                       f"{len(active_admins)} active Domain Admin accounts found "
                       f"(recommended ≤ {threshold}). Reduce attack surface.",
                       names[:30])
-        # Check for admins that have never logged in
+        # Check for admins that have never logged in (reconciled across DCs when
+        # --accurate-logon, so a DA who only logs on to one DC isn't a false hit).
         never_logon = []
         for m in active_admins:
-            llt = get_int(m["attrs"], "lastLogonTimestamp")
-            if llt == 0:
+            if self._reconciled_logon_age(m) is None:
                 never_logon.append(get_str(m["attrs"], "sAMAccountName"))
         if never_logon:
             self._add("P-AdminLogin",
@@ -3927,6 +4048,8 @@ class CheckEngine:
         members = {}
         for grpname in ["Domain Admins", "Administrators", "Enterprise Admins"]:
             for m in self.d.priv_group_members.get(grpname, []):
+                if not self._is_user_account(m):   # skip nested groups
+                    continue
                 sam = get_str(m["attrs"], "sAMAccountName") or dn_base(m.get("dn", ""))
                 members.setdefault(sam, (grpname, m))
         affected = []
@@ -3947,15 +4070,20 @@ class CheckEngine:
 
     def _p_inactive_admins(self):
         affected = []
+        seen = set()
         for grpname in ["Domain Admins","Enterprise Admins","Administrators"]:
             for m in self.d.priv_group_members.get(grpname, []):
+                if not self._is_user_account(m):   # skip nested groups
+                    continue
                 uac = get_int(m["attrs"], "userAccountControl")
                 if uac_has(uac, UAC_ACCOUNTDISABLE):
                     continue
-                llt = filetime_to_dt(get_int(m["attrs"], "lastLogonTimestamp"))
-                age = days_since(llt)
+                sam = get_str(m["attrs"], "sAMAccountName")
+                if sam in seen:
+                    continue
+                age = self._reconciled_logon_age(m)
                 if age is None or age > 180:
-                    sam = get_str(m["attrs"], "sAMAccountName")
+                    seen.add(sam)
                     age_str = f"{age} days" if age is not None else "NEVER"
                     affected.append(f"{sam} (last logon: {age_str})")
         if affected:
@@ -4650,6 +4778,9 @@ class CheckEngine:
     def _check_trust(self):
         for trust in self.d.trusts:
             self._t_check_trust(trust)
+        # Roadmap item 9: classify every trust (scope / transitivity / direction /
+        # SID-filtering) into a reachable-domains map for the report.
+        self.d.trust_map = [classify_trust(t["attrs"]) for t in self.d.trusts]
         self._t_azure_ad_sso()
 
     def _t_check_trust(self, trust: Dict):
@@ -7598,19 +7729,27 @@ class HTMLReporter:
             bars += (f'<div class="kc-bar-row"><div class="kc-bar-l">{self._e(os)}</div>'
                      f'<div class="kc-bar-t"><div class="kc-bar-f" style="width:{n/omax*100:.0f}%;background:{col}"></div></div>'
                      f'<div class="kc-bar-n">{n}</div></div>')
-        # trusts table (folded into inventory)
+        # trust map (folded into inventory): scope / transitivity / direction /
+        # SID-filtering + cross-domain risks — the reachable-domains view.
         trusts = ""
-        if d.trusts:
-            tt = {1:"Downlevel",2:"Uplevel",3:"MIT",4:"DCE"}; td = {0:"Disabled",1:"Inbound",2:"Outbound",3:"Bidirectional"}
+        tmap = getattr(d, "trust_map", None) or [classify_trust(t["attrs"]) for t in d.trusts]
+        if tmap:
             rows = ""
-            for t in d.trusts:
-                name = get_str(t["attrs"],"name") or get_str(t["attrs"],"trustPartner")
-                ta = get_int(t["attrs"],"trustAttributes")
-                sidf = "<span class='kc-ok'>yes</span>" if ta & TRUST_ATTR_QUARANTINED else "<span class='kc-bad'>no</span>"
-                rows += (f'<tr><td><strong>{self._e(name)}</strong></td><td>{tt.get(get_int(t["attrs"],"trustType"),"?")}</td>'
-                         f'<td>{td.get(get_int(t["attrs"],"trustDirection"),"?")}</td><td>{sidf}</td></tr>')
-            trusts = ('<div class="kc-sub-h">Trusts</div><table class="kc-table"><thead><tr><th>Partner</th>'
-                      '<th>Type</th><th>Direction</th><th>SID filtering</th></tr></thead>'
+            for c in tmap:
+                sidf = ("<span class='kc-ok'>yes</span>" if c["sid_filtering"]
+                        else "<span class='kc-bad'>no</span>")
+                trans = "yes" if c["transitive"] else "no"
+                risk = (f"<span class='kc-bad'>{self._e('; '.join(c['risks']))}</span>"
+                        if c["risks"] else "<span class='kc-muted'>—</span>")
+                rows += (f'<tr><td><strong>{self._e(c["name"])}</strong></td>'
+                         f'<td>{self._e(c["scope"])}</td><td>{self._e(c["direction"])}</td>'
+                         f'<td>{trans}</td><td>{sidf}</td><td class="kc-detail">{risk}</td></tr>')
+            trusts = ('<div class="kc-sub-h">Trust map <span style="font-weight:400;'
+                      'text-transform:none;letter-spacing:0;color:var(--faint)">— reachable '
+                      'domains & cross-domain risk</span></div>'
+                      '<table class="kc-table"><thead><tr><th>Partner</th><th>Scope</th>'
+                      '<th>Direction</th><th>Transitive</th><th>SID filtering</th>'
+                      '<th>Risk</th></tr></thead>'
                       f'<tbody>{rows}</tbody></table>')
         return ('<div class="kc-sub-h">Domain inventory</div>'
                 f'<div class="kc-stat-grid">{cells}</div>'
