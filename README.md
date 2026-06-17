@@ -10,16 +10,18 @@ It is built to run from a non-domain-joined box during an internal assessment.
 
 ## Features
 
-- **Two-axis scoring → A–F grade.** *Exposure* (0–100) is set by the easiest
-  available path to Tier 0, so a hardened domain scores low and a one-step
-  takeover scores high — it actually differentiates environments. *Hygiene debt*
-  (0–100) grades misconfiguration/stale load by prevalence. The two combine into
-  an A–F posture grade. Findings are organized by **operational category**
+- **Exposure-based scoring.** *Exposure* (0–100) is set by the easiest available
+  path to Tier 0, so a hardened domain scores low and a one-step takeover scores
+  high — it actually differentiates environments (with a plain-English verdict,
+  e.g. "Domain compromisable"). *Hygiene debt* (0–100) grades misconfiguration/
+  stale load by prevalence. Findings are organized by **operational category**
   (Privilege Escalation, Credential Access, Lateral Movement, Persistence,
   Recon & Exposure, Hygiene & Legacy), not a compliance taxonomy.
-- **Paths to Domain Dominance** — BloodHound-style control-path chains
-  (attacker → control edge → … → Tier 0) with the exact tradecraft to walk each.
-- **MITRE ATT&CK mapping** on findings, with a tactic coverage matrix.
+- **Attack Paths** — BloodHound-style control-path chains (attacker → control
+  edge → … → Tier 0) with the exact tradecraft to walk each.
+- **Privileged Accounts explorer** — click any privileged group to see its
+  members with pwd age, last logon, enabled/admin status and flags (stale,
+  kerberoastable, never-expires), plus the principals holding control over Tier-0.
 - **Coverage tuned to internal pentests** — RBCD, constrained delegation on
   service accounts, ADCS ESC1/2/3/4/8, **SCCM/MECM** site infrastructure,
   **pre-staged (Pre-Windows 2000) computer accounts**, **password-spray surface**
@@ -34,8 +36,9 @@ It is built to run from a non-domain-joined box during an internal assessment.
   sidesteps *LDAPS channel binding (EPA)*. ccache reuse is also supported.
 - **Interactive HTML report** — click any finding for evidence, copy-ready
   exploitation commands, remediation and affected objects; severity/category
-  filters, search, ATT&CK coverage, prioritized action plan, light/dark theme
-  and print-to-PDF. Plus machine-readable JSON and CSV for tracking over time.
+  exploitation commands, remediation and a terminal-style evidence block; an
+  inline attack-path visual on relevant findings; severity/operation filters,
+  search, light/dark theme and print-to-PDF. Plus JSON and CSV exports.
 
 ## Install
 

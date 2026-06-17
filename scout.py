@@ -141,7 +141,7 @@ RULES: Dict[str, Tuple[str, str, int, str]] = {
     "A-MinPwdLen":            ("Minimum password length < 8 characters","Anomaly",5,"LOW"),
     "A-ReversiblePwd":        ("Accounts with reversible password encryption","Anomaly",15,"HIGH"),
     "A-LMHashAuthorized":     ("LM hash storage not disabled","Anomaly",25,"CRITICAL"),
-    "A-AeA":                  ("AES encryption not required for Kerberos","Anomaly",5,"LOW"),
+    "A-AeA":                  ("AES encryption not required for Kerberos","Anomaly",5,"INFO"),
     "A-DsHeuristicsAnonymous":("Anonymous LDAP operations allowed","Anomaly",25,"HIGH"),
     "A-DsHeuristicsLDAPSecurity":("LDAP security heuristics weakened","Anomaly",10,"MEDIUM"),
     "A-DsHeuristicsAllowAnonNSPI":("Anonymous NSPI access allowed","Anomaly",10,"MEDIUM"),
@@ -157,8 +157,8 @@ RULES: Dict[str, Tuple[str, str, int, str]] = {
     "A-ProtectedUsers":       ("Protected Users group not used for privileged accounts","Anomaly",10,"MEDIUM"),
     "A-PwdGPO":               ("Weak password policy enforced via GPO","Anomaly",10,"MEDIUM"),
     "A-PwdComplexity":        ("Password complexity not required","Anomaly",10,"MEDIUM"),
-    "A-PwdHistory":           ("Password history length below recommended","Anomaly",5,"LOW"),
-    "A-PwdMaxAge":            ("Password maximum age not enforced","Anomaly",5,"LOW"),
+    "A-PwdHistory":           ("Password history length below recommended","Anomaly",5,"INFO"),
+    "A-PwdMaxAge":            ("Password maximum age not enforced","Anomaly",5,"INFO"),
     "A-NoGPOLLMNR":           ("LLMNR not disabled via GPO","Anomaly",10,"MEDIUM"),
     "A-NoNetSessionHardening":("NetSessionEnum hardening not enabled","Anomaly",15,"HIGH"),
     "A-DC-Spooler":           ("Print Spooler service enabled on DC","Anomaly",25,"HIGH"),
@@ -256,7 +256,7 @@ RULES: Dict[str, Tuple[str, str, int, str]] = {
     "S-NoPreAuth":            ("User accounts without Kerberos pre-auth","Stale",15,"HIGH"),
     "S-NoPreAuthAdmin":       ("Admin accounts without Kerberos pre-auth","Stale",25,"CRITICAL"),
     "S-SIDHistory":           ("Accounts with SID history set","Stale",10,"MEDIUM"),
-    "S-PwdLastSet-45":        ("Enabled accounts with password >45 days old","Stale",5,"LOW"),
+    "S-PwdLastSet-45":        ("Enabled accounts with password >45 days old","Stale",5,"INFO"),
     "S-PwdLastSet-90":        ("Enabled accounts with password >90 days old","Stale",5,"LOW"),
     "S-PwdLastSet-DC":        ("DC computer account password >45 days old","Stale",25,"HIGH"),
     "S-PwdLastSet-Cluster":   ("Cluster account password >45 days old","Stale",5,"LOW"),
@@ -270,7 +270,7 @@ RULES: Dict[str, Tuple[str, str, int, str]] = {
     "S-SMB-v1":               ("SMBv1 enabled on domain controller","Stale",25,"HIGH"),
     "S-Duplicate":            ("Duplicate (CNF:) accounts detected","Stale",5,"LOW"),
     "S-Domain$$$":            ("Orphaned Domain$$$ accounts present","Stale",5,"LOW"),
-    "S-AesNotEnabled":        ("Accounts without AES encryption types","Stale",5,"LOW"),
+    "S-AesNotEnabled":        ("Accounts without AES encryption types","Stale",5,"INFO"),
     "S-PrimaryGroup":         ("Users with non-default primary group","Stale",5,"LOW"),
     "S-C-PrimaryGroup":       ("Computers with non-default primary group","Stale",5,"LOW"),
     "S-C-Reversible":         ("Computer accounts with reversible encryption","Stale",10,"MEDIUM"),
@@ -2235,7 +2235,8 @@ class ADData:
             members = self.conn.paged_search(self.base,
                 f"(memberOf:1.2.840.113556.1.4.1941:={gdn})",
                 ["sAMAccountName","distinguishedName","userAccountControl",
-                 "pwdLastSet","lastLogonTimestamp","servicePrincipalName"])
+                 "pwdLastSet","lastLogonTimestamp","servicePrincipalName",
+                 "adminCount","msDS-SupportedEncryptionTypes","mail","whenCreated"])
             seen = {m["dn"] for m in members}
             # add accounts whose PRIMARY group RID matches this group
             grp_rid = None
@@ -5257,7 +5258,6 @@ HYGIENE_WEIGHTS = {
     "S-SIDHistory":("flat",4), "A-RestrictRemoteSAM":("flat",3), "P-MachineAccountQuota":("flat",5),
 }
 
-GRADE_COLOUR = {"A":"#5f8a3a","B":"#74934a","C":"#cda52b","D":"#cb7a2f","F":"#bd4234"}
 
 
 class RiskScorer:
@@ -5311,28 +5311,22 @@ class RiskScorer:
         return min(f.maturity for f in self.findings)
 
     @staticmethod
-    def grade(exposure: int, hygiene: int) -> str:
-        """A-F posture grade — exposure dominates (it's the attacker's reality),
-        hygiene nudges the borderline cases."""
-        if exposure >= 85:           return "F"
-        if exposure >= 60:           return "D"
-        if exposure >= 35:           return "C" if hygiene < 70 else "D"
-        if exposure >= 15:           return "C" if hygiene >= 50 else "B"
-        if hygiene >= 65:            return "C"
-        if hygiene >= 35:            return "B"
-        return "A"
-
-    GRADE_LABEL = {"A":"Hardened","B":"Defensible","C":"Exposed","D":"At risk","F":"Compromisable"}
+    def verdict(exposure: int) -> Tuple[str, str]:
+        """Plain-English read on the easiest path to Tier-0 (word, colour)."""
+        if exposure >= 85: return "Domain compromisable", "#bd4234"
+        if exposure >= 60: return "Tier-0 reachable",     "#cb7a2f"
+        if exposure >= 35: return "Foothold-dependent",   "#cda52b"
+        if exposure >= 15: return "Limited exposure",     "#74934a"
+        return "No direct path", "#5f8a3a"
 
     def score(self) -> Dict[str, Any]:
-        exp = self.exposure(); hyg = self.hygiene(); g = self.grade(exp, hyg)
+        exp = self.exposure(); hyg = self.hygiene()
+        word, _ = self.verdict(exp)
         cat_counts = defaultdict(int)
         for f in self.findings:
             cat_counts[f.category] += 1
         return {
-            "exposure": exp, "hygiene": hyg, "grade": g,
-            "grade_label": self.GRADE_LABEL.get(g, ""),
-            "maturity": self.maturity(),
+            "exposure": exp, "hygiene": hyg, "verdict": word,
             "cat_counts": {c: cat_counts.get(c, 0) for c in ("Anomaly","Privileged","Stale","Trust")},
         }
 
@@ -5459,10 +5453,12 @@ html[data-theme=light] .kc-nav{background:rgba(222,218,198,.96)}
 
 /* ── summary: scoreband + dossier + narrative ── */
 .kc-scoreband{display:flex;gap:16px;flex-wrap:wrap;align-items:stretch;margin-bottom:18px}
-.kc-grade{flex:0 0 auto;display:flex;flex-direction:column;align-items:center;justify-content:center;
-  width:150px;border-radius:var(--r);color:#15170f;padding:14px}
-.kc-grade .g{font-size:64px;font-weight:800;line-height:1}
-.kc-grade .gl{font-family:var(--mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase;margin-top:2px;font-weight:700}
+.kc-verdict{flex:0 0 auto;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  width:190px;border-radius:var(--r);background:var(--surface2);border:1px solid var(--border);
+  border-top:3px solid;padding:14px 12px;text-align:center}
+.kc-verdict .ev{font-size:56px;font-weight:800;line-height:1}
+.kc-verdict .evl{font-family:var(--mono);font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint)}
+.kc-verdict .evw{font-size:14px;font-weight:700;margin-top:6px;line-height:1.2}
 .kc-meters{flex:1;min-width:300px;display:flex;flex-direction:column;justify-content:center;gap:14px;
   background:var(--surface2);border:1px solid var(--border);border-radius:var(--r);padding:16px 18px}
 .kc-meter-h{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:5px}
@@ -5629,6 +5625,34 @@ html[data-theme=light] .kc-cmd li code{background:#21250e;color:#e2e6cb}
 .kc-top{position:fixed;right:22px;bottom:22px;width:42px;height:42px;border-radius:50%;background:var(--accent);
   color:#15170f;border:none;font-size:20px;cursor:pointer;box-shadow:var(--shadow);z-index:40}
 
+/* clickable category cards */
+.kc-cat-card.kc-clickable{cursor:pointer;transition:border-color .12s,transform .08s}
+.kc-cat-card.kc-clickable:hover{border-color:var(--accent);transform:translateY(-1px)}
+.kc-invcols{display:grid;grid-template-columns:1fr 1fr;gap:22px;margin-top:8px}
+@media(max-width:900px){.kc-invcols{grid-template-columns:1fr}}
+
+/* privileged-accounts explorer */
+.kc-pg{border:1px solid var(--border);border-radius:var(--r-sm);margin-bottom:8px;overflow:hidden}
+.kc-pg-h{display:flex;align-items:center;gap:8px;padding:10px 14px;background:var(--surface2);cursor:pointer}
+.kc-pg-h:hover{background:var(--surface3)}
+.kc-pg-ar{color:var(--accent);font-size:12px;width:12px}
+.kc-pg-n{margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--muted)}
+.kc-pg-b{padding:0 4px 4px}
+.kc-aflag{display:inline-block;font-family:var(--mono);font-size:9.5px;padding:1px 5px;border-radius:3px;
+  border:1px solid var(--border2);color:var(--muted);margin:1px}
+.kc-aflag.bad{color:var(--bad);border-color:rgba(189,66,52,.5)}
+.kc-aflag.warn{color:var(--warn);border-color:rgba(205,165,43,.5)}
+.kc-aflag.ok{color:var(--ok);border-color:rgba(130,161,85,.4)}
+.kc-aflag.dis{color:var(--faint)}
+tr.kc-notable td{background:rgba(189,66,52,.06)}
+
+/* terminal-style evidence */
+.kc-term{background:#0d0e08;border:1px solid var(--border2);border-radius:var(--r-sm);color:#cfe0a8;
+  font-family:var(--mono);font-size:11.5px;line-height:1.5;padding:10px 12px;white-space:pre-wrap;
+  word-break:break-word;max-height:340px;overflow:auto}
+html[data-theme=light] .kc-term{background:#21250e;color:#dfe6c4}
+.kc-term .t-ok{color:var(--accent)}
+
 @media print{
   @page{size:A4;margin:13mm}
   html[data-theme]{--bg:#fff;--surface:#fff;--surface2:#f5f3ea;--surface3:#edebde;--border:#bbb;--border2:#999;
@@ -5673,6 +5697,11 @@ function kcJump(id){var el=document.getElementById(id);if(!el)return;
 function kcCopy(btn){var code=btn.parentNode.querySelector('code');if(!code)return;
   navigator.clipboard&&navigator.clipboard.writeText(code.textContent);
   var o=btn.textContent;btn.textContent='copied';setTimeout(function(){btn.textContent=o},1200);}
+function kcRowTog(id){var b=document.getElementById(id),ar=document.getElementById('ar-'+id);if(!b)return;
+  var open=b.style.display!=='none';b.style.display=open?'none':'block';if(ar)ar.textContent=open?'▸':'▾';}
+function kcCatJump(cat){document.querySelectorAll('.kc-fp-cat').forEach(function(b){
+    if(b.getAttribute('data-f')==='cat:'+cat){if(!b.classList.contains('on'))b.click();}});
+  var s=document.getElementById('sec-findings');if(s)s.scrollIntoView({behavior:'smooth',block:'start'});}
 document.addEventListener('DOMContentLoaded',function(){kcApply();
   var secs=[].slice.call(document.querySelectorAll('section[id]'));
   var links={};document.querySelectorAll('.kc-nav-links a').forEach(function(a){links[a.getAttribute('href').slice(1)]=a;});
@@ -5720,13 +5749,6 @@ class HTMLReporter:
             c[f.severity] += 1
         return c
 
-    def _cat_counts(self):
-        c = defaultdict(int)
-        for f in self.findings:
-            c[f.category] += 1
-        return c
-
-    # ── inline SVG donut (literal font family — SVG ignores CSS vars) ─────────
     def _donut(self):
         counts = self._sev_counts()
         order = ["CRITICAL","HIGH","MEDIUM","LOW","INFO"]
@@ -5762,9 +5784,8 @@ class HTMLReporter:
             '</header>')
 
     def _nav(self):
-        items = [("summary","Summary",""),("paths","Domain Dominance",""),
-                 ("roadmap","Action Plan",""),("attack","ATT&CK",""),
-                 ("findings","Findings",str(len(self.findings))),("inventory","Inventory","")]
+        items = [("summary","Summary",""),("paths","Attack Paths",""),
+                 ("priv","Privileged",""),("findings","Findings",str(len(self.findings)))]
         links = ""
         for sid, name, badge in items:
             b = f'<span class="kc-navb">{badge}</span>' if badge else ""
@@ -5833,14 +5854,15 @@ class HTMLReporter:
 
     def _scoreband(self):
         s = self.scores
-        g = s.get("grade","?"); gcol = GRADE_COLOUR.get(g,"#888")
-        glabel = s.get("grade_label","")
         exp = s.get("exposure",0); hyg = s.get("hygiene",0)
+        word, vcol = RiskScorer.verdict(exp)
         return ('<div class="kc-scoreband">'
-                f'<div class="kc-grade" style="background:{gcol}"><div class="g">{self._e(g)}</div>'
-                f'<div class="gl">{self._e(glabel)}</div></div>'
+                f'<div class="kc-verdict" style="border-color:{vcol}">'
+                f'<div class="ev" style="color:{vcol}">{exp}</div>'
+                f'<div class="evl">Exposure</div>'
+                f'<div class="evw" style="color:{vcol}">{self._e(word)}</div></div>'
                 '<div class="kc-meters">'
-                f'{self._meter("Exposure", exp, "ease of reaching Tier 0")}'
+                f'{self._meter("Exposure", exp, "easiest path to Tier 0")}'
                 f'{self._meter("Hygiene debt", hyg, "misconfiguration & stale-object load")}'
                 '</div>'
                 '<div class="kc-readout">'
@@ -5849,8 +5871,8 @@ class HTMLReporter:
 
     def _narrative(self):
         s = self.scores
-        g = s.get("grade","?"); glabel = s.get("grade_label","")
         exp = s.get("exposure",0); hyg = s.get("hygiene",0)
+        word, vcol = RiskScorer.verdict(exp)
         sc = self._sev_counts(); crit, high = sc.get("CRITICAL",0), sc.get("HIGH",0)
         if exp >= 85:    estate = "an attacker on the internal network can reach Domain Admin in a single, low-skill step"
         elif exp >= 60:  estate = "a clear, reliable path to Domain Admin exists"
@@ -5858,19 +5880,18 @@ class HTMLReporter:
         elif exp >= 15:  estate = "no direct path was found, but exploitable footholds exist"
         else:            estate = "no practical path to Tier-0 was identified from the collected data"
         parts = [
-            f"<strong>{self._e(self.domain)}</strong> grades <strong style=\"color:{GRADE_COLOUR.get(g,'#888')}\">"
-            f"{self._e(g)} ({self._e(glabel)})</strong>. Exposure is <strong>{exp}/100</strong> — {estate} — "
-            f"and hygiene debt is <strong>{hyg}/100</strong>, across <strong>{len(self.findings)}</strong> "
-            f"findings ({crit} critical, {high} high).",
+            f"Exposure is <strong style=\"color:{vcol}\">{exp}/100 — {self._e(word)}</strong>: {estate}. "
+            f"Hygiene debt is <strong>{hyg}/100</strong>, across <strong>{len(self.findings)}</strong> "
+            f"findings ({crit} critical, {high} high) on <strong>{self._e(self.domain)}</strong>.",
         ]
         marquee = [t for r, t in self._MARQUEE.items() if r in self.by_rule]
         if marquee:
             sm = marquee[:4]
             parts.append("Immediate exploitation is available via " +
                          (", ".join(sm[:-1]) + " and " + sm[-1] if len(sm) > 1 else sm[0]) +
-                         " — see Domain Dominance below for the routes to Tier 0.")
+                         " — see Attack Paths for the routes to Tier 0.")
         else:
-            parts.append("No single-step takeover primitives were found; work the action plan to keep it that way.")
+            parts.append("No single-step takeover primitives were found from the collected data.")
         return "".join(f"<p>{p}</p>" for p in parts)
 
     def _key_risks(self):
@@ -5911,22 +5932,26 @@ class HTMLReporter:
             bd = sev_by_cat[cat]
             chips = "".join(
                 f'<span style="color:{SEV_COLOUR[s]};font-family:var(--mono);font-size:10.5px;margin-right:8px">{bd[s]} {s[:4].lower()}</span>'
-                for s in ("CRITICAL","HIGH","MEDIUM","LOW") if bd.get(s))
-            cards += (f'<div class="kc-cat-card" style="border-top-color:{ccol}">'
-                      f'<div class="kc-cat-label">{cat}</div>'
+                for s in ("CRITICAL","HIGH","MEDIUM","LOW","INFO") if bd.get(s))
+            cards += (f'<div class="kc-cat-card kc-clickable" style="border-top-color:{ccol}" '
+                      f'onclick="kcCatJump(\'{self._e(cat)}\')" title="Filter the Findings table to {self._e(cat)}">'
                       f'<div class="kc-cat-score" style="color:{ccol}">{n}</div>'
+                      f'<div class="kc-cat-label">{self._e(cat)}</div>'
                       f'<div class="kc-cat-count">{chips or "clean"}</div></div>')
-        return f'<div class="kc-catstrip">{cards}</div>'
+        return ('<div class="kc-sub-h">Findings by operation <span style="font-weight:400;'
+                'text-transform:none;letter-spacing:0;color:var(--faint)">— count per area; click to filter</span></div>'
+                f'<div class="kc-catstrip">{cards}</div>')
 
     def _summary_section(self):
         return ('<section class="kc-section" id="sec-summary"><h2 class="kc-h2">Summary'
-                '<span class="tag">grade = exposure (easiest Tier-0 path) + hygiene debt</span></h2>'
+                '<span class="tag">exposure = easiest path to Tier 0 · hygiene = misconfig load</span></h2>'
                 f'{self._scoreband()}'
                 '<div class="kc-summary2">'
                 f'{self._dossier()}'
                 f'<div><div class="kc-narrative">{self._narrative()}</div>{self._key_risks()}</div>'
                 '</div>'
-                f'{self._category_strip()}</section>')
+                f'{self._category_strip()}'
+                f'{self._inventory_block()}</section>')
 
     # ── Paths to Domain Dominance (control-path chains) ───────────────────────
     def _node(self, label, kind="", icon=""):
@@ -5948,132 +5973,99 @@ class HTMLReporter:
         return f'<div class="kc-chain {scls}"><div class="kc-chain-row">{row}</div>{meta}</div>'
 
     def _build_paths(self):
-        """Synthesise attacker -> … -> Tier 0 chains from the findings + ACL data."""
-        chains = []  # (severity, html)
+        """Synthesise attacker -> … -> Tier 0 chains from the findings + ACL data.
+        Returns list of (severity, html, rule_id)."""
+        chains = []
         DA = self._node("Domain Admin", "crown", "♛")
         DOM = self._node("Domain compromise", "crown", "♛")
         any_user = self._node("Any domain user", "attacker", "☣")
         unauth = self._node("Unauthenticated", "attacker", "☣")
+        add = lambda sev, nodes, tool, rid: chains.append((sev, self._chain(nodes, sev, tool), rid))
 
-        # ACL-derived control edges (DCSync / dangerous ACL / GPO / priv-group write)
         for a in self.data.acl_findings:
             t = a.get("type",""); who = a.get("sid_name") or a.get("sid") or "principal"
             right = a.get("right",""); obj = a.get("object","")
             n_who = self._node(who, "attacker", "☣")
             if t == "dcsync":
-                chains.append(("CRITICAL", self._chain(
-                    [n_who, "DS-Repl", self._node("NTDS secrets","crown","🔑"), "dump", DOM],
-                    "CRITICAL", "secretsdump.py -just-dc")))
+                add("CRITICAL", [n_who, "DS-Repl", self._node("NTDS secrets","crown","🔑"), "dump", DOM], "secretsdump.py -just-dc", "P-DCSync")
             elif t in ("dangerous_acl","owner"):
-                chains.append(("CRITICAL", self._chain(
-                    [n_who, right or "WriteDACL", self._node(obj or "Domain root"), "grant DCSync", DOM],
-                    "CRITICAL", "dacledit / secretsdump")))
+                add("CRITICAL", [n_who, right or "WriteDACL", self._node(obj or "Domain root"), "grant DCSync", DOM], "dacledit / secretsdump", "P-DangerousACLDomain")
             elif t == "gpo_write":
-                chains.append(("CRITICAL", self._chain(
-                    [n_who, "edit GPO", self._node(obj or "GPO"), "applies to", self._node("Computers / DCs"), "SYSTEM", DOM],
-                    "CRITICAL", "pyGPOAbuse")))
+                add("CRITICAL", [n_who, "edit GPO", self._node(obj or "GPO"), "applies to", self._node("Computers / DCs"), "SYSTEM", DOM], "pyGPOAbuse", "P-ModifiableGPO")
             elif t == "write_property":
-                chains.append(("HIGH", self._chain(
-                    [n_who, right or "Write", self._node(obj or "privileged object"), "add member", DA],
-                    "HIGH", "")))
+                add("HIGH", [n_who, right or "Write", self._node(obj or "privileged object"), "add member", DA], "", "P-WriteToPrivGroup")
 
         def has(rid): return rid in self.by_rule
         def aff(rid, n=1):
             f = self.by_rule.get(rid)
             return (f.affected[:n] if f and f.affected else [])
 
-        if has("P-DCSync") and not any(c for s,c in chains if "NTDS" in c):
+        if has("P-DCSync") and not any(r == "P-DCSync" for _,_,r in chains):
             who = (aff("P-DCSync") or ["non-admin principal"])[0]
-            chains.append(("CRITICAL", self._chain(
-                [self._node(who.split()[0],"attacker","☣"), "DCSync", self._node("NTDS secrets","crown","🔑"), "dump", DOM],
-                "CRITICAL", "secretsdump.py -just-dc")))
+            add("CRITICAL", [self._node(who.split()[0],"attacker","☣"), "DCSync", self._node("NTDS secrets","crown","🔑"), "dump", DOM], "secretsdump.py -just-dc", "P-DCSync")
         if has("P-GPPPassword"):
-            chains.append(("CRITICAL", self._chain(
-                [any_user, "read SYSVOL", self._node("GPP cpassword","crown","🔑"), "AES-decrypt", self._node("Local admin creds")],
-                "CRITICAL", "gpp-decrypt")))
+            add("CRITICAL", [any_user, "read SYSVOL", self._node("GPP cpassword","crown","🔑"), "AES-decrypt", self._node("Local admin creds")], "gpp-decrypt", "P-GPPPassword")
         if has("A-CertTempCustomSubject"):
             tmpl = (aff("A-CertTempCustomSubject") or ["vuln template"])[0]
-            chains.append(("CRITICAL", self._chain(
-                [any_user, "ESC1 enrol", self._node(tmpl), "SAN=DA", self._node("DA certificate","crown","📜"), "PKINIT", DA],
-                "CRITICAL", "certipy req -upn administrator@…")))
+            add("CRITICAL", [any_user, "ESC1 enrol", self._node(tmpl), "SAN=DA", self._node("DA certificate","crown","📜"), "PKINIT", DA], "certipy req -upn administrator@…", "A-CertTempCustomSubject")
         if has("A-CertTemplateESC4"):
             tmpl = (aff("A-CertTemplateESC4") or ["template"])[0].split()[0]
-            chains.append(("CRITICAL", self._chain(
-                [any_user, "ESC4 WriteDACL", self._node(tmpl), "make ESC1", self._node("DA certificate","crown","📜"), "PKINIT", DA],
-                "CRITICAL", "certipy template")))
+            add("CRITICAL", [any_user, "ESC4 WriteDACL", self._node(tmpl), "make ESC1", self._node("DA certificate","crown","📜"), "PKINIT", DA], "certipy template", "A-CertTemplateESC4")
         if has("A-CertEnrollHttp"):
-            chains.append(("CRITICAL", self._chain(
-                [self._node("Coerced DC$","attacker","☣"), "NTLM relay", self._node("ADCS web enrol (ESC8)"), "issue", self._node("DC certificate","crown","📜"), "DCSync", DOM],
-                "CRITICAL", "PetitPotam + ntlmrelayx")))
+            add("CRITICAL", [self._node("Coerced DC$","attacker","☣"), "NTLM relay", self._node("ADCS web enrol (ESC8)"), "issue", self._node("DC certificate","crown","📜"), "DCSync", DOM], "PetitPotam + ntlmrelayx", "A-CertEnrollHttp")
         if has("P-ServiceDomainAdmin") or has("S-KerberoastableAdmin"):
             svc = (aff("S-KerberoastableAdmin") or aff("P-ServiceDomainAdmin") or ["svc_admin"])[0].split()[0]
-            chains.append(("CRITICAL", self._chain(
-                [any_user, "Kerberoast", self._node(svc), "crack RC4", self._node("svc password","crown","🔑"), "member of", DA],
-                "CRITICAL", "GetUserSPNs.py -request → hashcat -m 13100")))
+            add("CRITICAL", [any_user, "Kerberoast", self._node(svc), "crack RC4", self._node("svc password","crown","🔑"), "member of", DA], "GetUserSPNs.py -request → hashcat -m 13100", "S-KerberoastableAdmin")
         if has("P-ComputerInPrivGroup"):
             m = (aff("P-ComputerInPrivGroup") or ["WS$"])[0].split()[0]
-            chains.append(("CRITICAL", self._chain(
-                [self._node("SYSTEM on "+m,"attacker","☣"), "machine secret", self._node(m), "member of", DA],
-                "CRITICAL", "")))
+            add("CRITICAL", [self._node("SYSTEM on "+m,"attacker","☣"), "machine secret", self._node(m), "member of", DA], "", "P-ComputerInPrivGroup")
         if has("S-SIDHistoryPrivileged"):
             who = (aff("S-SIDHistoryPrivileged") or ["account"])[0].split()[0]
-            chains.append(("CRITICAL", self._chain(
-                [self._node(who,"attacker","☣"), "SID history", self._node("privileged SID","crown","🔑"), "honoured at logon", DA],
-                "CRITICAL", "")))
+            add("CRITICAL", [self._node(who,"attacker","☣"), "SID history", self._node("privileged SID","crown","🔑"), "honoured at logon", DA], "", "S-SIDHistoryPrivileged")
         if has("P-RBCD-Dangerous"):
-            chains.append(("CRITICAL", self._chain(
-                [self._node("controlled principal","attacker","☣"), "RBCD", self._node("Domain controller","crown","♛"), "S4U impersonate", DA],
-                "CRITICAL", "rbcd.py + getST.py")))
+            add("CRITICAL", [self._node("controlled principal","attacker","☣"), "RBCD", self._node("Domain controller","crown","♛"), "S4U impersonate", DA], "rbcd.py + getST.py", "P-RBCD-Dangerous")
         elif has("P-RBCD"):
             tgt = (aff("P-RBCD") or ["host"])[0]
-            chains.append(("HIGH", self._chain(
-                [self._node("controlled / new machine","attacker","☣"), "RBCD", self._node(tgt), "S4U impersonate", self._node("any user on host")],
-                "HIGH", "rbcd.py")))
+            add("HIGH", [self._node("controlled / new machine","attacker","☣"), "RBCD", self._node(tgt), "S4U impersonate", self._node("any user on host")], "rbcd.py", "P-RBCD")
         if has("P-UnconstrainedDelegation"):
             h = (aff("P-UnconstrainedDelegation") or ["host"])[0]
-            chains.append(("CRITICAL", self._chain(
-                [self._node("Coerced DC$","attacker","☣"), "auth to", self._node(h+" (unconstrained)"), "capture TGT", DA],
-                "CRITICAL", "printerbug.py + krbrelayx")))
+            add("CRITICAL", [self._node("Coerced DC$","attacker","☣"), "auth to", self._node(h+" (unconstrained)"), "capture TGT", DA], "printerbug.py + krbrelayx", "P-UnconstrainedDelegation")
         if has("P-MachineAccountQuota") and (has("P-RBCD") or not chains):
-            chains.append(("HIGH", self._chain(
-                [any_user, "MAQ>0: add machine", self._node("attacker computer"), "RBCD/shadow-cred", self._node("target host")],
-                "HIGH", "addcomputer.py")))
+            add("HIGH", [any_user, "MAQ>0: add machine", self._node("attacker computer"), "RBCD/shadow-cred", self._node("target host")], "addcomputer.py", "P-MachineAccountQuota")
         if has("A-DnsZoneAUCreateChild"):
-            chains.append(("HIGH", self._chain(
-                [any_user, "ADIDNS write", self._node("wpad / * record"), "coerce + relay", self._node("victim creds")],
-                "HIGH", "dnstool.py + Responder")))
+            add("HIGH", [any_user, "ADIDNS write", self._node("wpad / * record"), "coerce + relay", self._node("victim creds")], "dnstool.py + Responder", "A-DnsZoneAUCreateChild")
         if has("S-NoPreAuthAdmin") or has("S-NoPreAuth"):
             who = (aff("S-NoPreAuthAdmin") or aff("S-NoPreAuth") or ["account"])[0].split()[0]
             sev = "CRITICAL" if has("S-NoPreAuthAdmin") else "HIGH"
-            chains.append((sev, self._chain(
-                [unauth, "AS-REP roast", self._node(who), "crack", self._node("password","crown","🔑")],
-                sev, "GetNPUsers.py → hashcat -m 18200")))
+            add(sev, [unauth, "AS-REP roast", self._node(who), "crack", self._node("password","crown","🔑")], "GetNPUsers.py → hashcat -m 18200", "S-NoPreAuthAdmin" if has("S-NoPreAuthAdmin") else "S-NoPreAuth")
         if has("A-Pre2kComputer"):
             m = (aff("A-Pre2kComputer") or ["HOST$"])[0].split()[0]
-            chains.append(("HIGH", self._chain(
-                [unauth, "default pwd", self._node(m), "auth as computer", self._node("foothold + TGT","crown","🔑")],
-                "HIGH", "pre2k auth / getTGT.py")))
+            add("HIGH", [unauth, "default pwd", self._node(m), "auth as computer", self._node("foothold + TGT","crown","🔑")], "pre2k auth / getTGT.py", "A-Pre2kComputer")
         if has("A-WeakLockout"):
-            chains.append(("HIGH", self._chain(
-                [unauth, "password spray", self._node("no-lockout policy"), "valid creds", self._node("domain foothold","crown","🔑")],
-                "HIGH", "nxc smb --continue-on-success / kerbrute")))
+            add("HIGH", [unauth, "password spray", self._node("no-lockout policy"), "valid creds", self._node("domain foothold","crown","🔑")], "nxc smb --continue-on-success / kerbrute", "A-WeakLockout")
         if has("A-SCCM"):
             h = (aff("A-SCCM") or ["SCCM site server"])[0].split()[0]
-            chains.append(("HIGH", self._chain(
-                [self._node("Coerced/relayed auth","attacker","☣"), "NTLM relay", self._node(h+" (MP/site)"), "NAA / site DB", self._node("privileged creds","crown","🔑")],
-                "HIGH", "SharpSCCM / sccmhunter / ntlmrelayx")))
+            add("HIGH", [self._node("Coerced/relayed auth","attacker","☣"), "NTLM relay", self._node(h+" (MP/site)"), "NAA / site DB", self._node("privileged creds","crown","🔑")], "SharpSCCM / sccmhunter / ntlmrelayx", "A-SCCM")
         return chains
+
+    def _inline_path(self, rule_id):
+        """The attack-path chain HTML for a given rule, for inline use in panels."""
+        if getattr(self, "_paths_cache", None) is None:
+            self._paths_cache = self._build_paths()
+        for _, html, rid in self._paths_cache:
+            if rid == rule_id:
+                return html
+        return ""
 
     def _paths_section(self):
         chains = self._build_paths()
         if not chains:
-            return ('<section class="kc-section" id="sec-paths"><h2 class="kc-h2">Paths to domain dominance</h2>'
-                    '<p class="kc-sub">No single-/few-step escalation path to Tier 0 was identified from the '
-                    'collected data. Re-check after authenticated ACL collection, and review the action plan.</p></section>')
+            return ('<section class="kc-section" id="sec-paths"><h2 class="kc-h2">Attack paths</h2>'
+                    '<p class="kc-sub">No short path to Tier 0 surfaced from the collected data.</p></section>')
         order = {"CRITICAL":0,"HIGH":1,"MEDIUM":2}
         chains.sort(key=lambda c: order.get(c[0], 3))
-        ncrit = sum(1 for s,_ in chains if s == "CRITICAL")
-        body = "".join(c for _, c in chains)
+        ncrit = sum(1 for s,_,_ in chains if s == "CRITICAL")
+        body = "".join(h for _, h, _ in chains)
         # exposure stats
         dc_n = len(self.data.dcs)
         unconstrained = len(self.by_rule.get("P-UnconstrainedDelegation").affected) if "P-UnconstrainedDelegation" in self.by_rule else 0
@@ -6086,184 +6078,163 @@ class HTMLReporter:
                  f'<div class="kc-pstat"><b>{unconstrained}</b><span>unconstrained hosts</span></div>'
                  f'</div>')
         return ('<section class="kc-section kc-critborder" id="sec-paths">'
-                '<h2 class="kc-h2">Paths to domain dominance'
-                '<span class="tag">attacker → control → Tier 0</span></h2>'
-                '<p class="kc-sub">Concrete routes from a low-privileged (or unauthenticated) starting point to '
-                'domain compromise, derived from the collected ACLs, delegations, certificate templates and account '
-                'misconfigurations. Each row is a chain of control edges with the tradecraft to walk it.</p>'
+                '<h2 class="kc-h2">Attack paths<span class="tag">low-priv → Tier 0</span></h2>'
+                '<p class="kc-sub">Routes to domain compromise, with the tradecraft to walk each.</p>'
                 f'{stats}{body}</section>')
 
     # ── action plan ────────────────────────────────────────────────────────────
-    def _roadmap_section(self):
-        agg = {}
-        for f in self.findings:
-            a = agg.setdefault(f.rule_id, {"f":f,"pts":0,"aff":0})
-            a["pts"] += f.points; a["aff"] += len(f.affected)
-        rows = [{"rid":r,"f":a["f"],"pts":min(a["pts"],100),"aff":a["aff"],
-                 "effort":RULE_EFFORT.get(r,"Medium")} for r, a in agg.items()]
-        rows.sort(key=lambda r:(-r["pts"], self._SEV_ORDER.get(r["f"].severity,9)))
-        tiers = {"Low":("Quick wins","Low-effort GPO / setting changes with high payback"),
-                 "Medium":("Strategic","Account, ACL and delegation hardening"),
-                 "High":("Programme","Architecture, rollout and lifecycle work")}
-        out = ""
-        for tier in ("Low","Medium","High"):
-            tr = [r for r in rows if r["effort"] == tier]
-            if not tr:
-                continue
-            body = ""
-            for r in tr[:16]:
-                f = r["f"]; fix = (self._doc(r["rid"]).get("remediation") or [f.details or "See finding detail."])[0]
-                body += (f'<tr onclick="kcJump(\'f-{self._e(r["rid"])}\')">'
-                         f'<td><span class="kc-sev-pill" style="background:{f.sev_colour}">{self._e(f.severity)}</span></td>'
-                         f'<td><strong>{self._e(f.title)}</strong><div class="kc-rm-fix">{self._e(fix)}</div></td>'
-                         f'<td class="kc-num">{r["pts"]}</td><td class="kc-num">{r["aff"] or "—"}</td></tr>')
-            title, desc = tiers[tier]
-            out += (f'<h3 class="kc-rm-tier">{title} <span class="kc-rm-desc">— {desc}</span></h3>'
-                    '<table class="kc-table kc-rm-table"><thead><tr><th style="width:90px">Severity</th><th>Action</th>'
-                    '<th style="width:80px" class="kc-num">Risk&nbsp;↓</th><th style="width:74px" class="kc-num">Objects</th></tr></thead>'
-                    f'<tbody>{body}</tbody></table>')
-        if not out:
-            return ""
-        return ('<section class="kc-section" id="sec-roadmap"><h2 class="kc-h2">Prioritized action plan</h2>'
-                '<p class="kc-sub">Grouped by effort, ranked by risk reduction. “Risk ↓” is the danger-point '
-                'contribution recovered by fixing the item. Click a row to jump to the finding.</p>'
-                f'{out}</section>')
+    _PRIV_ORDER = ["Domain Admins","Enterprise Admins","Schema Admins","Administrators",
+                   "Account Operators","Backup Operators","Server Operators","Print Operators",
+                   "Group Policy Creator Owners","DnsAdmins","Key Admins","Enterprise Key Admins",
+                   "Cert Publishers","Exchange Windows Permissions"]
 
-    # ── ATT&CK coverage ───────────────────────────────────────────────────────
-    def _attack_section(self):
-        tech = {}
-        for f in self.findings:
-            for m in f.mitre:
-                tid = m.split(":")[0].strip()
-                name = m.split(":",1)[1].strip() if ":" in m else tid
-                base = tid.split(".")[0]
-                t = tech.setdefault(tid, {"name":name,"count":0,"tactic":ATTACK_TACTIC.get(base,"Other"),"rules":set()})
-                t["count"] += 1; t["rules"].add(f.rule_id)
-        if not tech:
-            return ""
-        by_t = defaultdict(list)
-        for tid, info in tech.items():
-            by_t[info["tactic"]].append((tid, info))
-        tactics = [t for t in ATTACK_TACTIC_ORDER if t in by_t] + [t for t in by_t if t not in ATTACK_TACTIC_ORDER]
-        cols = ""
-        for tac in tactics:
-            chips = ""
-            for tid, info in sorted(by_t[tac], key=lambda x:-x[1]["count"]):
-                chips += (f'<div class="kc-tech" title="{self._e(", ".join(sorted(info["rules"])))}">'
-                          f'<span class="kc-tech-id">{self._e(tid)}</span>'
-                          f'<span class="kc-tech-n">{self._e(info["name"])}</span>'
-                          f'<span class="kc-tech-c">{info["count"]}</span></div>')
-            cols += f'<div class="kc-tcol"><div class="kc-tcol-h">{self._e(tac)}</div>{chips}</div>'
-        return ('<section class="kc-section" id="sec-attack"><h2 class="kc-h2">MITRE ATT&amp;CK coverage</h2>'
-                '<p class="kc-sub">Triggered findings mapped to adversary techniques, grouped by tactic. '
-                'Hover a technique for the contributing rules.</p>'
-                f'<div class="kc-attack-grid">{cols}</div></section>')
+    def _acct_flags(self, m):
+        """Return (flags, notable) for a privileged member account."""
+        a = m["attrs"]; uac = get_int(a, "userAccountControl")
+        sam = get_str(a, "sAMAccountName")
+        flags = []; notable = False
+        disabled = uac_has(uac, UAC_ACCOUNTDISABLE)
+        machine = sam.endswith("$") or uac_has(uac, UAC_WORKSTATION_TRUST) or uac_has(uac, UAC_SERVER_TRUST)
+        if disabled:
+            flags.append(('<span class="kc-aflag dis">disabled</span>', "dis"))
+        if machine and not disabled:
+            flags.append(('<span class="kc-aflag bad">machine acct</span>', "bad")); notable = True
+        spn = get_list(a, "servicePrincipalName")
+        if spn and not disabled and not machine:
+            flags.append(('<span class="kc-aflag bad">kerberoastable</span>', "bad")); notable = True
+        if uac_has(uac, UAC_DONT_EXPIRE_PASSWORD) and not disabled:
+            flags.append(('<span class="kc-aflag warn">pwd never expires</span>', "warn")); notable = True
+        if uac_has(uac, UAC_DONT_REQUIRE_PREAUTH) and not disabled:
+            flags.append(('<span class="kc-aflag bad">AS-REP roastable</span>', "bad")); notable = True
+        ll_age = days_since(filetime_to_dt(get_int(a, "lastLogonTimestamp")))
+        if not disabled and ll_age is not None and ll_age > 90:
+            flags.append((f'<span class="kc-aflag warn">stale {ll_age}d</span>', "warn")); notable = True
+        if not disabled and ll_age is None:
+            flags.append(('<span class="kc-aflag warn">never logged on</span>', "warn")); notable = True
+        return flags, notable, disabled
 
-    # ── evidence sections ─────────────────────────────────────────────────────
-    def _gpp_section(self):
+    def _priv_member_row(self, m):
+        a = m["attrs"]; sam = get_str(a, "sAMAccountName") or dn_base(m["dn"])
+        uac = get_int(a, "userAccountControl")
+        disabled = uac_has(uac, UAC_ACCOUNTDISABLE)
+        pw_age = days_since(filetime_to_dt(get_int(a, "pwdLastSet")))
+        ll_age = days_since(filetime_to_dt(get_int(a, "lastLogonTimestamp")))
+        admin = "yes" if get_int(a, "adminCount") == 1 else "—"
+        flags, notable, _ = self._acct_flags(m)
+        st = '<span class="kc-bad">disabled</span>' if disabled else '<span class="kc-ok">enabled</span>'
+        fhtml = " ".join(fl for fl, _ in flags) or '<span class="kc-aflag ok">clean</span>'
+        cls = ' class="kc-notable"' if notable else ''
+        return (f'<tr{cls}><td><strong>{self._e(sam)}</strong></td><td>{st}</td>'
+                f'<td class="kc-num">{admin}</td>'
+                f'<td class="kc-num">{pw_age if pw_age is not None else "—"}</td>'
+                f'<td class="kc-num">{ll_age if ll_age is not None else "—"}</td>'
+                f'<td>{fhtml}</td></tr>')
+
+    def _privileged_section(self):
+        pgm = self.data.priv_group_members
+        groups = [g for g in self._PRIV_ORDER if pgm.get(g)]
+        groups += [g for g in pgm if g not in self._PRIV_ORDER and pgm.get(g)]
+        blocks = ""
+        gi = 0
+        for g in groups:
+            members = pgm[g]
+            # de-dup by dn
+            seen = set(); uniq = []
+            for m in members:
+                if m["dn"] in seen: continue
+                seen.add(m["dn"]); uniq.append(m)
+            notable_n = sum(1 for m in uniq if self._acct_flags(m)[1])
+            rows = "".join(self._priv_member_row(m) for m in
+                           sorted(uniq, key=lambda m: (0 if self._acct_flags(m)[1] else 1,
+                                                       get_str(m["attrs"],"sAMAccountName").lower()))[:80])
+            gid = f"pg-{gi}"; gi += 1
+            warn = f' · <span class="kc-bad">{notable_n} notable</span>' if notable_n else ""
+            blocks += (
+                f'<div class="kc-pg"><div class="kc-pg-h" onclick="kcRowTog(\'{gid}\')">'
+                f'<span class="kc-pg-ar" id="ar-{gid}">▸</span> <strong>{self._e(g)}</strong>'
+                f'<span class="kc-pg-n">{len(uniq)} member(s){warn}</span></div>'
+                f'<div class="kc-pg-b" id="{gid}" style="display:none">'
+                '<table class="kc-table"><thead><tr><th>Account</th><th>Status</th>'
+                '<th class="kc-num">Admin</th><th class="kc-num">Pwd age (d)</th>'
+                '<th class="kc-num">Last logon (d)</th><th>Flags</th></tr></thead>'
+                f'<tbody>{rows}</tbody></table></div></div>')
+        if not blocks:
+            return ""
+        # control-path principals (who holds rights over Tier-0)
+        acl = self.data.acl_findings
+        cp = ""
+        if acl:
+            labels = {"dcsync":"DCSync","dangerous_acl":"Dangerous ACL","owner":"Owner",
+                      "write_property":"WriteProperty","gpo_write":"GPO Write"}
+            rows = "".join(
+                f'<tr><td><strong>{self._e(a.get("sid_name",""))}</strong></td>'
+                f'<td><span class="kc-aflag bad">{labels.get(a.get("type",""),a.get("type",""))}</span></td>'
+                f'<td>{self._e(a.get("right",""))}</td><td>{self._e(a.get("object",""))}</td></tr>'
+                for a in acl)
+            cp = ('<div class="kc-sub-h">Principals with control over Tier-0</div>'
+                  '<p class="kc-sub">Non-Tier-0 principals holding rights that lead to domain takeover '
+                  '(the edges behind the attack paths above).</p>'
+                  '<table class="kc-table"><thead><tr><th>Principal</th><th>Right type</th>'
+                  f'<th>Right</th><th>Over</th></tr></thead><tbody>{rows}</tbody></table>')
+        return ('<section class="kc-section" id="sec-priv"><h2 class="kc-h2">Privileged accounts'
+                '<span class="tag">click a group — notable = stale / kerberoastable / no-expiry</span></h2>'
+                f'{blocks}{cp}</section>')
+
+    # ── findings register ──────────────────────────────────────────────────────
+    def _gpp_table(self):
         pw = self.data.sysvol_data.get("gpp_passwords", [])
         if not pw:
             return ""
         rows = ""
         for p in pw:
             fn = p.get("file",""); base = fn.split("\\")[-1] if "\\" in fn else fn
-            rows += (f'<tr><td>{self._e(p.get("gpo_name",""))}</td><td><code>{self._e(base)}</code></td>'
-                     f'<td><strong>{self._e(p.get("username",""))}</strong></td>'
-                     f'<td><code class="kc-crit-val">{self._e(p.get("plaintext",""))}</code></td></tr>')
-        return ('<section class="kc-section kc-critborder"><h2 class="kc-h2">⚠ GPP passwords recovered (MS14-025)</h2>'
-                '<p class="kc-sub kc-critsub">The AES key is published by Microsoft — treat every account below as '
-                'compromised and reset immediately.</p><table class="kc-table"><thead><tr><th>GPO</th><th>File</th>'
-                f'<th>Username</th><th>Decrypted password</th></tr></thead><tbody>{rows}</tbody></table></section>')
+            rows += (f'<tr><td><strong>{self._e(p.get("username",""))}</strong></td>'
+                     f'<td><code class="kc-crit-val">{self._e(p.get("plaintext",""))}</code></td>'
+                     f'<td>{self._e(p.get("gpo_name",""))}</td><td><code>{self._e(base)}</code></td></tr>')
+        return ('<table class="kc-table"><thead><tr><th>Username</th><th>Cracked password</th>'
+                f'<th>GPO</th><th>File</th></tr></thead><tbody>{rows}</tbody></table>')
 
-    def _adcs_section(self):
-        fs = [f for f in self.findings if f.rule_id in (
-            "A-CertTempCustomSubject","A-CertTempAnyPurpose","A-CertTempAgent","A-CertEnrollHttp","A-CertTemplateESC4")]
-        if not fs:
-            return ""
-        rows = ""
-        for f in fs:
-            esc = next((m for m in ("ESC1","ESC2","ESC3","ESC4","ESC8") if m in (f.details or "")), "")
-            rows += (f'<tr><td><code>{self._e(f.rule_id)}</code></td><td><span class="kc-badge kc-badge-crit">{esc}</span></td>'
-                     f'<td>{self._e(f.title)}</td><td class="kc-detail">{self._e(", ".join(f.affected[:5]))}</td>'
-                     f'<td><span class="kc-sev-pill" style="background:{f.sev_colour}">{self._e(f.severity)}</span></td></tr>')
-        return ('<section class="kc-section"><h2 class="kc-h2">📜 ADCS certificate issues</h2>'
-                '<p class="kc-sub">Only templates published to a CA are listed. Validate enrollment ACLs before exploitation.</p>'
-                '<table class="kc-table"><thead><tr><th>Rule</th><th>ESC</th><th>Issue</th><th>Template / CA</th>'
-                f'<th>Severity</th></tr></thead><tbody>{rows}</tbody></table></section>')
-
-    def _kerberoast_section(self):
-        kf = [f for f in self.findings if f.rule_id in ("S-Kerberoastable","S-KerberoastableAdmin","P-Kerberoasting")]
-        accts = _dedup_keep_order([a for f in kf for a in f.affected])[:48]
-        if not accts:
-            return ""
-        rows = "".join(f'<tr><td><strong>{self._e(a)}</strong></td></tr>' for a in accts)
-        return ('<section class="kc-section"><h2 class="kc-h2">🎟 Kerberoastable accounts</h2>'
-                '<p class="kc-sub">Request a TGS and crack offline: <code>GetUserSPNs.py -request</code> → '
-                '<code>hashcat -m 13100</code>.</p>'
-                f'<table class="kc-table"><thead><tr><th>Account / SPN</th></tr></thead><tbody>{rows}</tbody></table></section>')
-
-    def _acl_section(self):
-        acl = self.data.acl_findings
-        if not acl:
-            return ""
-        labels = {"dcsync":"DCSync","dangerous_acl":"Dangerous ACL","owner":"Owner","write_property":"WriteProperty","gpo_write":"GPO Write"}
-        cols = {"dcsync":"#bd4234","dangerous_acl":"#cb7a2f","owner":"#cb7a2f","write_property":"#cda52b","gpo_write":"#cb7a2f"}
-        rows = ""
-        for f in acl:
-            t = f.get("type","")
-            rows += (f'<tr><td><strong>{self._e(f.get("sid_name",""))}</strong><div class="kc-sid"><code>{self._e(f.get("sid",""))}</code></div></td>'
-                     f'<td><span class="kc-badge" style="background:{cols.get(t,"#888")}">{labels.get(t,t)}</span></td>'
-                     f'<td><strong>{self._e(f.get("right",""))}</strong></td><td>{self._e(f.get("object",""))}</td>'
-                     f'<td class="kc-detail">{self._e(f.get("detail",""))}</td></tr>')
-        return ('<section class="kc-section"><h2 class="kc-h2">🔗 Control-path edges (Tier 0)</h2>'
-                '<p class="kc-sub">Raw ACL/owner/DCSync edges behind the Domain Dominance paths above.</p>'
-                '<table class="kc-table"><thead><tr><th>Principal</th><th>Type</th><th>Right</th><th>Target</th>'
-                f'<th>Detail</th></tr></thead><tbody>{rows}</tbody></table></section>')
-
-    def _trusts_section(self):
-        if not self.data.trusts:
-            return ""
-        tt = {1:"Downlevel",2:"Uplevel",3:"MIT",4:"DCE"}; td = {0:"Disabled",1:"Inbound",2:"Outbound",3:"Bidirectional"}
-        rows = ""
-        for t in self.data.trusts:
-            name = get_str(t["attrs"],"name") or get_str(t["attrs"],"trustPartner")
-            ta = get_int(t["attrs"],"trustAttributes")
-            sidf = "<span class='kc-ok'>Yes</span>" if ta & TRUST_ATTR_QUARANTINED else "<span class='kc-bad'>No</span>"
-            tgt = "<span class='kc-bad'>Enabled</span>" if ta & TRUST_ATTR_TGT_DELEGATION else "<span class='kc-ok'>Disabled</span>"
-            rows += (f'<tr><td><strong>{self._e(name)}</strong></td><td>{tt.get(get_int(t["attrs"],"trustType"),"?")}</td>'
-                     f'<td>{td.get(get_int(t["attrs"],"trustDirection"),"?")}</td><td>{sidf}</td><td>{tgt}</td></tr>')
-        return ('<section class="kc-section"><h2 class="kc-h2">🤝 Trust relationships</h2>'
-                '<table class="kc-table"><thead><tr><th>Partner</th><th>Type</th><th>Direction</th><th>SID filtering</th>'
-                f'<th>TGT delegation</th></tr></thead><tbody>{rows}</tbody></table></section>')
-
-    # ── findings register ──────────────────────────────────────────────────────
     def _finding_panel(self, f):
-        doc = self._doc(f.rule_id); desc = doc.get("description") or f.details or ""
+        doc = self._doc(f.rule_id); desc = doc.get("description") or ""
         parts = []
-        if f.mitre:
-            parts.append('<div class="kc-attck-row">' + "".join(f'<span class="kc-mini">{self._e(m)}</span>' for m in f.mitre) + '</div>')
-        if f.details and f.details != desc:
-            parts.append(f'<div class="kc-evidence"><div class="kc-bh">Evidence</div><div class="kc-bb">{self._e(f.details)}</div></div>')
+        # 1) inline attack-path visual (if this finding is an escalation path)
+        path = self._inline_path(f.rule_id)
+        if path:
+            parts.append(f'<div class="kc-block"><div class="kc-bh">Attack path</div>{path}</div>')
+        # 2) evidence — terminal-style "what SCOUT observed"
+        term = f'<span class="t-ok">[+]</span> {self._e(f.details)}\n' if f.details else ""
+        if f.rule_id == "P-GPPPassword":
+            ev_extra = self._gpp_table()
+        else:
+            ev_extra = ""
+        if f.affected:
+            n = len(f.affected); shown = f.affected[:120]
+            term += "\n".join(f'    {self._e(a)}' for a in shown)
+            if n > len(shown):
+                term += f'\n    … and {n-len(shown)} more'
+        if term.strip() or ev_extra:
+            hdr = f'Evidence' + (f' — {len(f.affected)} affected' if f.affected else '')
+            block = f'<pre class="kc-term">{term or self._e(f.details)}</pre>' if term.strip() else ""
+            parts.append(f'<div class="kc-block"><div class="kc-bh">{hdr}</div>{block}{ev_extra}</div>')
+        # 3) narrative
         if desc:
-            parts.append(f'<div class="kc-block"><div class="kc-bh">Description</div><div class="kc-bb">{self._e(desc)}</div></div>')
+            parts.append(f'<div class="kc-block"><div class="kc-bh">What it is</div><div class="kc-bb">{self._e(desc)}</div></div>')
         if doc.get("why"):
             parts.append(f'<div class="kc-block"><div class="kc-bh">Why it matters</div><div class="kc-bb">{self._e(doc["why"])}</div></div>')
         if doc.get("technical"):
-            parts.append(f'<div class="kc-block"><div class="kc-bh">Technical detail</div><div class="kc-bb kc-mono">{self._e(doc["technical"])}</div></div>')
+            parts.append(f'<div class="kc-block"><div class="kc-bh">Technical</div><div class="kc-bb kc-mono">{self._e(doc["technical"])}</div></div>')
+        # 4) tradecraft
         if doc.get("exploit"):
             items = "".join(f'<li><code>{self._e(x)}</code><button class="kc-copy" onclick="kcCopy(this)">copy</button></li>' for x in doc["exploit"])
             parts.append(f'<div class="kc-block kc-attack"><div class="kc-bh">Exploitation</div><ul class="kc-cmd">{items}</ul></div>')
         if doc.get("remediation"):
             items = "".join(f'<li>{self._e(x)}</li>' for x in doc["remediation"])
             parts.append(f'<div class="kc-block kc-fix"><div class="kc-bh">Remediation</div><ul class="kc-fixlist">{items}</ul></div>')
-        if doc.get("refs"):
-            items = "".join(f'<li><a href="{self._e(u)}" target="_blank" rel="noopener">{self._e(u)}</a></li>' for u in doc["refs"])
-            parts.append(f'<div class="kc-block"><div class="kc-bh">References</div><ul class="kc-reflist">{items}</ul></div>')
-        if f.affected:
-            n = len(f.affected); shown = f.affected[:90]; extra = n - len(shown)
-            items = "".join(f'<li>{self._e(a)}</li>' for a in shown)
-            tail = f'<li class="kc-more">… and {extra} more</li>' if extra > 0 else ""
-            parts.append(f'<div class="kc-block"><div class="kc-bh">Affected ({n})</div><ul class="kc-affected">{items}{tail}</ul></div>')
+        refs = doc.get("refs") or []
+        meta = f'<span class="kc-mini">{self._e(f.rule_id)}</span>' + "".join(f'<span class="kc-mini">{self._e(m.split(":")[0])}</span>' for m in f.mitre)
+        if refs:
+            meta += "".join(f' <a href="{self._e(u)}" target="_blank" rel="noopener" style="font-size:11px">ref↗</a>' for u in refs)
+        parts.append(f'<div class="kc-block" style="border-top:1px solid var(--border);padding-top:8px">{meta}</div>')
         if not parts:
             parts.append('<div class="kc-bb">No additional detail.</div>')
         return "".join(parts)
@@ -6299,7 +6270,7 @@ class HTMLReporter:
                  '<button class="kc-fp" data-f="sev:LOW" onclick="kcFil(this)" style="--c:#74934a">Low</button>'
                  '<span class="kc-fsep"></span>' + catpills)
         return ('<section class="kc-section" id="sec-findings">'
-                f'<h2 class="kc-h2">Finding register <span class="kc-count">({len(self.findings)})</span></h2>'
+                f'<h2 class="kc-h2">Findings <span class="kc-count">({len(self.findings)})</span></h2>'
                 f'<div class="kc-toolbar"><div class="kc-pills">{pills}</div><div class="kc-toolbar-r">'
                 '<input id="kc-q" type="search" placeholder="Search findings…" oninput="kcApply()">'
                 '<button class="kc-fp" onclick="kcAll(1)">Expand</button>'
@@ -6311,40 +6282,32 @@ class HTMLReporter:
                 f'<tbody>{"".join(rows)}</tbody></table></section>')
 
     # ── inventory ─────────────────────────────────────────────────────────────
-    def _roster(self, gname):
-        members = self.data.priv_group_members.get(gname, [])
-        return _dedup_keep_order([get_str(m["attrs"],"sAMAccountName") or dn_base(m["dn"]) for m in members])
-
-    def _inventory_section(self):
+    def _inventory_block(self):
         d = self.data
         en_u = sum(1 for u in d.users if not uac_has(get_int(u["attrs"],"userAccountControl"),UAC_ACCOUNTDISABLE))
         dis_u = len(d.users) - en_u
         en_c = sum(1 for c in d.computers if not uac_has(get_int(c["attrs"],"userAccountControl"),UAC_ACCOUNTDISABLE))
-        da, ea, sa = self._roster("Domain Admins"), self._roster("Enterprise Admins"), self._roster("Schema Admins")
         sch = SCHEMA_VERSIONS.get(d.schema_version,str(d.schema_version)); maq = d.machine_account_quota
         def chip(ok, label):
             return f'<span class="{"kc-ok" if ok else "kc-bad"}">{label}</span>'
         maq_h = (f"<span class='kc-bad'>{maq}</span>" if maq>0 else (f"<span class='kc-ok'>0</span>" if maq==0 else "<span class='kc-warn'>?</span>"))
-        stats = [("Domain", self._e(self.domain)),
-                 ("Domain functional level", self._e(FUNCTIONAL_LEVELS.get(d.domain_level,str(d.domain_level)))),
-                 ("Forest functional level", self._e(FUNCTIONAL_LEVELS.get(d.forest_level,str(d.forest_level)))),
-                 ("Schema version", f"{self._e(sch)} ({d.schema_version})"),
-                 ("Users (enabled/disabled)", f"{en_u} / {dis_u}"), ("Computers (enabled)", str(en_c)),
-                 ("Domain controllers", str(len(d.dcs))), ("GPOs", str(len(d.gpos))),
-                 ("Trusts", str(len(d.trusts))), ("Sites / subnets", f"{len(d.sites)} / {len(d.subnets)}"),
-                 ("Domain Admins", str(len(da))), ("Enterprise Admins", str(len(ea))),
-                 ("Schema Admins", str(len(sa))), ("Fine-grained PSOs", str(len(d.psoes))),
-                 ("Cert templates", str(len(d.cert_templates))),
-                 ("LAPS", chip(d.laps_installed, "Installed" if d.laps_installed else "NOT installed")),
-                 ("MachineAccountQuota", maq_h),
-                 ("ADWS (9389)", chip(not d.adws_available, "open" if d.adws_available else "closed"))]
+        stats = [("Domain FL", self._e(FUNCTIONAL_LEVELS.get(d.domain_level,str(d.domain_level)))),
+                 ("Forest FL", self._e(FUNCTIONAL_LEVELS.get(d.forest_level,str(d.forest_level)))),
+                 ("Schema", f"{self._e(sch)}"),
+                 ("Users (en/dis)", f"{en_u} / {dis_u}"), ("Computers", str(en_c)),
+                 ("DCs", str(len(d.dcs))), ("GPOs", str(len(d.gpos))),
+                 ("Trusts", str(len(d.trusts))), ("Sites/subnets", f"{len(d.sites)} / {len(d.subnets)}"),
+                 ("PSOs", str(len(d.psoes))), ("Cert templates", str(len(d.cert_templates))),
+                 ("LAPS", chip(d.laps_installed, "yes" if d.laps_installed else "NO")),
+                 ("MachineAcctQuota", maq_h),
+                 ("ADWS 9389", chip(not d.adws_available, "open" if d.adws_available else "closed"))]
         cells = "".join(f'<div class="kc-stat"><div class="kc-stat-l">{l}</div><div class="kc-stat-v">{v}</div></div>' for l,v in stats)
         os_dist = defaultdict(int)
         for c in d.computers:
             if uac_has(get_int(c["attrs"],"userAccountControl"),UAC_ACCOUNTDISABLE):
                 continue
             os_dist[get_str(c["attrs"],"operatingSystem") or "Unknown"] += 1
-        top = sorted(os_dist.items(), key=lambda kv:-kv[1])[:10]; omax = max((n for _,n in top), default=1)
+        top = sorted(os_dist.items(), key=lambda kv:-kv[1])[:8]; omax = max((n for _,n in top), default=1)
         bars = ""
         for os, n in top:
             eol = any(x in os for x in ("XP","2003","2008","Vista","2000","Windows 7"))
@@ -6352,51 +6315,31 @@ class HTMLReporter:
             bars += (f'<div class="kc-bar-row"><div class="kc-bar-l">{self._e(os)}</div>'
                      f'<div class="kc-bar-t"><div class="kc-bar-f" style="width:{n/omax*100:.0f}%;background:{col}"></div></div>'
                      f'<div class="kc-bar-n">{n}</div></div>')
-        def roster(title, names):
-            if not names:
-                return ""
-            shown = names[:30]; extra = len(names)-len(shown)
-            chips = "".join(f'<span class="kc-rchip">{self._e(x)}</span>' for x in shown)
-            tail = f'<span class="kc-rchip kc-more">+{extra}</span>' if extra>0 else ""
-            return f'<div class="kc-roster"><h4>{title} ({len(names)})</h4><div>{chips}{tail}</div></div>'
-        rosters = roster("Domain Admins", da) + roster("Enterprise Admins", ea) + roster("Schema Admins", sa)
-        return ('<section class="kc-section" id="sec-inventory"><h2 class="kc-h2">🏰 Domain inventory</h2>'
+        # trusts table (folded into inventory)
+        trusts = ""
+        if d.trusts:
+            tt = {1:"Downlevel",2:"Uplevel",3:"MIT",4:"DCE"}; td = {0:"Disabled",1:"Inbound",2:"Outbound",3:"Bidirectional"}
+            rows = ""
+            for t in d.trusts:
+                name = get_str(t["attrs"],"name") or get_str(t["attrs"],"trustPartner")
+                ta = get_int(t["attrs"],"trustAttributes")
+                sidf = "<span class='kc-ok'>yes</span>" if ta & TRUST_ATTR_QUARANTINED else "<span class='kc-bad'>no</span>"
+                rows += (f'<tr><td><strong>{self._e(name)}</strong></td><td>{tt.get(get_int(t["attrs"],"trustType"),"?")}</td>'
+                         f'<td>{td.get(get_int(t["attrs"],"trustDirection"),"?")}</td><td>{sidf}</td></tr>')
+            trusts = ('<div class="kc-sub-h">Trusts</div><table class="kc-table"><thead><tr><th>Partner</th>'
+                      '<th>Type</th><th>Direction</th><th>SID filtering</th></tr></thead>'
+                      f'<tbody>{rows}</tbody></table>')
+        return ('<div class="kc-sub-h">Domain inventory</div>'
                 f'<div class="kc-stat-grid">{cells}</div>'
-                + (f'<div class="kc-sub-h">Tier-0 privileged accounts</div>{rosters}' if rosters else "")
-                + (f'<div class="kc-sub-h">Operating systems</div><div class="kc-barchart">{bars}</div>' if bars else "")
-                + '</section>')
-
-    def _appendix(self):
-        errs = ""
-        ce = getattr(self.data, "collect_errors", None)
-        if ce:
-            items = "".join(f"<li>{self._e(x)}</li>" for x in ce)
-            errs = ('<div class="kc-block"><div class="kc-bh">Collection notes</div>'
-                    f'<ul class="kc-fixlist">{items}</ul></div>')
-        return ('<section class="kc-section" id="sec-appendix"><h2 class="kc-h2">Methodology &amp; scope</h2>'
-                '<div class="kc-bb">'
-                f'<p><strong>Tool.</strong> {TOOL_NAME} v{VERSION} — an offline, Linux-based Active Directory '
-                'security assessment over LDAP/LDAPS/SMB, oriented to internal penetration testing: ACL/'
-                'delegation control paths, ADCS (ESC1-4/8), SCCM, WSUS, Kerberoasting/AS-REP, GPP/LAPS, RBCD, '
-                'pre-staged computer accounts, coercion/relay exposure and password-policy/spray surface.</p>'
-                '<p><strong>Scoring.</strong> Two axes, not one gauge. <em>Exposure</em> (0–100) is set by the '
-                'easiest available path to Tier 0 — so a hardened domain scores low and a domain with a one-step '
-                'takeover scores high. <em>Hygiene debt</em> (0–100) is a prevalence-graded measure of '
-                'misconfiguration and stale objects. The A–F posture grade combines them, exposure-weighted.</p>'
-                '<p><strong>Limitations.</strong> Results reflect what the assessing account could read at scan '
-                'time. Some controls (host-local registry, CA web-enrollment) are inferred from GPO/LDAP state and '
-                'should be confirmed on the host. Point-in-time, authorized-testing use only.</p>'
-                f'{errs}'
-                f'<p class="kc-muted">Generated {self._e(self.ts)} against {self._e(self.dc_ip)} '
-                f'using {self._e(self.auth_mode or "n/a")} authentication.</p></div></section>')
+                + (f'<div class="kc-invcols">'
+                   f'<div><div class="kc-sub-h">Operating systems</div><div class="kc-barchart">{bars}</div></div>'
+                   f'<div>{trusts}</div></div>' if (bars or trusts) else ""))
 
     # ── assemble ──────────────────────────────────────────────────────────────
     def render(self):
         body = (self._head() + self._nav() + '<main class="kc-container">' +
-                self._summary_section() + self._paths_section() + self._roadmap_section() +
-                self._gpp_section() + self._adcs_section() + self._kerberoast_section() +
-                self._acl_section() + self._attack_section() + self._trusts_section() +
-                self._findings_section() + self._inventory_section() + self._appendix() + '</main>'
+                self._summary_section() + self._paths_section() +
+                self._privileged_section() + self._findings_section() + '</main>'
                 f'<footer class="kc-footer">{TOOL_NAME} v{VERSION} — authorized security assessment use only · '
                 f'generated {self._e(self.ts)}</footer>'
                 '<button class="kc-top" onclick="kcJump(\'top\')" title="Back to top">↑</button>')

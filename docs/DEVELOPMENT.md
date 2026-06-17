@@ -28,7 +28,7 @@ an assessment box with only `pip install` deps. Major pieces, top to bottom:
   SMB-signing checks (impacket).
 - **`RiskScorer`** — two axes: `exposure()` (easiest path to Tier 0, from
   `EXPOSURE_WEIGHTS`) and `hygiene()` (prevalence-graded debt, from
-  `HYGIENE_WEIGHTS`), combined into an A–F `grade()`.
+  `HYGIENE_WEIGHTS`), plus `verdict()` (plain-English exposure band).
 - **`HTMLReporter`** — single-file interactive report (`_KC_CSS`/`_KC_JS` module
   strings hold the inline theme/JS; no external assets).
 - **`main()`** — arg parsing, orchestration, HTML/JSON/CSV output.
@@ -58,12 +58,12 @@ Two axes, deliberately not a single saturating gauge (which always pinned at
   domain scores low; a one-step takeover (GPP/DCSync/ESC1) scores ~95–100.
 - **Hygiene debt (0–100)** = sum of `HYGIENE_WEIGHTS` contributions; `pct_users`/
   `pct_comps` entries scale by the fraction of enabled objects affected.
-- **Grade (A–F)** = `RiskScorer.grade(exposure, hygiene)`, exposure-weighted.
-- `RULE_SCALE` still graduates per-finding `points` (used for the action-plan
-  "Risk ↓" and finding sort).
+- **Verdict** = `RiskScorer.verdict(exposure)` — a plain-English band word
+  ("Domain compromisable" … "No direct path"), shown instead of a letter grade.
+- `RULE_SCALE` still graduates per-finding `points` (used for finding sort).
 
-There is intentionally no maturity/CMMI score — it tested as not useful for an
-offensive engagement.
+There is intentionally no maturity/CMMI score and no letter grade — both tested
+as not useful for an offensive engagement.
 
 ## Adding a rule
 
@@ -109,7 +109,7 @@ Ordered roughly by value:
 ## Design notes
 
 SCOUT is a self-contained, operator-oriented tool with its own rule catalog,
-checks, scoring (Exposure + Hygiene → A–F grade) and report. Findings are
+checks, scoring (Exposure + Hygiene + verdict) and report. Findings are
 organized by operational category (Privilege Escalation, Credential Access,
 Lateral Movement, Persistence, Recon & Exposure, Hygiene & Legacy) rather than a
 compliance taxonomy, and watered-down/non-actionable rules are suppressed by
