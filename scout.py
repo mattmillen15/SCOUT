@@ -4,10 +4,11 @@ SCOUT - Security Configuration Observation & Understanding Tool
 Active Directory security assessment for non-domain-joined Linux operators.
 
 Operator-oriented internal AD assessment: control-path / domain-dominance
-analysis, ADCS (ESC1-4/8), SCCM, WSUS, Kerberoasting/AS-REP, GPP/LAPS, RBCD,
-pre-staged computer accounts, coercion/relay and spray surface, with MITRE
-ATT&CK mapping. Scored on two axes — Exposure (easiest path to Tier 0) and
-Hygiene debt — combined into an A-F posture grade (not a saturating gauge).
+analysis, ADCS (ESC1-4/7/8/9), SCCM, WSUS, Kerberoasting/AS-REP, GPP/LAPS, RBCD,
+gMSA/dMSA & KDS, Entra/AAD-Connect indicators, pre-staged computer accounts,
+coercion/relay and spray surface, with MITRE ATT&CK mapping. Scored on two
+independent axes — Exposure (easiest path to Tier 0) and Hygiene debt — with a
+plain-English exposure verdict (no saturating gauge, no letter grade).
 Data is collected over LDAP/LDAPS; SMB/SYSVOL checks use impacket where
 available. Outputs an interactive single-file HTML report plus JSON and CSV.
 
@@ -51,7 +52,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 try:
     import ldap3
-    from ldap3 import ALL, NTLM, SASL, GSSAPI, SIMPLE, Server, Connection, AUTO_BIND_NO_TLS, AUTO_BIND_TLS_BEFORE_BIND
+    from ldap3 import ALL, DSA, NTLM, SASL, GSSAPI, SIMPLE, Server, Connection, AUTO_BIND_NO_TLS, AUTO_BIND_TLS_BEFORE_BIND
     from ldap3.core.exceptions import LDAPException, LDAPBindError, LDAPSocketOpenError
     from ldap3.protocol.microsoft import security_descriptor_control
 except ImportError:
@@ -103,6 +104,8 @@ UAC_TRUSTED_TO_AUTH        = 0x01000000  # protocol transition
 UAC_PARTIAL_SECRETS        = 0x04000000  # RODC
 
 # ── Trust attributes ──────────────────────────────────────────────────────────
+TRUST_ATTR_NON_TRANSITIVE   = 0x00000001
+TRUST_ATTR_UPLEVEL_ONLY     = 0x00000002
 TRUST_ATTR_QUARANTINED      = 0x00000004  # SID filtering
 TRUST_ATTR_FOREST           = 0x00000008
 TRUST_ATTR_CROSS_ORG        = 0x00000010  # selective auth
@@ -111,6 +114,8 @@ TRUST_ATTR_TREAT_EXTERNAL   = 0x00000040
 TRUST_ATTR_RC4              = 0x00000080
 TRUST_ATTR_TGT_DELEGATION   = 0x00000800
 TRUST_TYPE_DOWNLEVEL        = 1
+TRUST_TYPE_UPLEVEL          = 2
+TRUST_TYPE_MIT              = 3
 TRUST_DIR_DISABLED          = 0
 TRUST_DIR_INBOUND           = 1
 TRUST_DIR_OUTBOUND          = 2
@@ -342,12 +347,18 @@ RULES: Dict[str, Tuple[str, str, int, str]] = {
     "A-SCCM":                 ("SCCM/MECM site infrastructure exposed (relay / NAA / PXE attack surface)","Anomaly",40,"HIGH"),
     "A-Pre2kComputer":        ("Pre-created (pre-Windows 2000) computer accounts with a predictable password","Anomaly",50,"HIGH"),
     "A-WeakLockout":          ("No / weak account-lockout policy (password spraying viable)","Anomaly",25,"HIGH"),
+    # ── Added — managed-account / KDS / Entra / GPO-link coverage (roadmap) ────
+    "P-GMSAReadable":         ("gMSA/dMSA managed password readable by a broad principal","Privileged",50,"CRITICAL"),
+    "A-KDSRootKey":           ("KDS root key readable — offline gMSA password compromise (GoldenGMSA)","Anomaly",50,"CRITICAL"),
+    "A-AADConnectSync":       ("Entra/Azure AD Connect sync account present (DCSync-capable)","Anomaly",25,"HIGH"),
+    "A-SeamlessSSO":          ("Entra Seamless SSO computer account (AZUREADSSOACC$) key is stale","Anomaly",25,"HIGH"),
+    "S-OrphanedGPO":          ("Orphaned / unlinked GPOs present","Stale",5,"LOW"),
 }
 
-# Field/army palette — oxide red, rust, mustard/brass, olive drab, field grey.
-SEV_COLOUR = {"CRITICAL":"#b23a2e","HIGH":"#c2702a","MEDIUM":"#c9a227",
+# Field/army palette — oxide red, rust, mustard/brass, olive drab, field gray.
+SEV_COLOR = {"CRITICAL":"#b23a2e","HIGH":"#c2702a","MEDIUM":"#c9a227",
               "LOW":"#6f8f3f","INFO":"#8a8f78"}
-CAT_COLOUR  = {"Anomaly":"#c2702a","Privileged":"#a8843c",
+CAT_COLOR  = {"Anomaly":"#c2702a","Privileged":"#a8843c",
                "Stale":"#5d7a86","Trust":"#6f8f3f"}
 
 # ── Maturity model (CMMI 1-5, ANSSI-style) ───────────────────────────────────
@@ -493,6 +504,10 @@ RULE_MITRE: Dict[str, List[str]] = {
     "A-Pre2kComputer": ["T1078: Valid Accounts", "T1110: Brute Force"],
     "A-WeakLockout": ["T1110.003: Password Spraying"],
     "P-ExchangePrivEsc": ["T1222.001: ACL Modification", "T1098: Account Manipulation"],
+    "P-GMSAReadable": ["T1555: Credentials from Password Stores", "T1078: Valid Accounts"],
+    "A-KDSRootKey": ["T1555: Credentials from Password Stores", "T1098: Account Manipulation"],
+    "A-AADConnectSync": ["T1078.004: Cloud Accounts", "T1003.006: DCSync"],
+    "A-SeamlessSSO": ["T1550.003: Pass-the-Ticket", "T1078.004: Cloud Accounts"],
 }
 
 # ── Graduated scoring: rule_id -> (points_per_affected, cap). When present, a
@@ -523,7 +538,7 @@ def scaled_points(rule_id: str, base_points: int, n_affected: int) -> int:
 #    (not the internal A/P/S/T taxonomy). Used only for report grouping/filtering.
 OPCAT_ORDER = ["Privilege Escalation", "Credential Access", "Lateral Movement",
                "Persistence", "Recon & Exposure", "Hygiene & Legacy"]
-OPCAT_COLOUR = {
+OPCAT_COLOR = {
     "Privilege Escalation":"#bd4234", "Credential Access":"#cb7a2f",
     "Lateral Movement":"#5d7a86", "Persistence":"#8a6d4f",
     "Recon & Exposure":"#6f8f3f", "Hygiene & Legacy":"#8c917a",
@@ -548,7 +563,10 @@ OP_CATEGORY = {
     "A-CertEnrollHttp":"Privilege Escalation","A-CertCAManageLowPriv":"Privilege Escalation",
     "A-CertTemplateESC9":"Privilege Escalation","P-ControlPathDA":"Privilege Escalation",
     "P-ControlPathIndirectEveryone":"Privilege Escalation","P-ControlPathIndirectMany":"Privilege Escalation",
+    "P-GMSAReadable":"Privilege Escalation",
     # Credential access / harvesting
+    "A-KDSRootKey":"Credential Access","A-AADConnectSync":"Credential Access",
+    "A-SeamlessSSO":"Lateral Movement","S-OrphanedGPO":"Hygiene & Legacy",
     "P-GPPPassword":"Credential Access","A-LAPS-Not-Installed":"Credential Access",
     "A-LAPS-Joined-Computers":"Credential Access","A-LocalAdminPassword":"Credential Access",
     "A-ReversiblePwd":"Credential Access","S-Reversible":"Credential Access",
@@ -724,7 +742,7 @@ RULE_DOCS: Dict[str, Dict[str, Any]] = {
     },
     "A-PwdHistory": {
         "description": "Password history length is below the recommended value (24).",
-        "why": "Users can quickly cycle back to a previously-known password — minimising rotation's effectiveness against captured hashes.",
+        "why": "Users can quickly cycle back to a previously-known password — minimizing rotation's effectiveness against captured hashes.",
         "remediation": [
             "Set-ADDefaultDomainPasswordPolicy -PasswordHistoryCount 24",
         ],
@@ -1292,7 +1310,7 @@ RULE_DOCS: Dict[str, Dict[str, Any]] = {
             "getST.py -spn <target-spn> -impersonate Administrator 'DOMAIN/svc:pass'",
         ],
         "remediation": [
-            "Minimise constrained-delegation grants; prefer RBCD scoped to specific resources.",
+            "Minimize constrained-delegation grants; prefer RBCD scoped to specific resources.",
             "Add sensitive accounts to Protected Users and mark them 'account is sensitive and cannot be delegated'.",
         ],
     },
@@ -1311,7 +1329,7 @@ RULE_DOCS: Dict[str, Dict[str, Any]] = {
     },
     "S-SIDHistoryPrivileged": {
         "description": "Accounts carry a privileged or built-in SID in their sIDHistory.",
-        "why": "SID history is honoured at logon, so the account silently wields the privileges of the referenced SID (e.g. Enterprise Admins / Administrators) without appearing in any group. A classic stealth persistence backdoor.",
+        "why": "SID history is honored at logon, so the account silently wields the privileges of the referenced SID (e.g. Enterprise Admins / Administrators) without appearing in any group. A classic stealth persistence backdoor.",
         "technical": "Look for sIDHistory RIDs 512/516/518/519/520 or built-in S-1-5-32-544 etc., or any RID 500.",
         "exploit": ["Mimikatz sid::patch + sid::add to inject; the account then authenticates with hidden admin rights."],
         "remediation": [
@@ -1343,7 +1361,7 @@ RULE_DOCS: Dict[str, Dict[str, Any]] = {
         "technical": "Dangerous ACE (GenericAll/GenericWrite/WriteDacl/WriteOwner/WriteProperty) for Everyone/Authenticated Users/Domain Users/Computers on the pKICertificateTemplate object.",
         "exploit": [
             "certipy find -vulnerable -u user@domain -p pass",
-            "certipy template -template <tmpl> -u user@domain -p pass   # weaponise to ESC1",
+            "certipy template -template <tmpl> -u user@domain -p pass   # weaponize to ESC1",
             "certipy req -template <tmpl> -upn administrator@domain ...  # then auth",
         ],
         "remediation": [
@@ -1452,6 +1470,62 @@ RULE_DOCS: Dict[str, Dict[str, Any]] = {
         "remediation": ["Restrict the container ACL to the SCCM site server(s) only."],
         "refs": ["https://github.com/garrettfoster13/sccmhunter"],
     },
+    "P-GMSAReadable": {
+        "description": "A broad / low-privileged principal can read the managed password of a gMSA or dMSA.",
+        "why": "msDS-GroupMSAMembership controls who may retrieve msDS-ManagedPassword. If a non-Tier-0 principal is listed, they can read the gMSA/dMSA's current password (a derived NT hash / AES keys) and authenticate as that account — which is frequently highly privileged (SQL, AD CS, Exchange, scheduled tasks).",
+        "technical": "msDS-GroupMSAMembership (PrincipalsAllowedToRetrieveManagedPassword) DACL grants read to a broad SID (Everyone / Authenticated Users / Domain Users / Domain Computers / BUILTIN\\Users).",
+        "exploit": [
+            "nxc ldap <dc> -u user -p pass --gmsa",
+            "certipy/gMSADumper.py -u user -p pass -d domain -l <dc>",
+            "Use the recovered NT hash with pass-the-hash / getTGT.py.",
+        ],
+        "remediation": [
+            "Restrict msDS-GroupMSAMembership to the specific hosts/service identities that need the account.",
+        ],
+        "refs": ["https://github.com/micahvandeusen/gMSADumper"],
+    },
+    "A-KDSRootKey": {
+        "description": "A broad / low-privileged principal is granted read on the KDS root key.",
+        "why": "With the KDS root key an attacker computes the password of ANY gMSA in the forest offline (GoldenGMSA), with no further DC interaction — persistent access to every managed service account. Only Domain Admins / SYSTEM should ever read it.",
+        "technical": "CN=Master Root Keys,CN=Group Key Distribution Service,CN=Services,CN=Configuration — nTSecurityDescriptor DACL grants read (GenericAll/GenericRead/ReadProperty/Control-Access) to a broad SID (Everyone / Authenticated Users / Domain Users / Domain Computers / BUILTIN\\Users).",
+        "exploit": [
+            "GoldenGMSA.exe kdsinfo / gmsainfo / compute --sid <gmsa-sid>",
+        ],
+        "remediation": [
+            "Treat KDS root keys as Tier-0; verify only Domain Admins/SYSTEM can read CN=Master Root Keys and investigate the delegation that exposed it.",
+        ],
+        "refs": ["https://github.com/Semperis/GoldenGMSA"],
+    },
+    "A-AADConnectSync": {
+        "description": "An Entra/Azure AD Connect synchronization account (MSOL_*) is present in the domain.",
+        "why": "The on-prem AAD Connect sync account is granted directory-replication (DCSync) rights to support Password Hash Sync. Compromising the AD Connect server (or this account) yields DCSync — full credential extraction — and a pivot between on-prem AD and Entra ID.",
+        "technical": "User accounts named MSOL_<hex> (default AAD Connect naming). The AD Connect server stores the account's credentials in a recoverable form (DPAPI).",
+        "exploit": [
+            "On the AAD Connect host: AADInternals Get-AADIntSyncCredentials → recover MSOL_ password.",
+            "impacket-secretsdump 'DOMAIN/MSOL_xxx:pass@dc' -just-dc",
+        ],
+        "remediation": [
+            "Tier-0 the AD Connect server and the MSOL_ account; restrict logon; monitor its DCSync usage.",
+        ],
+        "refs": ["https://aadinternals.com/post/on-prem_admin/"],
+    },
+    "A-SeamlessSSO": {
+        "description": "The Entra Seamless SSO computer account AZUREADSSOACC$ has a stale Kerberos key.",
+        "why": "AZUREADSSOACC$ holds the key that signs Seamless SSO Kerberos tickets to Entra ID. Microsoft recommends rotating it every 30 days; a stale key lets an attacker who recovers it forge silver tickets to authenticate to Entra as any synced user.",
+        "technical": "Computer object AZUREADSSOACC$ with pwdLastSet older than the rotation window.",
+        "remediation": [
+            "Rotate the Seamless SSO key (Update-AzureADSSOForest) on a schedule; consider disabling Seamless SSO if unused.",
+        ],
+        "refs": ["https://learn.microsoft.com/entra/identity/hybrid/connect/how-to-connect-sso-faq"],
+    },
+    "S-OrphanedGPO": {
+        "description": "Group Policy Objects exist that are not linked to the domain, any OU, or any site.",
+        "why": "Unlinked GPOs apply to nothing, but they retain their settings and DACLs. They are a cleanup item, and one a defender should review — an attacker with edit + link rights could weaponize an unlinked GPO, and orphaned policies hide drift.",
+        "technical": "groupPolicyContainer objects whose DN appears in no gPLink across the domain root, OUs or sites.",
+        "remediation": [
+            "Review and delete GPOs that are intentionally unlinked; relink any that should be active.",
+        ],
+    },
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1531,6 +1605,19 @@ def sid_to_str(raw) -> str:
     except Exception:
         return str(raw)
 
+def to_text(v) -> str:
+    """Backend-agnostic value -> str. The impacket/Kerberos backend returns every
+    attribute as raw bytes (see ADConnection._impacket_search), whereas ldap3
+    hands back decoded strings. str(b'SubCA') yields the literal "b'SubCA'", which
+    is how object names leaked into the report as b'...'. Decode bytes as UTF-8
+    (AD's directory string encoding) so both backends render identically."""
+    if isinstance(v, (bytes, bytearray)):
+        try:
+            return bytes(v).decode("utf-8")
+        except UnicodeDecodeError:
+            return bytes(v).decode("utf-8", "replace")
+    return str(v)
+
 def get_int(entry_attrs, attr: str, default=0) -> int:
     v = entry_attrs.get(attr)
     if v is None:
@@ -1548,20 +1635,68 @@ def get_str(entry_attrs, attr: str, default="") -> str:
         return default
     if isinstance(v, list):
         v = v[0] if v else default
-    return str(v) if v is not None else default
+    return to_text(v) if v is not None else default
 
 def get_list(entry_attrs, attr: str) -> List[str]:
     v = entry_attrs.get(attr)
     if v is None:
         return []
     if isinstance(v, (list, tuple)):
-        return [str(x) for x in v if x is not None]
-    return [str(v)]
+        return [to_text(x) for x in v if x is not None]
+    return [to_text(v)]
 
 def dn_base(dn: str) -> str:
     """Return the first RDN value from a DN."""
     m = re.match(r'^[^=]+=([^,]+)', dn or "")
     return m.group(1) if m else dn
+
+def classify_trust(attrs: Dict) -> Dict:
+    """Classify a trustedDomain object's scope / transitivity / direction and the
+    cross-domain risks it carries (roadmap item 9). Factual, derived purely from
+    trustAttributes / trustDirection / trustType."""
+    name = (get_str(attrs, "trustPartner") or get_str(attrs, "name")
+            or get_str(attrs, "flatName"))
+    ta = get_int(attrs, "trustAttributes")
+    tdir = get_int(attrs, "trustDirection")
+    ttype = get_int(attrs, "trustType")
+    direction = {0: "Disabled", 1: "Inbound", 2: "Outbound",
+                 3: "Bidirectional"}.get(tdir, f"?({tdir})")
+    if ta & TRUST_ATTR_WITHIN_FOREST:
+        scope = "Intra-forest"
+    elif ta & TRUST_ATTR_FOREST:
+        scope = "Forest"
+    elif ttype == TRUST_TYPE_MIT:
+        scope = "Realm (MIT)"
+    elif ta & TRUST_ATTR_TREAT_EXTERNAL:
+        scope = "External (treat-as-external)"
+    else:
+        scope = "External"
+    # External (non-forest, non-intra-forest) trusts are non-transitive; otherwise
+    # honor the explicit NON_TRANSITIVE bit.
+    intra_or_forest = bool(ta & (TRUST_ATTR_WITHIN_FOREST | TRUST_ATTR_FOREST))
+    transitive = (not (ta & TRUST_ATTR_NON_TRANSITIVE)) if intra_or_forest else False
+    sid_filtering = bool(ta & TRUST_ATTR_QUARANTINED) or bool(ta & TRUST_ATTR_WITHIN_FOREST)
+    selective_auth = bool(ta & TRUST_ATTR_CROSS_ORG)
+    tgt_delegation = bool(ta & TRUST_ATTR_TGT_DELEGATION)
+    risks = []
+    # Inbound/Bidirectional = the partner's principals can authenticate INTO this
+    # domain; without SID filtering that enables SID-history injection from the
+    # partner to escalate here.
+    exposes_us = tdir in (TRUST_DIR_INBOUND, TRUST_DIR_BIDIRECT)
+    if exposes_us and not sid_filtering:
+        risks.append("SID filtering off + inbound — SID-history injection from "
+                     f"'{name}' can escalate into this domain")
+    if tgt_delegation:
+        risks.append("TGT delegation enabled — unconstrained host in the trusted "
+                     "domain can capture this domain's TGTs")
+    if scope.startswith("External") and transitive:
+        risks.append("transitive external trust — widens the reachable surface")
+    return {"name": name, "direction": direction, "scope": scope,
+            "transitive": transitive, "sid_filtering": sid_filtering,
+            "selective_auth": selective_auth, "tgt_delegation": tgt_delegation,
+            "type": {1: "Downlevel (NT4)", 2: "Uplevel (AD)", 3: "MIT",
+                     4: "DCE"}.get(ttype, str(ttype)),
+            "risks": risks}
 
 def check_port(host: str, port: int, timeout: float = 3.0) -> bool:
     try:
@@ -1605,7 +1740,7 @@ Examples:
                            "Best path when LDAP signing or channel binding is enforced.")
     auth.add_argument("--ccache",          metavar="FILE",
                       help="Reuse an existing Kerberos ccache (implies -k). "
-                           "Also honoured via the KRB5CCNAME env var.")
+                           "Also honored via the KRB5CCNAME env var.")
     auth.add_argument("--save-ccache",     metavar="FILE", nargs="?", const="__AUTO__",
                       help="Save the obtained TGT to a ccache for reuse "
                            "(optional path; defaults to <user>.ccache).")
@@ -1632,6 +1767,16 @@ Examples:
                       help="Skip SMB-based checks (signature, SMBv1, null session)")
     conn.add_argument("--no-adcs",   action="store_true",
                       help="Skip ADCS certificate template checks")
+    conn.add_argument("--no-paths",  action="store_true",
+                      help="Skip control-path (Tier-0 reachability) analysis. It "
+                           "bulk-reads security descriptors and runs a graph "
+                           "closure — the slowest stage on large domains.")
+    conn.add_argument("--accurate-logon", action="store_true",
+                      help="For privileged-inactivity findings, reconcile the "
+                           "(replicated, up-to-14-days-stale) lastLogonTimestamp "
+                           "against the non-replicated lastLogon on EVERY DC and "
+                           "use the most recent. Extra per-DC queries; clears "
+                           "false 'inactive'/'never logged on' admin findings.")
 
     out = p.add_argument_group("Output")
     out.add_argument("-o", "--output", metavar="FILE",
@@ -1645,8 +1790,18 @@ Examples:
     out.add_argument("--scope",    metavar="TEXT", default="",
                      help="Engagement scope note printed on the report cover")
     out.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
-    out.add_argument("--no-color",      action="store_true", help="Disable colour output")
+    out.add_argument("--no-color",      action="store_true", help="Disable color output")
     return p
+
+def make_args(**overrides):
+    """A fully-defaulted args namespace (every CLI flag at its argparse default),
+    with overrides applied. Lets embedders — notably the NetExec module — drive
+    the engine without reconstructing the whole flag set."""
+    ns = build_parser().parse_args(["-d", overrides.get("domain", "example.local"),
+                                    "--dc-ip", overrides.get("dc_ip", "127.0.0.1")])
+    for k, v in overrides.items():
+        setattr(ns, k, v)
+    return ns
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FINDING  (one rule trigger)
@@ -1665,8 +1820,8 @@ class Finding:
     mitre:    List[str] = field(default_factory=list)  # ["T1003.006: DCSync", …]
 
     @property
-    def sev_colour(self) -> str:
-        return SEV_COLOUR.get(self.severity, "#95a5a6")
+    def sev_color(self) -> str:
+        return SEV_COLOR.get(self.severity, "#95a5a6")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AD CONNECTION
@@ -1706,7 +1861,7 @@ class ADConnection:
         # even when reverse DNS / PTR records are absent.
         try:
             probe = Server(self.args.dc_ip, port=self._ldap_port() if not self.args.ldaps else 389,
-                           use_ssl=False, get_info=ALL, connect_timeout=self.args.timeout)
+                           use_ssl=False, get_info=DSA, connect_timeout=self.args.timeout)
             conn = Connection(probe)
             if conn.open() is not False and probe.info:
                 dh = probe.info.other.get("dnsHostName")
@@ -1732,8 +1887,13 @@ class ADConnection:
         # disables cert/hostname validation — avoids PROTOCOL_TLS_CLIENT's
         # strict defaults that cause connection resets against self-signed DCs.
         tls = ldap3.Tls(validate=ssl.CERT_NONE) if self.args.ldaps else None
+        # get_info=DSA (RootDSE only), NOT ALL: loading the SCHEMA makes ldap3
+        # validate every requested attribute against it and fail the whole search
+        # with LDAPAttributeError if any is absent (e.g. the LAPS attributes on a
+        # domain without LAPS → 0 computers collected). SCOUT never uses the
+        # schema; it only needs RootDSE naming contexts + functional levels.
         return Server(self.args.dc_ip, port=port, use_ssl=self.args.ldaps,
-                      tls=tls, get_info=ALL, connect_timeout=self.args.timeout)
+                      tls=tls, get_info=DSA, connect_timeout=self.args.timeout)
 
     def connect(self) -> bool:
         """Establish an authenticated LDAP session, choosing the most robust
@@ -1805,17 +1965,24 @@ class ADConnection:
         return True
 
     def _do_bind(self) -> None:
+        # check_names=False is essential: with the schema loaded (get_info=ALL),
+        # ldap3 otherwise validates every REQUESTED attribute against the schema
+        # and raises LDAPAttributeError for the whole search if any is absent.
+        # On a domain without LAPS, requesting ms-Mcs-AdmPwdExpirationTime made
+        # the entire computer search fail -> 0 computers collected, silently.
+        # Disabling the check makes ldap3 behave like raw LDAP / the impacket
+        # backend: ask for anything, the server returns what exists.
         if self.args.null_session:
-            self.conn = Connection(self.server, auto_bind=True)
+            self.conn = Connection(self.server, auto_bind=True, check_names=False)
         elif self.args.hashes:
             lm, nt = self._parse_hashes()
             user = f"{self.args.domain}\\{self.args.username}"
             self.conn = Connection(self.server, user=user, password=f"{lm}:{nt}",
-                                   authentication=NTLM, auto_bind=True)
+                                   authentication=NTLM, auto_bind=True, check_names=False)
         elif self.args.username and self.args.password is not None:
             user = f"{self.args.domain}\\{self.args.username}"
             self.conn = Connection(self.server, user=user, password=self.args.password,
-                                   authentication=NTLM, auto_bind=True)
+                                   authentication=NTLM, auto_bind=True, check_names=False)
         else:
             raise ValueError("No credentials supplied and --null-session not set.")
 
@@ -1878,7 +2045,7 @@ class ADConnection:
 
         # Persist the TGT to a ccache and export KRB5CCNAME so the later SMB /
         # SYSVOL Kerberos logins transparently reuse this ticket. If the operator
-        # asked to keep it (--save-ccache) we honour their path; otherwise a temp
+        # asked to keep it (--save-ccache) we honor their path; otherwise a temp
         # file is used and cleaned up at exit.
         cc = CCache()
         cc.fromTGT(tgt, oldSessionKey, sessionKey)
@@ -1947,15 +2114,20 @@ class ADConnection:
             self.args.dc_host = dc_fqdn
         # pull naming contexts AND functional levels from RootDSE (no ldap3
         # server.info on this path, so collection reads these from here).
+        self._load_rootdse_impacket()
+        return True
+
+    def _load_rootdse_impacket(self):
+        """Populate naming contexts + functional levels from RootDSE over the
+        impacket backend. Shared by the Kerberos path and adopt_impacket()."""
         try:
-            resp = ic.search(searchBase="", searchFilter="(objectClass=*)",
-                             scope=LDAPScope("baseObject"),
-                             attributes=["defaultNamingContext",
-                                         "configurationNamingContext",
-                                         "schemaNamingContext",
-                                         "rootDomainNamingContext",
-                                         "domainFunctionality",
-                                         "forestFunctionality"])
+            from impacket.ldap.ldapasn1 import Scope as LDAPScope
+            resp = self._impacket.search(
+                searchBase="", searchFilter="(objectClass=*)",
+                scope=LDAPScope("baseObject"),
+                attributes=["defaultNamingContext", "configurationNamingContext",
+                            "schemaNamingContext", "rootDomainNamingContext",
+                            "domainFunctionality", "forestFunctionality"])
             for entry in resp:
                 # impacket can return SearchResultReference/Done entries with no
                 # 'attributes' — guard per-entry so they don't abort the loop.
@@ -1976,7 +2148,7 @@ class ADConnection:
                         try: self.forest_func = int(v)
                         except ValueError: pass
         except Exception as e:
-            if self.args.verbose:
+            if getattr(self.args, "verbose", False):
                 print(f"[!] RootDSE read failed: {e}")
         if not self.base_dn:
             self.base_dn = ",".join(f"DC={p}" for p in self.args.domain.split("."))
@@ -1984,6 +2156,14 @@ class ADConnection:
             self.cfg_nc = f"CN=Configuration,{self.base_dn}"
         if not self.sch_nc:
             self.sch_nc = f"CN=Schema,{self.cfg_nc}"
+
+    def adopt_impacket(self, ldap_connection) -> bool:
+        """Reuse an already-authenticated impacket LDAPConnection (e.g. NetExec's
+        connection.ldap_connection) instead of binding ourselves — this is what
+        lets the engine run as an `nxc ldap -M scout` module (roadmap item 8).
+        All of SCOUT's impacket-backend search code keys off self._impacket."""
+        self._impacket = ldap_connection
+        self._load_rootdse_impacket()
         return True
 
     def _impacket_search(self, base: str, flt: str, attrs: List[str],
@@ -2059,8 +2239,14 @@ class ADConnection:
                 generator=True)
             for entry in gen:
                 if entry.get("type") == "searchResEntry":
+                    # Use raw_attributes (always bytes), NOT attributes: with
+                    # get_info=DSA there is no schema, so ldap3 leaves objectSid /
+                    # other binary values as an undecoded str-of-bytes that
+                    # sid_to_str can't parse. raw_attributes gives bytes, matching
+                    # the impacket backend exactly — both paths now flow through
+                    # to_text()/sid_to_str()/get_int() uniformly.
                     results.append({"dn": entry["dn"],
-                                    "attrs": entry["attributes"]})
+                                    "attrs": entry["raw_attributes"]})
         except LDAPException as e:
             if self.args.verbose:
                 print(f"[!] LDAP search error ({base}, {flt}): {e}")
@@ -2069,6 +2255,52 @@ class ADConnection:
     def search_one(self, base: str, flt: str, attrs: List[str]) -> Optional[Dict]:
         r = self.paged_search(base, flt, attrs, page_size=5)
         return r[0] if r else None
+
+    def fetch_sd(self, dn: str, sdflags: int = 0x07) -> Optional[bytes]:
+        """Backend-agnostic single-object nTSecurityDescriptor read, with the
+        LDAP_SERVER_SD_FLAGS control so the DACL is returned. Returns raw SD
+        bytes or None. Centralizing this means checks no longer reach into the
+        ldap3-only `self.conn` API directly (which silently did nothing on the
+        Kerberos/impacket backend — e.g. the DNS-zone and OU ACL checks)."""
+        if getattr(self, "_impacket", None):
+            try:
+                from impacket.ldap.ldapasn1 import Control, Scope as LDAPScope
+                from pyasn1.codec.ber import encoder
+                from pyasn1.type import univ
+                ctrl = Control(); ctrl["controlType"] = "1.2.840.113556.1.4.801"
+                seq = univ.Sequence(); seq.setComponentByPosition(0, univ.Integer(sdflags))
+                ctrl["controlValue"] = encoder.encode(seq)
+                res = self._impacket.search(
+                    searchBase=dn, searchFilter="(objectClass=*)",
+                    scope=LDAPScope("baseObject"), attributes=["nTSecurityDescriptor"],
+                    searchControls=[ctrl])
+                for entry in res:
+                    try:
+                        for attr in entry["attributes"]:
+                            if str(attr["type"]) == "nTSecurityDescriptor" and attr["vals"]:
+                                return bytes(attr["vals"][0])
+                    except Exception:
+                        continue
+            except Exception as e:
+                if self.args.verbose:
+                    print(f"[!] fetch_sd (impacket) failed for {dn}: {e}")
+            return None
+        try:
+            from ldap3.protocol.microsoft import security_descriptor_control as sdc
+            # NOTE: security_descriptor_control() returns a list already; pass it
+            # directly (controls=...), never wrapped in [ ].
+            self.conn.search(dn, "(objectClass=*)", ldap3.BASE,
+                             attributes=["nTSecurityDescriptor"],
+                             controls=sdc(sdflags=sdflags))
+            for entry in self.conn.response:
+                if entry.get("type") == "searchResEntry":
+                    raw = entry.get("raw_attributes", {}).get("nTSecurityDescriptor", [])
+                    if raw:
+                        return raw[0] if isinstance(raw, list) else raw
+        except Exception as e:
+            if self.args.verbose:
+                print(f"[!] fetch_sd (ldap3) failed for {dn}: {e}")
+        return None
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AD DATA COLLECTOR
@@ -2092,10 +2324,12 @@ class ADData:
         self.dcs:           List[Dict] = []
         self.rodcs:         List[Dict] = []
         self.trusts:        List[Dict] = []
+        self.trust_map:     List[Dict] = []   # classified trusts (scope/transitivity/risks)
         self.gpos:          List[Dict] = []
         self.sites:         List[Dict] = []
         self.subnets:       List[Dict] = []
         self.psoes:         List[Dict] = []
+        self.ous:           List[Dict] = []
         self.cert_templates:List[Dict] = []
         self.enrollment_svcs:List[Dict] = []
         self.dns_zones:     List[Dict] = []
@@ -2140,6 +2374,7 @@ class ADData:
             ("GPOs",                     self._collect_gpos),
             ("sites/subnets",            self._collect_sites),
             ("password settings objects",self._collect_psoes),
+            ("OUs / GPO links",          self._collect_ous),
         ]
         if not self.args.no_adcs:
             steps.append(("ADCS objects", self._collect_adcs))
@@ -2263,7 +2498,7 @@ class ADData:
             "msDS-AllowedToDelegateTo","msDS-AllowedToActOnBehalfOfOtherIdentity",
             "ms-Mcs-AdmPwdExpirationTime","msLAPS-PasswordExpirationTime",
             "distinguishedName","msDS-IsRODC","primaryGroupID","whenCreated",
-            "objectSid","name","dNSHostName","logonCount"])
+            "objectSid","name","logonCount"])
 
     # ── groups ────────────────────────────────────────────────────────────────
 
@@ -2364,7 +2599,7 @@ class ADData:
     def _collect_sites(self):
         self.sites = self.conn.paged_search(
             f"CN=Sites,{self.cfg}",
-            "(objectClass=site)", ["cn","distinguishedName"])
+            "(objectClass=site)", ["cn","distinguishedName","gPLink"])
         self.subnets = self.conn.paged_search(
             f"CN=Subnets,CN=Sites,{self.cfg}",
             "(objectClass=subnet)", ["cn","siteObject","description"])
@@ -2379,6 +2614,16 @@ class ADData:
             "msDS-MaximumPasswordAge","msDS-LockoutThreshold",
             "msDS-AppliesTo","msDS-PasswordHistoryLength",
             "msDS-PSOAppliesTo"])
+
+    # ── OUs / GPO links ───────────────────────────────────────────────────────
+
+    def _collect_ous(self):
+        # gPLink on OUs (and the domain root, already collected) lets the
+        # control-path analyzer resolve which GPOs actually apply to DCs/Tier-0
+        # rather than assuming every GPO reaches Tier 0.
+        self.ous = self.conn.paged_search(
+            self.base, "(objectClass=organizationalUnit)",
+            ["distinguishedName", "name", "gPLink", "gPOptions"])
 
     # ── ADCS ─────────────────────────────────────────────────────────────────
 
@@ -2470,7 +2715,168 @@ class CheckEngine:
         self._m_sccm()
         self._m_pre2k_computers()
         self._m_weak_lockout()
+        self._m_managed_accounts()
+        self._m_kds_root_key()
+        self._m_entra()
+        self._m_orphaned_gpos()
         self._m_control_paths()
+
+    def _m_managed_accounts(self):
+        """gMSA / dMSA whose managed password a broad principal may read (roadmap
+        item 2). msDS-GroupMSAMembership names who can retrieve msDS-ManagedPassword."""
+        if not HAS_IMPACKET_LDAP:
+            return
+        try:
+            objs = self.d.conn.paged_search(
+                self.d.base,
+                "(|(objectClass=msDS-GroupManagedServiceAccount)"
+                "(objectClass=msDS-DelegatedManagedServiceAccount))",
+                ["sAMAccountName", "msDS-GroupMSAMembership",
+                 "servicePrincipalName", "memberOf"])
+        except Exception:
+            objs = []
+        broad = self._broad_low_priv_sids()
+        affected = []
+        for o in objs:
+            a = o["attrs"]; sam = get_str(a, "sAMAccountName")
+            raw = a.get("msDS-GroupMSAMembership")
+            if isinstance(raw, list):
+                raw = raw[0] if raw else None
+            if not isinstance(raw, (bytes, bytearray)):
+                continue
+            try:
+                sd = _ldaptypes.SR_SECURITY_DESCRIPTOR(data=raw)
+            except Exception:
+                continue
+            dacl = sd["Dacl"]
+            if not dacl:
+                continue
+            readers = []
+            for ace in dacl["Data"]:
+                try:
+                    if "DENIED" in ace["TypeName"].upper():
+                        continue
+                    sidstr = ace["Ace"]["Sid"].formatCanonical()
+                except Exception:
+                    continue
+                if sidstr in broad:
+                    readers.append(broad[sidstr])
+            if readers:
+                affected.append(f"{sam} ← {', '.join(_dedup_keep_order(readers))}")
+        if affected:
+            self._add("P-GMSAReadable",
+                      "A broad principal can retrieve these managed (gMSA/dMSA) "
+                      "passwords. Read the password, derive the NT hash and "
+                      "authenticate as the (often privileged) service account. "
+                      "Principal(s) after '←' can read it.",
+                      affected)
+
+    def _m_kds_root_key(self):
+        """KDS root key over-exposure — GoldenGMSA offline compromise (roadmap 2).
+
+        Report only when a BROAD / low-privileged principal is granted read on the
+        KDS root key object, parsed from its security descriptor. Keying off "can
+        the current bind read msKds-RootKeyData" was a false positive: by Windows
+        design only SYSTEM/Domain Admins can read it, so a privileged bind (a
+        supported run mode) would trip it on every healthy domain."""
+        if not HAS_IMPACKET_LDAP:
+            return
+        base = (f"CN=Master Root Keys,CN=Group Key Distribution Service,"
+                f"CN=Services,{self.d.cfg}")
+        try:
+            keys = self.d.conn.paged_search(
+                base, "(objectClass=msKds-ProvRootKey)",
+                ["cn", "nTSecurityDescriptor", "whenCreated"])
+        except Exception:
+            keys = []
+        broad = self._broad_low_priv_sids()
+        READ_RIGHTS = (self._ADS_GENERIC_ALL | 0x80000000     # GENERIC_ALL | GENERIC_READ
+                       | 0x00000010 | self._ADS_CONTROL_ACCESS)  # READ_PROP | CONTROL_ACCESS
+        affected = []
+        for k in keys:
+            raw = k["attrs"].get("nTSecurityDescriptor")
+            if isinstance(raw, list):
+                raw = raw[0] if raw else None
+            if not isinstance(raw, (bytes, bytearray)):
+                continue
+            try:
+                sd = _ldaptypes.SR_SECURITY_DESCRIPTOR(data=raw)
+            except Exception:
+                continue
+            dacl = sd["Dacl"]
+            if not dacl:
+                continue
+            readers = []
+            for ace in dacl["Data"]:
+                try:
+                    if "DENIED" in ace["TypeName"].upper():
+                        continue
+                    mask = int(ace["Ace"]["Mask"]["Mask"])
+                    sidstr = ace["Ace"]["Sid"].formatCanonical()
+                except Exception:
+                    continue
+                if sidstr in broad and (mask & READ_RIGHTS):
+                    readers.append(broad[sidstr])
+            if readers:
+                cn = get_str(k["attrs"], "cn") or dn_base(k.get("dn", ""))
+                affected.append(f"{cn} ← {', '.join(_dedup_keep_order(readers))}")
+        if affected:
+            self._add("A-KDSRootKey",
+                      "A broad / low-privileged principal is granted read on the KDS "
+                      "root key (principal(s) after '←'). With the root key, every "
+                      "gMSA password in the forest can be computed offline "
+                      "(GoldenGMSA) — only Domain Admins/SYSTEM should be able to "
+                      "read it.",
+                      affected)
+
+    def _m_entra(self):
+        """On-prem-readable Entra / AAD-Connect indicators (roadmap item 3)."""
+        msol = []
+        for u in self.d.users:
+            sam = get_str(u["attrs"], "sAMAccountName")
+            if sam.upper().startswith("MSOL_"):
+                msol.append(sam)
+        if msol:
+            self._add("A-AADConnectSync",
+                      "Azure AD Connect synchronization account(s) found. The "
+                      "on-prem sync account holds DCSync rights (for Password Hash "
+                      "Sync); compromising the AD Connect host recovers its "
+                      "credentials and bridges on-prem AD ⇄ Entra ID.",
+                      msol)
+        for c in self.d.computers:
+            sam = get_str(c["attrs"], "sAMAccountName")
+            if sam.upper().rstrip("$") == "AZUREADSSOACC":
+                age = days_since(filetime_to_dt(get_int(c["attrs"], "pwdLastSet")))
+                if age is not None and age > 90:
+                    self._add("A-SeamlessSSO",
+                              f"Entra Seamless SSO account {sam} key is {age} days "
+                              "old (recommended rotation: 30 days). A recovered "
+                              "stale key allows forging silver tickets to Entra ID "
+                              "as any synced user.",
+                              [f"{sam} (pwd {age}d old)"])
+
+    def _m_orphaned_gpos(self):
+        """OU/gPLink inventory — GPOs linked nowhere (roadmap item 5)."""
+        linked = set()
+        gplinks = []
+        if self.d.domain_obj:
+            gplinks.append(get_str(self.d.domain_obj["attrs"], "gPLink"))
+        for cont in list(getattr(self.d, "ous", [])) + list(self.d.sites):
+            gplinks.append(get_str(cont["attrs"], "gPLink"))
+        for gp in gplinks:
+            for gdn in ControlPathAnalyzer._parse_gplink(gp):
+                linked.add(gdn.lower())
+        orphaned = []
+        for g in self.d.gpos:
+            dn = g.get("dn", "")
+            if dn and dn.lower() not in linked:
+                orphaned.append(get_str(g["attrs"], "displayName") or dn_base(dn))
+        if orphaned:
+            self._add("S-OrphanedGPO",
+                      "These GPOs are not linked to the domain, any OU or any "
+                      "site — they apply to nothing but retain their settings and "
+                      "DACLs. Review and remove, or relink if they should be active.",
+                      orphaned)
 
     def _m_control_paths(self):
         cp = getattr(self.d, "control_paths", None) or {}
@@ -2635,6 +3041,55 @@ class CheckEngine:
         dcdns = {d["dn"] for d in self.d.dcs}
         return dn in dcdns
 
+    def _sid_index(self) -> Dict[str, str]:
+        """objectSid -> sAMAccountName for every collected user/computer/group,
+        plus well-known SIDs. Used to resolve the principals named inside a
+        security descriptor (e.g. an RBCD allow-list) to readable names."""
+        if getattr(self, "_sid_idx_cache", None) is not None:
+            return self._sid_idx_cache
+        idx: Dict[str, str] = {}
+        for obj in self.d.users + self.d.computers + list(self.d.groups.values()):
+            raw = obj["attrs"].get("objectSid")
+            if isinstance(raw, list):
+                raw = raw[0] if raw else None
+            s = sid_to_str(raw) if raw else ""
+            if s:
+                idx[s] = get_str(obj["attrs"], "sAMAccountName") or dn_base(obj.get("dn", ""))
+        idx.setdefault("S-1-1-0", "Everyone")
+        idx.setdefault("S-1-5-11", "Authenticated Users")
+        idx.setdefault("S-1-5-7", "Anonymous Logon")
+        self._sid_idx_cache = idx
+        return idx
+
+    def _rbcd_allowed_principals(self, a) -> List[str]:
+        """Principals named in msDS-AllowedToActOnBehalfOfOtherIdentity — i.e. the
+        accounts that can already use S4U to impersonate any user TO this object.
+        These are the specific principals an operator needs (issue #4); the bare
+        target name alone doesn't say who holds the delegation."""
+        raw = a.get("msDS-AllowedToActOnBehalfOfOtherIdentity")
+        if isinstance(raw, list):
+            raw = raw[0] if raw else None
+        if not isinstance(raw, (bytes, bytearray)) or not HAS_IMPACKET_LDAP:
+            return []
+        try:
+            sd = _ldaptypes.SR_SECURITY_DESCRIPTOR(data=raw)
+        except Exception:
+            return []
+        idx = self._sid_index()
+        out: List[str] = []
+        dacl = sd["Dacl"]
+        if not dacl:
+            return []
+        for ace in dacl["Data"]:
+            try:
+                if "DENIED" in ace["TypeName"].upper():
+                    continue
+                sidstr = ace["Ace"]["Sid"].formatCanonical()
+            except Exception:
+                continue
+            out.append(idx.get(sidstr, sidstr))
+        return _dedup_keep_order(out)
+
     def _m_rbcd(self):
         dc_dns = {d["dn"] for d in self.d.dcs}
         normal, dangerous = [], []
@@ -2644,23 +3099,28 @@ class CheckEngine:
                and not get_str(a, "msDS-AllowedToActOnBehalfOfOtherIdentity"):
                 continue
             sam = get_str(a, "sAMAccountName")
+            allowed = self._rbcd_allowed_principals(a)
+            who = ", ".join(allowed) if allowed else "principals unreadable from SD"
+            entry = f"{sam} ← {who}"
             if obj["dn"] in dc_dns:
-                dangerous.append(sam)
+                dangerous.append(entry)
             else:
-                normal.append(sam)
+                normal.append(entry)
         if dangerous:
             self._add("P-RBCD-Dangerous",
                       "Resource-based constrained delegation is configured on a "
-                      "domain controller object. Anyone able to write that SD can "
-                      "impersonate any user to the DC (instant domain compromise).",
+                      "domain controller object. The principal(s) named in the SD "
+                      "(shown after '←') can use S4U to impersonate any user to the "
+                      "DC — instant domain compromise. Investigate how it was set; "
+                      "if you control a named principal, exploit it directly.",
                       dangerous)
         if normal:
             self._add("P-RBCD",
                       "These accounts have msDS-AllowedToActOnBehalfOfOtherIdentity "
-                      "set (resource-based constrained delegation). If an attacker "
-                      "controls an allowed principal (or can add one via "
-                      "MachineAccountQuota) they impersonate any user to the host. "
-                      "Validate every configured delegation.",
+                      "set (resource-based constrained delegation). The principal(s) "
+                      "after '←' can impersonate any user to the host; if you control "
+                      "one (or can add one via MachineAccountQuota) you take over the "
+                      "host. Validate every configured delegation.",
                       normal)
 
     def _m_constrained_delegation(self):
@@ -3001,20 +3461,13 @@ class CheckEngine:
         risky_zones: List[str] = []
         for z in self.d.dns_zones:
             zname = get_str(z["attrs"], "name") or z["dn"]
-            # Re-fetch zone with SACL/DACL flags so the DACL is actually returned
+            # Re-fetch zone SD with the DACL flag (backend-agnostic — the old
+            # direct ldap3 search did nothing on the Kerberos/impacket backend).
             try:
-                ctl = security_descriptor_control(sdflags=0x07)
-                self.d.conn.conn.search(
-                    z["dn"], "(objectClass=*)",
-                    attributes=["nTSecurityDescriptor"],
-                    controls=ctl)
-                entries = self.d.conn.conn.entries
-                if not entries:
-                    continue
-                sd_raw = entries[0]["nTSecurityDescriptor"].raw_values
+                sd_raw = self.d.conn.fetch_sd(z["dn"])
                 if not sd_raw:
                     continue
-                sd = _ldaptypes.SR_SECURITY_DESCRIPTOR(data=sd_raw[0])
+                sd = _ldaptypes.SR_SECURITY_DESCRIPTOR(data=sd_raw)
                 dacl = sd["Dacl"]
                 if not dacl:
                     continue
@@ -3109,38 +3562,53 @@ class CheckEngine:
             has_any_eku      = self._ANY_PURPOSE_OID in ekus
             no_eku           = not ekus
 
+            # Enrollment-based escalations (ESC1/2/3/9) are only attacker-reachable
+            # if a broad / low-priv principal can actually enroll. When only Tier-0
+            # (EA/DA) hold the Enroll right, reporting is a false positive (issue
+            # #2). If the SD can't be parsed we still report, with a caveat.
+            enrollers, enroll_parsed = self._template_low_priv_enrollers(tmpl)
+            enroll_reachable = bool(enrollers) or not enroll_parsed
+            if enrollers:
+                enroll_note = " Low-priv enrollers: " + ", ".join(enrollers) + "."
+            elif not enroll_parsed:
+                enroll_note = " (Enrollment rights could not be verified — confirm who can enroll.)"
+            else:
+                enroll_note = ""
+
             # ESC1: enrollee supplies subject + auth EKU + no manager approval
             if (name_flag & self._CT_ENROLLEE_SUPPLIES_SUBJECT
                     and has_auth_eku
-                    and not manager_approval):
+                    and not manager_approval
+                    and enroll_reachable):
                 ca_names = [get_str(s["attrs"],"cn") for s in self.d.enrollment_svcs
                             if cn in get_list(s["attrs"],"certificateTemplates")]
                 self._add("A-CertTempCustomSubject",
                           f"ESC1: Template '{cn}' allows enrollee-supplied Subject/SAN "
                           f"with authentication EKU and no manager approval. Published on CA(s): "
-                          f"{', '.join(ca_names) or 'unknown'}. "
+                          f"{', '.join(ca_names) or 'unknown'}.{enroll_note} "
                           "Attack: request cert with arbitrary UPN (e.g., Domain Admin) and "
                           "use PKINIT to obtain a TGT. "
                           "certipy find -vulnerable / req -template <tmpl> -upn administrator@domain",
                           [cn] + ca_names)
 
             # ESC2: any purpose EKU (no EKU restriction) + no manager approval
-            if (has_any_eku or no_eku) and not manager_approval:
+            if (has_any_eku or no_eku) and not manager_approval and enroll_reachable:
                 ca_names = [get_str(s["attrs"],"cn") for s in self.d.enrollment_svcs
                             if cn in get_list(s["attrs"],"certificateTemplates")]
                 self._add("A-CertTempAnyPurpose",
                           f"ESC2: Template '{cn}' has Any Purpose EKU or no EKU restrictions "
-                          f"and no manager approval. Published on: {', '.join(ca_names) or 'unknown'}. "
+                          f"and no manager approval. Published on: {', '.join(ca_names) or 'unknown'}.{enroll_note} "
                           "Can be used as an enrollment agent or to authenticate as any user.",
                           [cn])
 
             # ESC3: Certificate Request Agent EKU without RA signature
-            if self._CERT_REQUEST_AGENT in ekus and ra_sig == 0 and not manager_approval:
+            if (self._CERT_REQUEST_AGENT in ekus and ra_sig == 0
+                    and not manager_approval and enroll_reachable):
                 ca_names = [get_str(s["attrs"],"cn") for s in self.d.enrollment_svcs
                             if cn in get_list(s["attrs"],"certificateTemplates")]
                 self._add("A-CertTempAgent",
                           f"ESC3: Template '{cn}' has Certificate Request Agent EKU with no "
-                          f"RA signature requirement. Published on: {', '.join(ca_names) or 'unknown'}. "
+                          f"RA signature requirement. Published on: {', '.join(ca_names) or 'unknown'}.{enroll_note} "
                           "Allows enrolling on behalf of any user — combine with ESC2 template "
                           "to impersonate Domain Admin.",
                           [cn])
@@ -3153,16 +3621,16 @@ class CheckEngine:
                           f"principal(s): {', '.join(esc4)}. They can reconfigure it "
                           "into an ESC1 (enrollee-supplied SAN + auth EKU) and then "
                           "impersonate any user. certipy template -template "
-                          f"{cn} ... to weaponise.",
+                          f"{cn} ... to weaponize.",
                           [f"{cn} writable by {p}" for p in esc4])
 
             # ESC9: no security extension on an auth template (weak cert mapping)
-            if (enroll_flag & self._CT_NO_SECURITY_EXTENSION) and has_auth_eku:
+            if (enroll_flag & self._CT_NO_SECURITY_EXTENSION) and has_auth_eku and enroll_reachable:
                 self._add("A-CertTemplateESC9",
                           f"ESC9: Template '{cn}' sets CT_FLAG_NO_SECURITY_EXTENSION with an "
-                          "authentication EKU — the issued cert omits the SID security "
-                          "extension, so AD falls back to weak (UPN) mapping. With write access "
-                          "to a victim's userPrincipalName this allows authenticating as them.",
+                          f"authentication EKU — the issued cert omits the SID security "
+                          f"extension, so AD falls back to weak (UPN) mapping. With write access "
+                          f"to a victim's userPrincipalName this allows authenticating as them.{enroll_note}",
                           [cn])
 
         # ESC7: low-privileged principal holds CA management rights
@@ -3182,8 +3650,14 @@ class CheckEngine:
     _ADS_WRITE_DACL    = 0x00040000
     _ADS_WRITE_OWNER   = 0x00080000
     _ADS_WRITE_PROP    = 0x00000020
+    _ADS_CONTROL_ACCESS= 0x00000100          # DS-Control-Access (extended right / enroll)
     _CT_NO_SECURITY_EXTENSION = 0x00080000   # msPKI-Enrollment-Flag bit
     _CA_MANAGE_RIGHTS  = 0x00000003          # ManageCA (0x1) | ManageCertificates (0x2)
+    # Extended-right GUIDs that grant certificate enrollment on a template.
+    _ENROLL_GUIDS = {
+        "0e10c968-78fb-11d2-90d4-00c04f79dc55",  # Certificate-Enrollment
+        "a05b8cc2-17bc-4802-a710-e7c15ab866a2",  # Certificate-AutoEnrollment
+    }
 
     def _esc7_ca_managers(self, svc) -> List[str]:
         """Low-privileged principals with CA management rights (ESC7)."""
@@ -3200,7 +3674,7 @@ class CheckEngine:
             return []
         broad = self._broad_low_priv_sids()
         out = []
-        dacl = sd.get("Dacl")
+        dacl = sd["Dacl"]
         if not dacl:
             return []
         for ace in dacl["Data"]:
@@ -3251,7 +3725,7 @@ class CheckEngine:
                      | self._ADS_WRITE_DACL | self._ADS_WRITE_OWNER
                      | self._ADS_WRITE_PROP)
         writers: List[str] = []
-        dacl = sd.get("Dacl")
+        dacl = sd["Dacl"]
         if not dacl:
             return []
         for ace in dacl["Data"]:
@@ -3265,6 +3739,59 @@ class CheckEngine:
             if sidstr in broad and (mask & dangerous):
                 writers.append(broad[sidstr])
         return _dedup_keep_order(writers)
+
+    def _template_low_priv_enrollers(self, tmpl: Dict) -> Tuple[List[str], bool]:
+        """Which broad / low-privileged principals can ENROLL in this template.
+
+        Returns (principals, parsed_ok). The ESC1/2/3/9 escalations all require a
+        low-priv attacker to be able to enroll; if only Tier-0 (EA/DA) hold the
+        Enroll right the template is not attacker-reachable and reporting it is a
+        false positive (issue #2). parsed_ok is False when the security descriptor
+        could not be read/parsed, so the caller can fall back to reporting with a
+        caveat rather than silently dropping a possibly-real finding."""
+        if not HAS_IMPACKET_LDAP:
+            return [], False
+        raw = tmpl["attrs"].get("nTSecurityDescriptor")
+        if isinstance(raw, list):
+            raw = raw[0] if raw else None
+        if not isinstance(raw, (bytes, bytearray)):
+            return [], False
+        try:
+            sd = _ldaptypes.SR_SECURITY_DESCRIPTOR(data=raw)
+        except Exception:
+            return [], False
+        broad = self._broad_low_priv_sids()
+        dacl = sd["Dacl"]
+        if not dacl:
+            return [], True
+        out: List[str] = []
+        for ace in dacl["Data"]:
+            try:
+                if ace["AceType"] not in (0x00, 0x05):  # ALLOWED / ALLOWED_OBJECT
+                    continue
+                mask = int(ace["Ace"]["Mask"]["Mask"])
+                sidstr = ace["Ace"]["Sid"].formatCanonical()
+            except Exception:
+                continue
+            if sidstr not in broad:
+                continue
+            # GenericAll always confers enrollment.
+            if mask & self._ADS_GENERIC_ALL:
+                out.append(broad[sidstr]); continue
+            # Control-access (extended right). For object ACEs it only grants
+            # enroll when the ObjectType is the Enroll/AutoEnroll GUID (or absent,
+            # which means "all extended rights" and therefore includes enroll).
+            if mask & self._ADS_CONTROL_ACCESS:
+                ot = _ace_object_type(ace["Ace"]) if ace["AceType"] == 0x05 else b""
+                if not ot or len(ot) != 16:
+                    out.append(broad[sidstr]); continue
+                try:
+                    guid = _guid_from_bytes(bytes(ot)).strip("{}").lower()
+                except Exception:
+                    guid = ""
+                if guid in self._ENROLL_GUIDS:
+                    out.append(broad[sidstr])
+        return _dedup_keep_order(out), True
 
     def _a_member_everyone(self):
         everyone_patterns = ["everyone","s-1-1-0","authenticated users",
@@ -3443,11 +3970,73 @@ class CheckEngine:
         self._p_unprotected_ous()
         self._p_everyone_privs()
 
+    def _priv_last_logon_map(self) -> Dict[str, int]:
+        """Roadmap item 7: max non-replicated lastLogon per privileged account
+        across ALL DCs. lastLogonTimestamp replicates but lags up to ~14 days, so
+        an admin who only ever logs on to one DC can look stale/never-logged-on.
+        Only runs under --accurate-logon (extra per-DC binds). Cached."""
+        if getattr(self, "_pll_cache", None) is not None:
+            return self._pll_cache
+        cache: Dict[str, int] = {}
+        if not getattr(self.args, "accurate_logon", False):
+            self._pll_cache = cache
+            return cache
+        from ldap3.utils.conv import escape_filter_chars
+        sams = set()
+        for members in self.d.priv_group_members.values():
+            for m in members:
+                s = get_str(m["attrs"], "sAMAccountName")
+                if s:
+                    sams.add(s)
+        if not sams:
+            self._pll_cache = cache
+            return cache
+        flt = "(|" + "".join(f"(sAMAccountName={escape_filter_chars(s)})" for s in sams) + ")"
+        hosts = [get_str(d["attrs"], "dNSHostName") for d in self.d.dcs
+                 if get_str(d["attrs"], "dNSHostName")] or [self.args.dc_ip]
+        import copy
+        for host in _dedup_keep_order(hosts):
+            try:
+                a = copy.copy(self.args)
+                a.dc_ip = host; a.dc_host = host
+                sub = ADConnection(a)
+                if not sub.connect():
+                    continue
+                for r in sub.paged_search(self.d.base, flt, ["sAMAccountName", "lastLogon"]):
+                    sam = get_str(r["attrs"], "sAMAccountName").lower()
+                    ll = get_int(r["attrs"], "lastLogon")
+                    if ll > cache.get(sam, 0):
+                        cache[sam] = ll
+            except Exception as e:
+                if self.args.verbose:
+                    print(f"[!] --accurate-logon: DC {host} query failed: {e}")
+        self._pll_cache = cache
+        return cache
+
+    def _reconciled_logon_age(self, m) -> Optional[int]:
+        """Newest logon age (days) for an account: min of lastLogonTimestamp age
+        and the per-DC lastLogon age (when --accurate-logon). None = never."""
+        llt = get_int(m["attrs"], "lastLogonTimestamp")
+        best = llt
+        sam = get_str(m["attrs"], "sAMAccountName").lower()
+        ll = self._priv_last_logon_map().get(sam, 0)
+        if ll > best:
+            best = ll
+        return days_since(filetime_to_dt(best))
+
+    @staticmethod
+    def _is_user_account(m) -> bool:
+        """True for a real user/computer account, False for a nested GROUP. Group
+        members of a privileged group have no userAccountControl, so they were
+        wrongly counted as 'admin accounts' and flagged inactive/never-logged-on."""
+        return bool(m["attrs"].get("userAccountControl"))
+
     def _p_admin_count(self):
         da = self.d.priv_group_members.get("Domain Admins", [])
         active_admins = [m for m in da
-                         if not uac_has(get_int(m["attrs"],"userAccountControl"),
-                                        UAC_ACCOUNTDISABLE)]
+                         if self._is_user_account(m)
+                         and not uac_has(get_int(m["attrs"],"userAccountControl"),
+                                         UAC_ACCOUNTDISABLE)]
         threshold = 5
         if len(active_admins) > threshold:
             names = [get_str(m["attrs"],"sAMAccountName") for m in active_admins]
@@ -3455,11 +4044,11 @@ class CheckEngine:
                       f"{len(active_admins)} active Domain Admin accounts found "
                       f"(recommended ≤ {threshold}). Reduce attack surface.",
                       names[:30])
-        # Check for admins that have never logged in
+        # Check for admins that have never logged in (reconciled across DCs when
+        # --accurate-logon, so a DA who only logs on to one DC isn't a false hit).
         never_logon = []
         for m in active_admins:
-            llt = get_int(m["attrs"], "lastLogonTimestamp")
-            if llt == 0:
+            if self._reconciled_logon_age(m) is None:
                 never_logon.append(get_str(m["attrs"], "sAMAccountName"))
         if never_logon:
             self._add("P-AdminLogin",
@@ -3475,31 +4064,49 @@ class CheckEngine:
                       with_mail[:20])
 
     def _p_admin_pwd_age(self):
-        for grpname in ["Domain Admins","Administrators","Enterprise Admins"]:
+        # Dedup by account across the three groups, then emit ONE finding with an
+        # affected list — previously this added a separate finding per admin,
+        # flooding the report (e.g. 16 identical HIGH entries) and inflating the
+        # finding count.
+        members = {}
+        for grpname in ["Domain Admins", "Administrators", "Enterprise Admins"]:
             for m in self.d.priv_group_members.get(grpname, []):
-                uac = get_int(m["attrs"], "userAccountControl")
-                if uac_has(uac, UAC_ACCOUNTDISABLE):
+                if not self._is_user_account(m):   # skip nested groups
                     continue
-                pls = filetime_to_dt(get_int(m["attrs"], "pwdLastSet"))
-                age = days_since(pls)
-                if age is None or age > 90:
-                    sam = get_str(m["attrs"], "sAMAccountName")
-                    age_str = f"{age} days" if age is not None else "NEVER"
-                    self._add("P-AdminPwdTooOld",
-                              f"{sam} ({grpname}): password last set {age_str} ago.",
-                              [sam])
+                sam = get_str(m["attrs"], "sAMAccountName") or dn_base(m.get("dn", ""))
+                members.setdefault(sam, (grpname, m))
+        affected = []
+        for sam, (grpname, m) in members.items():
+            if uac_has(get_int(m["attrs"], "userAccountControl"), UAC_ACCOUNTDISABLE):
+                continue
+            age = days_since(filetime_to_dt(get_int(m["attrs"], "pwdLastSet")))
+            if age is None or age > 90:
+                age_str = f"{age} days" if age is not None else "NEVER"
+                affected.append(f"{sam} ({grpname}): password last set {age_str} ago")
+        if affected:
+            self._add("P-AdminPwdTooOld",
+                      f"{len(affected)} privileged account(s) have a password older "
+                      "than 90 days. Long-lived Tier-0 credentials are prime targets "
+                      "for offline cracking and replay — rotate them and prefer gMSA "
+                      "for service identities.",
+                      affected)
 
     def _p_inactive_admins(self):
         affected = []
+        seen = set()
         for grpname in ["Domain Admins","Enterprise Admins","Administrators"]:
             for m in self.d.priv_group_members.get(grpname, []):
+                if not self._is_user_account(m):   # skip nested groups
+                    continue
                 uac = get_int(m["attrs"], "userAccountControl")
                 if uac_has(uac, UAC_ACCOUNTDISABLE):
                     continue
-                llt = filetime_to_dt(get_int(m["attrs"], "lastLogonTimestamp"))
-                age = days_since(llt)
+                sam = get_str(m["attrs"], "sAMAccountName")
+                if sam in seen:
+                    continue
+                age = self._reconciled_logon_age(m)
                 if age is None or age > 180:
-                    sam = get_str(m["attrs"], "sAMAccountName")
+                    seen.add(sam)
                     age_str = f"{age} days" if age is not None else "NEVER"
                     affected.append(f"{sam} (last logon: {age_str})")
         if affected:
@@ -3703,16 +4310,10 @@ class CheckEngine:
             if not (len(parts) == 1 or is_dc_ou):
                 continue
             try:
-                ctl = security_descriptor_control(sdflags=0x07)
-                self.d.conn.conn.search(dn, "(objectClass=*)",
-                    attributes=["nTSecurityDescriptor"], controls=ctl)
-                entries = self.d.conn.conn.entries
-                if not entries:
-                    continue
-                sd_raw = entries[0]["nTSecurityDescriptor"].raw_values
+                sd_raw = self.d.conn.fetch_sd(dn)
                 if not sd_raw:
                     continue
-                sd = _ldaptypes.SR_SECURITY_DESCRIPTOR(data=sd_raw[0])
+                sd = _ldaptypes.SR_SECURITY_DESCRIPTOR(data=sd_raw)
                 dacl = sd["Dacl"]
                 if not dacl:
                     continue
@@ -4200,6 +4801,9 @@ class CheckEngine:
     def _check_trust(self):
         for trust in self.d.trusts:
             self._t_check_trust(trust)
+        # Roadmap item 9: classify every trust (scope / transitivity / direction /
+        # SID-filtering) into a reachable-domains map for the report.
+        self.d.trust_map = [classify_trust(t["attrs"]) for t in self.d.trusts]
         self._t_azure_ad_sso()
 
     def _t_check_trust(self, trust: Dict):
@@ -4995,8 +5599,12 @@ _BROAD_SIDS = {
 
 # DCSync extended right GUIDs
 _DCSYNC_GUIDS = {
+    # DCSync needs Get-Changes (…aa) + Get-Changes-All (…ad). The "All" right is
+    # …f6ad — NOT …f6ab (that GUID is DS-Replication-Synchronize, which is not a
+    # DCSync primitive). The previous table had …f6ab here and would miss real
+    # Get-Changes-All ACEs.
     "1131f6aa-9c07-11d1-f79f-00c04fc2dcd2": "DS-Replication-Get-Changes",
-    "1131f6ab-9c07-11d1-f79f-00c04fc2dcd2": "DS-Replication-Get-Changes-All",
+    "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2": "DS-Replication-Get-Changes-All",
     "89e95b76-444d-4c62-991a-0facbeda640c": "DS-Replication-Get-Changes-In-Filtered-Set",
 }
 
@@ -5016,6 +5624,18 @@ def _guid_from_bytes(b: bytes) -> str:
         p2.hex(), p3.hex()
     )
 
+# impacket's *_OBJECT_ACE only carries ObjectType when the ACE_OBJECT_TYPE_PRESENT
+# (0x1) flag is set, and the ldaptypes structures have NO .get() — a bare
+# subscript KeyErrors and `.get()` AttributeErrors. Read it safely.
+def _ace_object_type(ace_struct) -> bytes:
+    """Return an object ACE's ObjectType GUID bytes, or b'' if not present."""
+    try:
+        if ace_struct["Flags"] & 0x01:   # ACE_OBJECT_TYPE_PRESENT
+            return bytes(ace_struct["ObjectType"])
+    except Exception:
+        pass
+    return b""
+
 
 class ACLAnalyzer:
     """Fetches and analyzes DACLs on high-value AD objects for dangerous ACEs."""
@@ -5031,7 +5651,7 @@ class ACLAnalyzer:
         if not HAS_IMPACKET_LDAP:
             print("[!] impacket not available — skipping ACL analysis")
             return
-        print("[*] Analysing ACLs on high-value objects...")
+        print("[*] Analyzing ACLs on high-value objects...")
         self._build_broad_sids()
         # Domain root object
         self._check_object_acl(
@@ -5087,47 +5707,9 @@ class ACLAnalyzer:
         return None
 
     def _fetch_sd(self, dn: str) -> Optional[bytes]:
-        if getattr(self.conn, "_impacket", None):
-            return self._fetch_sd_impacket(dn)
-        try:
-            from ldap3.protocol.microsoft import security_descriptor_control as sdc
-            sdctrl = sdc(sdflags=0x07)  # Owner+Group+DACL
-            self.conn.conn.search(
-                dn, "(objectClass=*)", ldap3.BASE,
-                attributes=["nTSecurityDescriptor"],
-                controls=[sdctrl])
-            for entry in self.conn.conn.response:
-                if entry.get("type") == "searchResEntry":
-                    raw_list = entry.get("raw_attributes", {}).get(
-                        "nTSecurityDescriptor", [])
-                    if raw_list:
-                        return raw_list[0] if isinstance(raw_list, list) else raw_list
-        except Exception:
-            pass
-        return None
-
-    def _fetch_sd_impacket(self, dn: str) -> Optional[bytes]:
-        try:
-            from impacket.ldap.ldapasn1 import Control, Scope as LDAPScope
-            from pyasn1.codec.ber import encoder
-            from pyasn1.type import univ
-            ctrl = Control()
-            ctrl["controlType"] = "1.2.840.113556.1.4.801"
-            seq = univ.Sequence()
-            seq.setComponentByPosition(0, univ.Integer(0x07))
-            ctrl["controlValue"] = encoder.encode(seq)
-            results = self.conn._impacket.search(
-                searchBase=dn, searchFilter="(objectClass=*)",
-                scope=LDAPScope("baseObject"),
-                attributes=["nTSecurityDescriptor"],
-                searchControls=[ctrl])
-            for entry in results:
-                for attr in entry["attributes"]:
-                    if str(attr["type"]) == "nTSecurityDescriptor" and attr["vals"]:
-                        return bytes(attr["vals"][0])
-        except Exception:
-            pass
-        return None
+        # Delegate to the backend-agnostic reader on ADConnection (the fixed
+        # SD-control logic lives in one place now).
+        return self.conn.fetch_sd(dn)
 
     def _parse_dacl(self, raw_sd: bytes):
         try:
@@ -5189,7 +5771,7 @@ class ACLAnalyzer:
                 # DCSync rights
                 if check_dcsync and "OBJECT" in ace_type.upper():
                     try:
-                        obj_type = ace["Ace"].get("ObjectType", b"")
+                        obj_type = _ace_object_type(ace["Ace"])
                         if obj_type and len(obj_type) == 16:
                             guid_str = _guid_from_bytes(bytes(obj_type))
                             dcsync_name = _DCSYNC_GUIDS.get(guid_str.strip("{}").lower())
@@ -5290,6 +5872,8 @@ class ControlPathAnalyzer:
         self.conn = conn; self.data = data; self.args = args
         self.sid2name = {}; self.dn2sid = {}; self.adj = defaultdict(list); self.radj = defaultdict(list)
         self.medges = defaultdict(list)  # membership-only (member -> group)
+        self.sid2obj = {}   # sid -> ("user"|"computer"|"group", obj)
+        self.dn2obj = {}    # dn.lower() -> ("user"|"computer"|"group", obj)
 
     def run(self):
         if not HAS_IMPACKET_LDAP:
@@ -5314,14 +5898,19 @@ class ControlPathAnalyzer:
 
     def _index(self):
         d = self.data
-        for obj in list(d.users) + list(d.computers) + list(d.groups.values()):
-            sid = self._sid_of(obj); dn = obj.get("dn","")
-            if not sid:
-                continue
-            sam = get_str(obj["attrs"], "sAMAccountName") or dn_base(dn)
-            self.sid2name[sid] = sam
-            if dn:
-                self.dn2sid[dn.lower()] = sid
+        for kind, objs in (("user", d.users), ("computer", d.computers),
+                           ("group", list(d.groups.values()))):
+            for obj in objs:
+                sid = self._sid_of(obj); dn = obj.get("dn","")
+                sam = get_str(obj["attrs"], "sAMAccountName") or dn_base(dn)
+                if dn:
+                    self.dn2obj[dn.lower()] = (kind, obj)
+                if not sid:
+                    continue
+                self.sid2name[sid] = sam
+                self.sid2obj[sid] = (kind, obj)
+                if dn:
+                    self.dn2sid[dn.lower()] = sid
         # well-known + domain-relative broad principals
         self.sid2name.update({"S-1-1-0":"Everyone","S-1-5-11":"Authenticated Users",
                               "S-1-5-7":"Anonymous Logon"})
@@ -5330,9 +5919,16 @@ class ControlPathAnalyzer:
         if d.domain_obj:
             dsid = self._sid_of(d.domain_obj)
         self.dsid = dsid
-        # Tier-0 seeds (group SIDs + domain root DN)
+        # Tier-0 seeds (group SIDs + domain root DN). 516/521/498 (Domain
+        # Controllers / Read-only DCs / Enterprise Read-only DCs) are Tier-0 too:
+        # without them, the DCs' legitimate, by-design DCSync rights on the domain
+        # root were reported as a "non-privileged principal -> DA" control path
+        # (e.g. "Domain Controllers --[DCSync]--> Domain root"). Seeding them also
+        # folds DC machine accounts into the admin membership-closure so they are
+        # not themselves flagged as control-path principals.
         self.seeds = set()
-        for rid in (512, 519, 518, 548, 551, 549, 550, 520):   # DA/EA/Schema/AcctOp/BackupOp/SrvOp/PrintOp/GPCreator
+        for rid in (512, 519, 518, 548, 551, 549, 550, 520,    # DA/EA/Schema/AcctOp/BackupOp/SrvOp/PrintOp/GPCreator
+                    516, 521, 498):                            # Domain Controllers / RODC / Enterprise RODC
             if dsid:
                 self.seeds.add(f"{dsid}-{rid}")
         self.seeds |= {"S-1-5-32-544", "S-1-5-32-548", "S-1-5-32-551", "S-1-5-32-549", "S-1-5-32-550"}
@@ -5376,29 +5972,77 @@ class ControlPathAnalyzer:
                     self._edge(self._sid_of(obj), gsid, "primary group", membership=True)
 
     def _acl_edges(self):
-        # bulk-read SDs for groups + privileged (adminCount) users; per-object for
-        # the domain root, AdminSDHolder and GPOs.
+        # Bulk-read SDs for groups, then for EVERY user and computer (roadmap 1 —
+        # objectClass=user matches computers too, so one paged query covers both).
+        # This catches paths routing through control over an arbitrary non-admin
+        # object (e.g. WriteDacl over a computer that is in a privileged group, or
+        # an RBCD/shadow-cred target), which the old admin-only read missed.
         for dn, sid, sd in self._bulk_sds("(objectClass=group)"):
             if sid:
                 self._add_acl_edges(sd, sid, "group")
-        for dn, sid, sd in self._bulk_sds("(&(objectCategory=person)(objectClass=user)(adminCount=1))"):
+        for dn, sid, sd in self._bulk_sds("(objectClass=user)"):
             if sid:
-                self._add_acl_edges(sd, sid, "admin user")
+                self._add_acl_edges(sd, sid, "object")
         # domain root (DCSync / takeover -> Tier 0)
         sd = self._fetch_one_sd(self.conn.base_dn)
         if sd:
             self._add_acl_edges(sd, self.domain_root, "domain root", dcsync=True)
-        # GPOs -> Tier 0 (editing a GPO ≈ SYSTEM on linked hosts)
-        for gpo in self.data.gpos[:200]:
-            gdn = gpo.get("dn","")
-            if not gdn:
+        self._gpo_edges()
+
+    @staticmethod
+    def _parse_gplink(gplink: str) -> List[str]:
+        """Extract linked GPO DNs from a gPLink value:
+        [LDAP://cn={GUID},cn=policies,cn=system,DC=…;0][LDAP://…;2]."""
+        if not gplink:
+            return []
+        return [m.group(1).strip() for m in
+                re.finditer(r'\[LDAP://([^;\]]+);?\d*\]', gplink, re.I)]
+
+    def _gpo_edges(self):
+        """GPO control -> Tier 0, with real gPLink resolution (roadmap 1). A GPO
+        only gets a Tier-0 edge when it is actually linked to a container that
+        affects domain controllers; editing a GPO linked only to a workstation OU
+        is SYSTEM on those hosts, not an automatic path to DA. Every GPO SD is
+        bulk-read in one query."""
+        d = self.data
+        gpo_by_dn = {g.get("dn", "").lower(): g for g in d.gpos if g.get("dn")}
+        # Containers whose linked GPOs reach Tier 0. GPO inheritance flows down the
+        # WHOLE OU chain, so include every ancestor container of each DC (not just
+        # the immediate parent), the domain root, and — since DCs live in sites and
+        # site-linked GPOs apply to them — any AD site.
+        tier0_containers = {self.domain_root}
+        for dc in d.dcs:
+            rest = dc.get("dn", "").lower()
+            while "," in rest:
+                rest = rest.split(",", 1)[1]
+                tier0_containers.add(rest)
+        for s in getattr(d, "sites", []):
+            sdn = s.get("dn", "")
+            if sdn:
+                tier0_containers.add(sdn.lower())
+        # GPO DN -> set of container DNs that link it (domain root, OUs, sites)
+        linked = defaultdict(set)
+        containers = []
+        if d.domain_obj:
+            containers.append((self.conn.base_dn, get_str(d.domain_obj["attrs"], "gPLink")))
+        for cont in list(getattr(d, "ous", [])) + list(getattr(d, "sites", [])):
+            containers.append((cont.get("dn", ""), get_str(cont["attrs"], "gPLink")))
+        for cdn, gplink in containers:
+            for gdn in self._parse_gplink(gplink):
+                linked[gdn.lower()].add((cdn or "").lower())
+        for dn, _sid, sd in self._bulk_sds("(objectClass=groupPolicyContainer)"):
+            gpo = gpo_by_dn.get(dn.lower())
+            if not sd or gpo is None:
                 continue
-            sd = self._fetch_one_sd(gdn)
-            if sd:
-                gnode = "GPO:" + gdn.lower()
-                self.sid2name[gnode] = "GPO " + (get_str(gpo["attrs"],"displayName") or dn_base(gdn))
-                self._add_acl_edges(sd, gnode, "gpo")
-                self._edge(gnode, self.domain_root, "applies to hosts")
+            gnode = "GPO:" + dn.lower()
+            self.sid2name[gnode] = "GPO " + (get_str(gpo["attrs"], "displayName") or dn_base(dn))
+            self._add_acl_edges(sd, gnode, "gpo")
+            link_cdns = linked.get(dn.lower(), set())
+            if any(c in tier0_containers for c in link_cdns):
+                self._edge(gnode, self.domain_root, "linked to DCs")
+            # GPOs not linked to a DC-affecting container intentionally get no
+            # Tier-0 edge — controlling them is still surfaced as a finding, but
+            # it is not a path to Domain Admin.
 
     def _add_acl_edges(self, sd, target_node, kind, dcsync=False):
         try:
@@ -5421,7 +6065,7 @@ class ControlPathAnalyzer:
                     continue  # only edges from resolvable, non-Tier-0 principals
                 label = None
                 if dcsync and "OBJECT" in ace["TypeName"].upper():
-                    ot = ace["Ace"].get("ObjectType", b"")
+                    ot = _ace_object_type(ace["Ace"])
                     if ot and len(ot) == 16:
                         guid = _guid_from_bytes(bytes(ot)).strip("{}").lower()
                         if guid in _DCSYNC_GUIDS:
@@ -5464,8 +6108,87 @@ class ControlPathAnalyzer:
             p = self._shortest(s)
             if p:
                 paths.append((self.sid2name.get(s, s), p, s in self.broad))
+        nodes, edges = self._build_node_registry(paths)
         self.data.control_paths = {"count": len(control), "broad": _dedup_keep_order(broad),
-                                   "paths": paths}
+                                   "paths": paths, "nodes": nodes, "edges": edges}
+
+    def _acct_info(self, kind, obj) -> Dict:
+        """Per-principal facts the report shows in the node drawer (PingCastle-
+        style): enabled, password age, last-logon age, kerberoastable, stale."""
+        a = obj["attrs"]
+        uac = get_int(a, "userAccountControl")
+        sam = get_str(a, "sAMAccountName") or dn_base(obj.get("dn", ""))
+        enabled = not uac_has(uac, UAC_ACCOUNTDISABLE)
+        pwd_age = days_since(filetime_to_dt(get_int(a, "pwdLastSet")))
+        logon_age = days_since(filetime_to_dt(get_int(a, "lastLogonTimestamp")))
+        spn = bool(get_list(a, "servicePrincipalName"))
+        stale = bool(enabled and (logon_age is None or logon_age > 90))
+        return {"sam": sam, "kind": kind, "enabled": enabled, "pwd_age": pwd_age,
+                "logon_age": logon_age, "spn": spn, "stale": stale}
+
+    def _node_meta(self, name) -> Dict:
+        """Metadata for one path node, keyed by its display name. Drives the
+        clickable node drawer + graph in the report."""
+        meta = {"label": name, "type": "object", "sid": "", "enabled": None,
+                "pwd_age": None, "logon_age": None, "spn": False, "stale": False,
+                "tier0": False, "members": [], "member_count": 0, "note": ""}
+        if name == "Domain root":
+            meta.update(type="domain", tier0=True,
+                        note="The domain head object. DCSync or takeover here is full domain compromise.")
+            return meta
+        if name.startswith("GPO "):
+            meta.update(type="gpo",
+                        note="Editing a linked GPO runs code as SYSTEM on every computer it applies to.")
+            return meta
+        if name in ("Everyone", "Authenticated Users", "Anonymous Logon",
+                    "Domain Users", "Domain Computers"):
+            meta.update(type="broad",
+                        note="Built-in broad principal — effectively every "
+                             "(authenticated) user in the domain.")
+            return meta
+        sid = self._name2sid.get(name, "")
+        meta["sid"] = sid
+        if sid in self.tier0_groups:
+            meta["tier0"] = True
+        ent = self.sid2obj.get(sid)
+        if not ent:
+            return meta
+        kind, obj = ent
+        meta["type"] = kind
+        if kind in ("user", "computer"):
+            info = self._acct_info(kind, obj)
+            meta.update(enabled=info["enabled"], pwd_age=info["pwd_age"],
+                        logon_age=info["logon_age"], spn=info["spn"], stale=info["stale"])
+        elif kind == "group":
+            mdns = get_list(obj["attrs"], "member")
+            meta["member_count"] = len(mdns)
+            members = []
+            for mdn in mdns[:80]:
+                me = self.dn2obj.get(mdn.lower())
+                if me:
+                    members.append(self._acct_info(me[0], me[1]))
+                else:
+                    members.append({"sam": dn_base(mdn), "kind": "external",
+                                    "enabled": None, "pwd_age": None,
+                                    "logon_age": None, "spn": False, "stale": False})
+            meta["members"] = members
+        return meta
+
+    def _build_node_registry(self, paths):
+        """Collect node metadata + the unique edge set across the emitted paths,
+        for the clickable drawer and the graph visual in the report."""
+        self._name2sid = {nm: sid for sid, nm in self.sid2name.items()}
+        nodes, edges, seen_edge = {}, [], set()
+        for _name, path, _broad in paths:
+            for src, label, dst in path:
+                for nm in (src, dst):
+                    if nm not in nodes:
+                        nodes[nm] = self._node_meta(nm)
+                ek = (src, label, dst)
+                if ek not in seen_edge:
+                    seen_edge.add(ek)
+                    edges.append({"src": src, "label": label, "dst": dst})
+        return nodes, edges
 
     def _shortest(self, start):
         from collections import deque
@@ -5515,20 +6238,30 @@ class ControlPathAnalyzer:
             return out
         try:
             from ldap3.protocol.microsoft import security_descriptor_control as sdc
+            # security_descriptor_control() returns a list already — pass it
+            # directly, not wrapped in [ ] (see _fetch_sd note above).
             gen = self.conn.conn.extend.standard.paged_search(
                 search_base=self.conn.base_dn, search_filter=ldap_filter,
                 search_scope=ldap3.SUBTREE, attributes=["objectSid","nTSecurityDescriptor"],
-                controls=[sdc(sdflags=0x05)], paged_size=500, generator=True)
+                controls=sdc(sdflags=0x05), paged_size=500, generator=True)
             for e in gen:
-                if e.get("type") != "searchResEntry":
+                # Per-entry guard: an object with an empty SD/SID list previously
+                # raised IndexError (sdb[0] on []) and, because the try wrapped the
+                # whole loop, aborted the ENTIRE read — dropping every edge after
+                # the first such object (e.g. the full user/computer SD closure).
+                try:
+                    if e.get("type") != "searchResEntry":
+                        continue
+                    raw = e.get("raw_attributes", {})
+                    sdb = raw.get("nTSecurityDescriptor") or []
+                    sdb = (sdb[0] if isinstance(sdb, list) else sdb) if sdb else None
+                    sraw = raw.get("objectSid") or []
+                    sraw = (sraw[0] if isinstance(sraw, list) else sraw) if sraw else None
+                    if sdb:
+                        sd = _ldaptypes.SR_SECURITY_DESCRIPTOR(); sd.fromString(sdb)
+                        out.append((e.get("dn", ""), sid_to_str(sraw) if sraw else "", sd))
+                except Exception:
                     continue
-                raw = e.get("raw_attributes", {})
-                sdb = raw.get("nTSecurityDescriptor", [None])
-                sdb = sdb[0] if isinstance(sdb, list) else sdb
-                sraw = raw.get("objectSid", [None]); sraw = sraw[0] if isinstance(sraw, list) else sraw
-                if sdb:
-                    sd = _ldaptypes.SR_SECURITY_DESCRIPTOR(); sd.fromString(sdb)
-                    out.append((e.get("dn",""), sid_to_str(sraw) if sraw else "", sd))
         except Exception as e:
             if self.args.verbose:
                 print(f"[!] bulk SD (ldap3) failed: {e}")
@@ -5698,7 +6431,8 @@ EXPOSURE_WEIGHTS = {
     "A-SCCM":72, "A-Pre2kComputer":78, "A-WeakLockout":40,
     "A-CertCAManageLowPriv":88, "A-CertTemplateESC9":80,
     "P-ControlPathDA":92, "P-ControlPathIndirectEveryone":95, "P-ControlPathIndirectMany":70,
-    "A-SCCMContainerACL":75,
+    "A-SCCMContainerACL":75, "P-GMSAReadable":88, "A-KDSRootKey":90,
+    "A-AADConnectSync":70, "A-SeamlessSSO":60,
 }
 
 # rule_id -> (mode, weight). mode 'flat' adds weight; mode 'pct_users'/'pct_comps'
@@ -5776,7 +6510,7 @@ class RiskScorer:
 
     @staticmethod
     def verdict(exposure: int) -> Tuple[str, str]:
-        """Plain-English read on the easiest path to Tier-0 (word, colour)."""
+        """Plain-English read on the easiest path to Tier-0 (word, color)."""
         if exposure >= 85: return "Domain compromisable", "#bd4234"
         if exposure >= 60: return "Tier-0 reachable",     "#cb7a2f"
         if exposure >= 35: return "Foothold-dependent",   "#cda52b"
@@ -5794,7 +6528,7 @@ class RiskScorer:
             "cat_counts": {c: cat_counts.get(c, 0) for c in ("Anomaly","Privileged","Stale","Trust")},
         }
 
-    # legacy 0-100 band colour, reused for the exposure/hygiene bars
+    # legacy 0-100 band color, reused for the exposure/hygiene bars
     @staticmethod
     def risk_label(score: int) -> Tuple[str, str]:
         if score >= 75: return "CRITICAL", "#bd4234"
@@ -5978,6 +6712,7 @@ html[data-theme=light] .kc-nav{background:rgba(222,218,198,.96)}
   border-radius:14px;padding:4px 11px;font-size:12.5px;font-weight:600;white-space:nowrap}
 .kc-node.attacker{border-color:var(--high);color:var(--high)}
 .kc-node.crown{border-color:var(--crit);background:rgba(189,66,52,.14);color:var(--crit);font-weight:700}
+.kc-node.loot{border-color:var(--accent);color:var(--accent)}
 .kc-node .ic{font-size:12px;opacity:.85}
 .kc-edge{display:inline-flex;flex-direction:column;align-items:center;color:var(--muted);
   font-family:var(--mono);font-size:9px;letter-spacing:.03em;text-transform:uppercase;padding:0 4px;min-width:54px}
@@ -6015,6 +6750,39 @@ html[data-theme=light] .kc-nav{background:rgba(222,218,198,.96)}
 .kc-badge-crit{background:var(--crit)}
 .kc-mini{display:inline-block;font-family:var(--mono);font-size:10px;background:var(--surface3);
   border:1px solid var(--border2);color:var(--deck);border-radius:3px;padding:1px 5px;margin:1px 2px}
+
+/* ── control-path: clickable nodes, graph, drawer ── */
+.kc-node.clk{cursor:pointer;transition:border-color .1s,color .1s}
+.kc-node.clk:hover,.kc-node.clk:focus{border-color:var(--accent);color:var(--accent);outline:none}
+.kc-node.clk[data-stale="1"]::after{content:"●";color:var(--warn);font-size:8px;margin-left:5px;transform:translateY(-1px)}
+.kc-graph-wrap{overflow:auto;border:1px solid var(--border);border-radius:var(--r-sm);
+  background:var(--surface2);padding:10px;margin-bottom:14px;max-height:560px}
+.kc-gnode{cursor:pointer} .kc-gnode rect{transition:stroke-width .1s}
+.kc-gnode:hover rect,.kc-gnode:focus rect{stroke-width:2.4;outline:none}
+.kc-drawer-ov{position:fixed;inset:0;background:rgba(8,9,5,.55);z-index:190;display:none}
+.kc-drawer-ov.open{display:block}
+.kc-drawer{position:fixed;top:0;right:-520px;width:480px;max-width:94vw;height:100%;
+  background:var(--surface);border-left:1px solid var(--border2);box-shadow:-6px 0 26px rgba(0,0,0,.42);
+  z-index:200;transition:right .18s ease;overflow:auto}
+.kc-drawer.open{right:0}
+.kc-dw-h{display:flex;align-items:center;gap:10px;padding:14px 18px;border-bottom:1px solid var(--border);
+  position:sticky;top:0;background:var(--surface)}
+.kc-dw-h .nm{font-size:16px;font-weight:800;word-break:break-word}
+.kc-dw-x{margin-left:auto;background:var(--surface2);border:1px solid var(--border2);color:var(--text);
+  width:30px;height:30px;border-radius:var(--r-sm);cursor:pointer;font-size:16px;flex-shrink:0}
+.kc-dw-x:hover{border-color:var(--accent);color:var(--accent)}
+.kc-dw-b{padding:14px 18px}
+.kc-dw-badge{display:inline-block;font-family:var(--mono);font-size:9.5px;letter-spacing:.06em;
+  text-transform:uppercase;padding:2px 7px;border-radius:3px;border:1px solid var(--border2);color:var(--muted);margin-right:5px}
+.kc-dw-badge.t0{background:var(--crit);color:#fff;border-color:var(--crit)}
+.kc-dw-note{color:var(--muted);font-size:12.5px;margin:8px 0 12px;line-height:1.55}
+.kc-dw-facts{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:12.5px;margin-bottom:10px}
+.kc-dw-facts dt{color:var(--faint);font-family:var(--mono);font-size:10.5px;text-transform:uppercase}
+.kc-dw-mt{width:100%;border-collapse:collapse;font-size:12px;margin-top:6px}
+.kc-dw-mt th{text-align:left;color:var(--deck);font-family:var(--mono);font-size:9.5px;text-transform:uppercase;
+  padding:5px 7px;border-bottom:1px solid var(--border)}
+.kc-dw-mt td{padding:5px 7px;border-bottom:1px solid var(--border)}
+.kc-dw-mt tr.stale td{background:rgba(205,165,43,.08)}
 
 /* roadmap */
 .kc-rm-tier{font-size:13px;letter-spacing:.05em;text-transform:uppercase;color:var(--deck);margin:18px 0 8px;font-weight:700}
@@ -6172,6 +6940,53 @@ document.addEventListener('DOMContentLoaded',function(){kcApply();
   function spy(){var y=window.scrollY+110,cur=null;secs.forEach(function(s){if(s.offsetTop<=y)cur=s.id;});
     Object.keys(links).forEach(function(k){links[k].classList.toggle('active',k===cur);});}
   window.addEventListener('scroll',spy);spy();});
+/* ── control-path node detail drawer (PingCastle-style drill-down) ── */
+function kcEsc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){
+  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
+function kcAge(d){return d==null?'—':(d+'d');}
+function kcStat(v){return v===false?'<span class="kc-bad">disabled</span>':
+  (v===true?'<span class="kc-ok">enabled</span>':'—');}
+function kcNode(el){
+  var name=el.getAttribute('data-node');var m=(window.KC_NODES||{})[name];
+  var dw=document.getElementById('kc-drawer'),ov=document.getElementById('kc-drawer-ov');
+  var body=document.getElementById('kc-dw-body'),ttl=document.getElementById('kc-dw-name');
+  if(!dw||!body||!ttl)return;ttl.textContent=name;
+  if(!m){body.innerHTML='<p class="kc-dw-note">No additional detail was collected for this node.</p>';}
+  else{
+    var h='<div style="margin-bottom:8px"><span class="kc-dw-badge'+(m.tier0?' t0':'')+'">'+kcEsc(m.type||'object')+'</span>';
+    if(m.tier0)h+='<span class="kc-dw-badge t0">Tier 0</span>';h+='</div>';
+    if(m.note)h+='<div class="kc-dw-note">'+kcEsc(m.note)+'</div>';
+    if(m.type==='user'||m.type==='computer'){
+      h+='<dl class="kc-dw-facts">'+
+         '<dt>Enabled</dt><dd>'+kcStat(m.enabled)+'</dd>'+
+         '<dt>Password age</dt><dd>'+kcAge(m.pwd_age)+'</dd>'+
+         '<dt>Last logon</dt><dd>'+(m.logon_age==null?'never / unknown':kcAge(m.logon_age))+'</dd>'+
+         '<dt>Kerberoastable</dt><dd>'+(m.spn?'<span class="kc-bad">yes (has SPN)</span>':'no')+'</dd>'+
+         '<dt>Stale</dt><dd>'+(m.stale?'<span class="kc-warn">yes (&gt;90d / never)</span>':'no')+'</dd>'+
+         (m.sid?'<dt>SID</dt><dd class="kc-mono" style="font-size:11px">'+kcEsc(m.sid)+'</dd>':'')+'</dl>';
+    }else if(m.type==='group'){
+      var mem=m.members||[];
+      h+='<div class="kc-dw-note">'+(m.member_count||0)+' direct member(s)'+
+         (mem.length<(m.member_count||0)?(' (showing first '+mem.length+')'):'')+'.</div>';
+      if(mem.length){
+        h+='<table class="kc-dw-mt"><thead><tr><th>Member</th><th>Status</th><th>Pwd age</th><th>Last logon</th><th>Flags</th></tr></thead><tbody>';
+        mem.forEach(function(mm){var fl=[];if(mm.spn)fl.push('kerberoastable');if(mm.stale)fl.push('stale');
+          h+='<tr'+(mm.stale?' class="stale"':'')+'><td>'+kcEsc(mm.sam)+'</td><td>'+kcStat(mm.enabled)+
+             '</td><td>'+kcAge(mm.pwd_age)+'</td><td>'+(mm.logon_age==null?'—':kcAge(mm.logon_age))+
+             '</td><td>'+kcEsc(fl.join(', '))+'</td></tr>';});
+        h+='</tbody></table>';
+      }
+      if(m.sid)h+='<div class="kc-mono" style="font-size:11px;color:var(--faint);margin-top:8px">'+kcEsc(m.sid)+'</div>';
+    }else if(m.sid){
+      h+='<dl class="kc-dw-facts"><dt>SID</dt><dd class="kc-mono" style="font-size:11px">'+kcEsc(m.sid)+'</dd></dl>';
+    }
+    body.innerHTML=h;
+  }
+  dw.classList.add('open');if(ov)ov.classList.add('open');dw.scrollTop=0;
+}
+function kcCloseDrawer(){var dw=document.getElementById('kc-drawer'),ov=document.getElementById('kc-drawer-ov');
+  if(dw)dw.classList.remove('open');if(ov)ov.classList.remove('open');}
+document.addEventListener('keydown',function(e){if(e.key==='Escape')kcCloseDrawer();});
 """
 
 
@@ -6221,7 +7036,7 @@ class HTMLReporter:
         nonzero = [s for s in order if counts[s]]
         segs = []; start = -90.0
         if len(nonzero) == 1:
-            segs.append(f'<circle cx="{cx}" cy="{cy}" r="{r}" fill="none" stroke="{SEV_COLOUR[nonzero[0]]}" stroke-width="{w}"/>')
+            segs.append(f'<circle cx="{cx}" cy="{cy}" r="{r}" fill="none" stroke="{SEV_COLOR[nonzero[0]]}" stroke-width="{w}"/>')
         else:
             for s in nonzero:
                 sweep = counts[s] / total * 360; end = start + sweep
@@ -6229,7 +7044,7 @@ class HTMLReporter:
                 x1 = cx + r*math.cos(math.radians(start)); y1 = cy + r*math.sin(math.radians(start))
                 x2 = cx + r*math.cos(math.radians(end));   y2 = cy + r*math.sin(math.radians(end))
                 segs.append(f'<path d="M {x1:.2f} {y1:.2f} A {r} {r} 0 {large} 1 {x2:.2f} {y2:.2f}" '
-                            f'fill="none" stroke="{SEV_COLOUR[s]}" stroke-width="{w}"/>')
+                            f'fill="none" stroke="{SEV_COLOR[s]}" stroke-width="{w}"/>')
                 start = end
         if not nonzero:
             segs.append(f'<circle cx="{cx}" cy="{cy}" r="{r}" fill="none" stroke="var(--track)" stroke-width="{w}"/>')
@@ -6307,7 +7122,7 @@ class HTMLReporter:
         sc = self._sev_counts(); out = '<div class="kc-legend">'
         for s in ["CRITICAL","HIGH","MEDIUM","LOW","INFO"]:
             if sc.get(s,0):
-                out += f'<span><i style="background:{SEV_COLOUR[s]}"></i>{s.title()} {sc[s]}</span>'
+                out += f'<span><i style="background:{SEV_COLOR[s]}"></i>{s.title()} {sc[s]}</span>'
         return out + '</div>'
 
     def _meter(self, label, value, hint):
@@ -6372,7 +7187,7 @@ class HTMLReporter:
         for f in items:
             one = (self._doc(f.rule_id).get("description") or f.details or f.title)
             one = one if len(one) <= 130 else one[:127] + "…"
-            rows += (f'<li><span class="kc-dot" style="background:{f.sev_colour}"></span>'
+            rows += (f'<li><span class="kc-dot" style="background:{f.sev_color}"></span>'
                      f'<span style="flex:1"><a href="#f-{self._e(f.rule_id)}" onclick="kcJump(\'f-{self._e(f.rule_id)}\');return false"><strong>{self._e(f.title)}</strong></a> '
                      f'<span class="kc-kr-sub">{self._e(one)}</span></span></li>')
         return ('<div class="kc-keyrisks"><div class="kc-sub-h">Key risks at a glance</div>'
@@ -6392,10 +7207,10 @@ class HTMLReporter:
                 sev_by_cat[oc][f.severity] += 1; tot[oc] += 1
         cards = ""
         for cat in OPCAT_ORDER:
-            n = tot.get(cat,0); ccol = OPCAT_COLOUR.get(cat,"#888")
+            n = tot.get(cat,0); ccol = OPCAT_COLOR.get(cat,"#888")
             bd = sev_by_cat[cat]
             chips = "".join(
-                f'<span style="color:{SEV_COLOUR[s]};font-family:var(--mono);font-size:10.5px;margin-right:8px">{bd[s]} {s[:4].lower()}</span>'
+                f'<span style="color:{SEV_COLOR[s]};font-family:var(--mono);font-size:10.5px;margin-right:8px">{bd[s]} {s[:4].lower()}</span>'
                 for s in ("CRITICAL","HIGH","MEDIUM","LOW","INFO") if bd.get(s))
             cards += (f'<div class="kc-cat-card kc-clickable" style="border-top-color:{ccol}" '
                       f'onclick="kcCatJump(\'{self._e(cat)}\')" title="Filter the Findings table to {self._e(cat)}">'
@@ -6406,6 +7221,20 @@ class HTMLReporter:
                 'text-transform:none;letter-spacing:0;color:var(--faint)">— count per area; click to filter</span></div>'
                 f'<div class="kc-catstrip">{cards}</div>')
 
+    def _collection_notes(self):
+        """Surface per-query collection failures so an empty section can't be
+        mistaken for a clean result (roadmap item 6)."""
+        errs = getattr(self.data, "collect_errors", None) or []
+        if not errs:
+            return ""
+        items = "".join(f'<li>{self._e(e)}</li>' for e in errs[:30])
+        more = f'<li class="kc-more">… and {len(errs)-30} more</li>' if len(errs) > 30 else ""
+        return ('<div class="kc-block" style="border-left:3px solid var(--warn);'
+                'background:rgba(205,165,43,.08);padding:8px 12px;border-radius:0 var(--r-sm) var(--r-sm) 0;margin-top:14px">'
+                '<div class="kc-bh" style="color:var(--warn)">Collection notes — some queries failed; '
+                'affected areas may be under-reported</div>'
+                f'<ul class="kc-fixlist">{items}{more}</ul></div>')
+
     def _summary_section(self):
         return ('<section class="kc-section" id="sec-summary"><h2 class="kc-h2">Summary'
                 '<span class="tag">exposure = easiest path to Tier 0 · hygiene = misconfig load</span></h2>'
@@ -6415,13 +7244,117 @@ class HTMLReporter:
                 f'<div><div class="kc-narrative">{self._narrative()}</div>{self._key_risks()}</div>'
                 '</div>'
                 f'{self._category_strip()}'
-                f'{self._inventory_block()}</section>')
+                f'{self._inventory_block()}'
+                f'{self._collection_notes()}</section>')
 
     # ── Paths to Domain Dominance (control-path chains) ───────────────────────
     def _node(self, label, kind="", icon=""):
         cls = "kc-node" + (f" {kind}" if kind else "")
         ic = f'<span class="ic">{icon}</span>' if icon else ""
         return f'<span class="{cls}">{ic}{self._e(label)}</span>'
+
+    # ── control-path node registry / clickable nodes / graph ──────────────────
+    def _cp(self):
+        return getattr(self.data, "control_paths", None) or {}
+
+    def _cp_nodes(self):
+        return self._cp().get("nodes") or {}
+
+    def _pnode(self, name, kind=""):
+        """A clickable control-path node — opens the detail drawer (PingCastle-
+        style: group members, account enabled / pwd-age / stale, etc.)."""
+        meta = self._cp_nodes().get(name, {})
+        if not kind:
+            kind = "crown" if meta.get("tier0") else ("loot" if meta.get("type") == "gpo" else "")
+        cls = "kc-node clk" + (f" {kind}" if kind else "")
+        stale = ' data-stale="1"' if meta.get("stale") else ''
+        known = ' data-known="1"' if name in self._cp_nodes() else ''
+        return (f'<span class="{cls}" role="button" tabindex="0" data-node="{self._e(name)}"{stale}{known} '
+                f'onclick="kcNode(this)" onkeydown="if(event.key===\'Enter\'){{kcNode(this)}}">'
+                f'{self._e(name)}</span>')
+
+    def _node_registry_json(self):
+        import json as _json
+        nodes = self._cp_nodes()
+        # ensure_ascii (json default) already escapes non-ASCII incl. U+2028/9.
+        # Neutralize < and > so no AD object name (e.g. one containing
+        # "</script>") can break out of the inline <script> element.
+        return (_json.dumps(nodes, default=str)
+                .replace("<", "\\u003c").replace(">", "\\u003e"))
+
+    def _control_graph_svg(self):
+        """Server-rendered layered graph of the control paths — the 'visual' an
+        operator can click into. No JS layout dependency; nodes are clickable."""
+        cp = self._cp(); edges = cp.get("edges") or []; meta = cp.get("nodes") or {}
+        if not edges:
+            return ""
+        names = list(meta.keys())
+        adj = defaultdict(set); radj = defaultdict(set)
+        for e in edges:
+            if e["src"] in meta and e["dst"] in meta:
+                adj[e["src"]].add(e["dst"]); radj[e["dst"]].add(e["src"])
+        # layer = longest distance from a source; relax with a cap to survive cycles
+        layer = {n: 0 for n in names}
+        for _ in range(len(names) + 1):
+            changed = False
+            for n in names:
+                if radj[n]:
+                    lv = 1 + max((layer[p] for p in radj[n]), default=0)
+                    if lv > layer[n] and lv <= len(names):
+                        layer[n] = lv; changed = True
+            if not changed:
+                break
+        layers = defaultdict(list)
+        for n in names:
+            layers[layer[n]].append(n)
+        for lv in layers:
+            layers[lv].sort()
+        maxlayer = max(layers) if layers else 0
+        rowmax = max((len(v) for v in layers.values()), default=1)
+        NW, NH, GX, GY, MX, MY = 168, 30, 66, 14, 14, 16
+        width = MX * 2 + (maxlayer + 1) * NW + maxlayer * GX
+        height = MY * 2 + rowmax * (NH + GY)
+        pos = {}
+        for lv, ns in layers.items():
+            x = MX + lv * (NW + GX)
+            total = len(ns) * (NH + GY) - GY
+            y0 = MY + (height - 2 * MY - total) / 2
+            for i, n in enumerate(ns):
+                pos[n] = (x, y0 + i * (NH + GY))
+        def col(n):
+            m = meta.get(n, {})
+            if m.get("tier0"): return ("rgba(189,66,52,.18)", "var(--crit)")
+            t = m.get("type", "")
+            if t == "group":   return ("var(--surface3)", "var(--accent2)")
+            if t == "gpo":     return ("var(--surface3)", "var(--accent)")
+            if t == "broad":   return ("rgba(203,122,47,.16)", "var(--high)")
+            if m.get("stale"): return ("var(--surface3)", "var(--warn)")
+            return ("var(--surface3)", "var(--border2)")
+        seg = ['<defs><marker id="kcarr" markerWidth="9" markerHeight="9" refX="8" refY="3" '
+               'orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="var(--accent)"/></marker></defs>']
+        for e in edges:
+            if e["src"] not in pos or e["dst"] not in pos:
+                continue
+            x1, y1 = pos[e["src"]]; x2, y2 = pos[e["dst"]]
+            sx, sy = x1 + NW, y1 + NH / 2; ex, ey = x2, y2 + NH / 2
+            mx, my = (sx + ex) / 2, (sy + ey) / 2
+            seg.append(f'<line x1="{sx:.0f}" y1="{sy:.0f}" x2="{ex:.0f}" y2="{ey:.0f}" '
+                       f'stroke="var(--border2)" stroke-width="1.3" marker-end="url(#kcarr)"/>')
+            seg.append(f'<text x="{mx:.0f}" y="{my-3:.0f}" text-anchor="middle" font-size="9" '
+                       f'fill="var(--muted)" font-family="var(--mono)">{self._e(e["label"])}</text>')
+        for n, (x, y) in pos.items():
+            fill, stroke = col(n)
+            lbl = n if len(n) <= 22 else n[:21] + "…"
+            seg.append(
+                f'<g class="kc-gnode" role="button" tabindex="0" data-node="{self._e(n)}" '
+                f'onclick="kcNode(this)" onkeydown="if(event.key===\'Enter\'){{kcNode(this)}}">'
+                f'<rect x="{x:.0f}" y="{y:.0f}" width="{NW}" height="{NH}" rx="6" fill="{fill}" '
+                f'stroke="{stroke}" stroke-width="1.4"/>'
+                f'<text x="{x+NW/2:.0f}" y="{y+NH/2+4:.0f}" text-anchor="middle" font-size="11.5" '
+                f'fill="var(--text)" font-family="var(--sans)">{self._e(lbl)}</text></g>')
+        return (f'<div class="kc-graph-wrap"><svg width="{width:.0f}" height="{height:.0f}" '
+                f'viewBox="0 0 {width:.0f} {height:.0f}" role="img" '
+                f'aria-label="Control-path graph to Tier 0">{"".join(seg)}</svg></div>')
 
     def _edge(self, label):
         return f'<span class="kc-edge">{self._e(label)}</span>'
@@ -6431,27 +7364,31 @@ class HTMLReporter:
         row = ""
         for i, part in enumerate(nodes_edges):
             row += part if i % 2 == 0 else self._edge(part)
-        meta = f'<div class="kc-chain-meta"><span class="kc-sev-pill" style="background:{SEV_COLOUR.get(sev,"#888")}">{sev}</span>' \
+        meta = f'<div class="kc-chain-meta"><span class="kc-sev-pill" style="background:{SEV_COLOR.get(sev,"#888")}">{sev}</span>' \
                + (f'<span class="kc-chain-tool">{self._e(tool)}</span>' if tool else "") + '</div>'
         scls = {"CRITICAL":"", "HIGH":"sev-high", "MEDIUM":"sev-medium"}.get(sev, "sev-medium")
         return f'<div class="kc-chain {scls}"><div class="kc-chain-row">{row}</div>{meta}</div>'
 
     def _build_paths(self):
-        """Synthesise attacker -> … -> Tier 0 chains from the findings + ACL data.
+        """Synthesize attacker -> … -> Tier 0 chains from the findings + ACL data.
         Returns list of (severity, html, rule_id)."""
         chains = []
-        DA = self._node("Domain Admin", "crown", "♛")
-        DOM = self._node("Domain compromise", "crown", "♛")
-        any_user = self._node("Any domain user", "attacker", "☣")
-        unauth = self._node("Unauthenticated", "attacker", "☣")
+        # Node convention (no emoji — they rendered inconsistently and looked
+        # unprofessional): "attacker" = a principal/host you control, "loot" = a
+        # secret/certificate you capture, "crown" = Tier-0 / Domain Admin. Plain
+        # nodes are ordinary AD objects on the route.
+        DA = self._node("Domain Admin", "crown")
+        DOM = self._node("Domain compromise", "crown")
+        any_user = self._node("Any domain user", "attacker")
+        unauth = self._node("Unauthenticated", "attacker")
         add = lambda sev, nodes, tool, rid: chains.append((sev, self._chain(nodes, sev, tool), rid))
 
         for a in self.data.acl_findings:
             t = a.get("type",""); who = a.get("sid_name") or a.get("sid") or "principal"
             right = a.get("right",""); obj = a.get("object","")
-            n_who = self._node(who, "attacker", "☣")
+            n_who = self._node(who, "attacker")
             if t == "dcsync":
-                add("CRITICAL", [n_who, "DS-Repl", self._node("NTDS secrets","crown","🔑"), "dump", DOM], "secretsdump.py -just-dc", "P-DCSync")
+                add("CRITICAL", [n_who, "DCSync", self._node("NTDS secrets","loot"), "dump hashes", DOM], "secretsdump.py -just-dc", "P-DCSync")
             elif t in ("dangerous_acl","owner"):
                 add("CRITICAL", [n_who, right or "WriteDACL", self._node(obj or "Domain root"), "grant DCSync", DOM], "dacledit / secretsdump", "P-DangerousACLDomain")
             elif t == "gpo_write":
@@ -6466,50 +7403,75 @@ class HTMLReporter:
 
         if has("P-DCSync") and not any(r == "P-DCSync" for _,_,r in chains):
             who = (aff("P-DCSync") or ["non-admin principal"])[0]
-            add("CRITICAL", [self._node(who.split()[0],"attacker","☣"), "DCSync", self._node("NTDS secrets","crown","🔑"), "dump", DOM], "secretsdump.py -just-dc", "P-DCSync")
+            add("CRITICAL", [self._node(who.split()[0],"attacker"), "DCSync", self._node("NTDS secrets","loot"), "dump hashes", DOM], "secretsdump.py -just-dc", "P-DCSync")
         if has("P-GPPPassword"):
-            add("CRITICAL", [any_user, "read SYSVOL", self._node("GPP cpassword","crown","🔑"), "AES-decrypt", self._node("Local admin creds")], "gpp-decrypt", "P-GPPPassword")
+            add("CRITICAL", [any_user, "read SYSVOL", self._node("GPP cpassword","loot"), "AES-decrypt", self._node("Local admin creds","loot")], "gpp-decrypt", "P-GPPPassword")
         if has("A-CertTempCustomSubject"):
             tmpl = (aff("A-CertTempCustomSubject") or ["vuln template"])[0]
-            add("CRITICAL", [any_user, "ESC1 enrol", self._node(tmpl), "SAN=DA", self._node("DA certificate","crown","📜"), "PKINIT", DA], "certipy req -upn administrator@…", "A-CertTempCustomSubject")
+            add("CRITICAL", [any_user, "ESC1 enroll", self._node(tmpl), "SAN = DA", self._node("DA certificate","loot"), "PKINIT", DA], "certipy req -upn administrator@…", "A-CertTempCustomSubject")
         if has("A-CertTemplateESC4"):
             tmpl = (aff("A-CertTemplateESC4") or ["template"])[0].split()[0]
-            add("CRITICAL", [any_user, "ESC4 WriteDACL", self._node(tmpl), "make ESC1", self._node("DA certificate","crown","📜"), "PKINIT", DA], "certipy template", "A-CertTemplateESC4")
+            add("CRITICAL", [any_user, "ESC4 WriteDACL", self._node(tmpl), "make ESC1", self._node("DA certificate","loot"), "PKINIT", DA], "certipy template", "A-CertTemplateESC4")
         if has("A-CertEnrollHttp"):
-            add("CRITICAL", [self._node("Coerced DC$","attacker","☣"), "NTLM relay", self._node("ADCS web enrol (ESC8)"), "issue", self._node("DC certificate","crown","📜"), "DCSync", DOM], "PetitPotam + ntlmrelayx", "A-CertEnrollHttp")
+            add("CRITICAL", [self._node("Coerced DC$","attacker"), "NTLM relay", self._node("ADCS web enrollment (ESC8)"), "issue", self._node("DC certificate","loot"), "DCSync", DOM], "PetitPotam + ntlmrelayx", "A-CertEnrollHttp")
         if has("P-ServiceDomainAdmin") or has("S-KerberoastableAdmin"):
             svc = (aff("S-KerberoastableAdmin") or aff("P-ServiceDomainAdmin") or ["svc_admin"])[0].split()[0]
-            add("CRITICAL", [any_user, "Kerberoast", self._node(svc), "crack RC4", self._node("svc password","crown","🔑"), "member of", DA], "GetUserSPNs.py -request → hashcat -m 13100", "S-KerberoastableAdmin")
+            add("CRITICAL", [any_user, "Kerberoast", self._node(svc), "crack RC4", self._node("Service password","loot"), "member of", DA], "GetUserSPNs.py -request → hashcat -m 13100", "S-KerberoastableAdmin")
         if has("P-ComputerInPrivGroup"):
             m = (aff("P-ComputerInPrivGroup") or ["WS$"])[0].split()[0]
-            add("CRITICAL", [self._node("SYSTEM on "+m,"attacker","☣"), "machine secret", self._node(m), "member of", DA], "", "P-ComputerInPrivGroup")
+            add("CRITICAL", [self._node("SYSTEM on "+m,"attacker"), "machine secret", self._node(m), "member of", DA], "", "P-ComputerInPrivGroup")
         if has("S-SIDHistoryPrivileged"):
             who = (aff("S-SIDHistoryPrivileged") or ["account"])[0].split()[0]
-            add("CRITICAL", [self._node(who,"attacker","☣"), "SID history", self._node("privileged SID","crown","🔑"), "honoured at logon", DA], "", "S-SIDHistoryPrivileged")
+            add("CRITICAL", [self._node(who,"attacker"), "SID history", self._node("Privileged SID","loot"), "honored at logon", DA], "", "S-SIDHistoryPrivileged")
         if has("P-RBCD-Dangerous"):
-            add("CRITICAL", [self._node("controlled principal","attacker","☣"), "RBCD", self._node("Domain controller","crown","♛"), "S4U impersonate", DA], "rbcd.py + getST.py", "P-RBCD-Dangerous")
+            # Name the principal that actually holds the delegation over the DC —
+            # the finding evidence is "DC$ ← <principal(s)>" (issue #4).
+            ev = (aff("P-RBCD-Dangerous") or [""])[0]
+            who = ev.split("←", 1)[1].strip().split(",")[0].strip() if "←" in ev else ""
+            who = who or "controlled principal"
+            add("CRITICAL", [self._node(who,"attacker"), "RBCD S4U", self._node("Domain controller"), "impersonate any user", DA], "getST.py -spn cifs/dc -impersonate Administrator", "P-RBCD-Dangerous")
         elif has("P-RBCD"):
-            tgt = (aff("P-RBCD") or ["host"])[0]
-            add("HIGH", [self._node("controlled / new machine","attacker","☣"), "RBCD", self._node(tgt), "S4U impersonate", self._node("any user on host")], "rbcd.py", "P-RBCD")
+            tgt = (aff("P-RBCD") or ["host"])[0].split("←")[0].strip() or "host"
+            add("HIGH", [self._node("controlled / new machine","attacker"), "RBCD S4U", self._node(tgt), "impersonate any user", self._node("Host compromise")], "rbcd.py + getST.py", "P-RBCD")
         if has("P-UnconstrainedDelegation"):
             h = (aff("P-UnconstrainedDelegation") or ["host"])[0]
-            add("CRITICAL", [self._node("Coerced DC$","attacker","☣"), "auth to", self._node(h+" (unconstrained)"), "capture TGT", DA], "printerbug.py + krbrelayx", "P-UnconstrainedDelegation")
-        if has("P-MachineAccountQuota") and (has("P-RBCD") or not chains):
-            add("HIGH", [any_user, "MAQ>0: add machine", self._node("attacker computer"), "RBCD/shadow-cred", self._node("target host")], "addcomputer.py", "P-MachineAccountQuota")
+            add("CRITICAL", [self._node("Coerced DC$","attacker"), "authenticates to", self._node(h+" (unconstrained)"), "capture TGT", DA], "printerbug.py + krbrelayx", "P-UnconstrainedDelegation")
+        # MAQ is only a Tier-0 path when the target's RBCD attribute can actually
+        # be written: via an existing controllable RBCD, or an NTLM relay to the
+        # directory (LDAP signing / LDAPS channel binding NOT enforced). When the
+        # DC enforces signing + channel binding and no write primitive exists, MAQ
+        # alone is not exploitable (issue #4) — it remains a finding, not a path.
+        relay_viable = (has("A-DCLdapSign") or has("A-LDAPSigningDisabled")
+                        or has("A-DCLdapsChannelBinding"))
+        if has("P-MachineAccountQuota") and has("P-RBCD"):
+            add("HIGH", [any_user, "add machine (MAQ)", self._node("attacker computer"),
+                         "configure RBCD on target", self._node("RBCD-enabled host"),
+                         "S4U impersonate", self._node("Host compromise")],
+                "addcomputer.py + rbcd.py + getST.py", "P-MachineAccountQuota")
+        elif has("P-MachineAccountQuota") and relay_viable:
+            add("HIGH", [any_user, "add machine (MAQ)", self._node("attacker computer"),
+                         "coerce + relay to LDAP", self._node("write RBCD on target"),
+                         "S4U impersonate", self._node("Host compromise")],
+                "addcomputer.py + ntlmrelayx --delegate-access", "P-MachineAccountQuota")
         if has("A-DnsZoneAUCreateChild"):
-            add("HIGH", [any_user, "ADIDNS write", self._node("wpad / * record"), "coerce + relay", self._node("victim creds")], "dnstool.py + Responder", "A-DnsZoneAUCreateChild")
+            add("HIGH", [any_user, "ADIDNS write", self._node("wpad / * record"), "coerce + relay", self._node("Victim credentials","loot")], "dnstool.py + Responder", "A-DnsZoneAUCreateChild")
         if has("S-NoPreAuthAdmin") or has("S-NoPreAuth"):
             who = (aff("S-NoPreAuthAdmin") or aff("S-NoPreAuth") or ["account"])[0].split()[0]
-            sev = "CRITICAL" if has("S-NoPreAuthAdmin") else "HIGH"
-            add(sev, [unauth, "AS-REP roast", self._node(who), "crack", self._node("password","crown","🔑")], "GetNPUsers.py → hashcat -m 18200", "S-NoPreAuthAdmin" if has("S-NoPreAuthAdmin") else "S-NoPreAuth")
+            admin = has("S-NoPreAuthAdmin")
+            sev = "CRITICAL" if admin else "HIGH"
+            nodes = [unauth, "AS-REP roast", self._node(who), "crack hash", self._node("Cracked password","loot")]
+            if admin:
+                nodes += ["member of", DA]
+            add(sev, nodes, "GetNPUsers.py → hashcat -m 18200",
+                "S-NoPreAuthAdmin" if admin else "S-NoPreAuth")
         if has("A-Pre2kComputer"):
             m = (aff("A-Pre2kComputer") or ["HOST$"])[0].split()[0]
-            add("HIGH", [unauth, "default pwd", self._node(m), "auth as computer", self._node("foothold + TGT","crown","🔑")], "pre2k auth / getTGT.py", "A-Pre2kComputer")
+            add("HIGH", [unauth, "guess default password", self._node(m), "authenticate as "+m, self._node("Domain foothold")], "pre2k auth / getTGT.py", "A-Pre2kComputer")
         if has("A-WeakLockout"):
-            add("HIGH", [unauth, "password spray", self._node("no-lockout policy"), "valid creds", self._node("domain foothold","crown","🔑")], "nxc smb --continue-on-success / kerbrute", "A-WeakLockout")
+            add("HIGH", [unauth, "password spray", self._node("No lockout policy"), "valid credentials", self._node("Domain foothold")], "nxc smb --continue-on-success / kerbrute", "A-WeakLockout")
         if has("A-SCCM"):
             h = (aff("A-SCCM") or ["SCCM site server"])[0].split()[0]
-            add("HIGH", [self._node("Coerced/relayed auth","attacker","☣"), "NTLM relay", self._node(h+" (MP/site)"), "NAA / site DB", self._node("privileged creds","crown","🔑")], "SharpSCCM / sccmhunter / ntlmrelayx", "A-SCCM")
+            add("HIGH", [self._node("Coerced / relayed auth","attacker"), "NTLM relay", self._node(h+" (MP / site)"), "NAA / site DB", self._node("Privileged credentials","loot")], "SharpSCCM / sccmhunter / ntlmrelayx", "A-SCCM")
         return chains
 
     def _inline_path(self, rule_id):
@@ -6622,25 +7584,32 @@ class HTMLReporter:
                 '<th class="kc-num">Admin</th><th class="kc-num">Pwd age (d)</th>'
                 '<th class="kc-num">Last logon (d)</th><th>Flags</th></tr></thead>'
                 f'<tbody>{rows}</tbody></table></div></div>')
-        # control-path closure: shortest paths to Domain Admin (BloodHound-style)
-        cpaths = getattr(self.data, "control_paths", None) or {}
+        # control-path closure: shortest paths to Domain Admin (PingCastle /
+        # BloodHound-style). Nodes are clickable — click one to open the drawer
+        # with its members / account facts; the graph gives the visual overview.
+        cpaths = self._cp()
         cp = ""
         if cpaths.get("paths"):
             chains = ""
             for name, path, is_broad in cpaths["paths"]:
                 if not path:
                     continue
-                ne = [self._node(path[0][0], "attacker", "☣")]
+                ne = [self._pnode(path[0][0], "attacker")]
                 for k, (src, label, dst) in enumerate(path):
                     last = (k == len(path) - 1)
-                    ne += [label, self._node(dst, "crown" if last else "", "♛" if last else "")]
+                    ne += [label, self._pnode(dst, "crown" if last else "")]
                 chains += self._chain(ne, "CRITICAL" if is_broad else "HIGH",
-                                      "via membership + ACL/owner edges")
+                                      "membership + ACL / ownership")
             extra = cpaths.get("count", 0) - len(cpaths["paths"])
             more = f'<p class="kc-sub">… and {extra} more principal(s) with a path to Tier-0.</p>' if extra > 0 else ""
-            cp = ('<div class="kc-sub-h">Shortest paths to Domain Admin '
+            graph = self._control_graph_svg()
+            graph_hdr = ('<div class="kc-sub-h">Control-path graph '
+                         '<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--faint)">'
+                         '— click any node for members / account detail</span></div>') if graph else ""
+            cp = (graph_hdr + graph +
+                  '<div class="kc-sub-h">Shortest paths to Domain Admin '
                   f'<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--faint)">'
-                  f'— {cpaths.get("count",0)} non-privileged principal(s) can reach Tier-0</span></div>'
+                  f'— {cpaths.get("count",0)} non-privileged principal(s) can reach Tier-0; click a node</span></div>'
                   f'{chains}{more}')
         if not blocks and not cp:
             return ""
@@ -6714,7 +7683,7 @@ class HTMLReporter:
                                                  self._SEV_ORDER.get(f.severity,9), f.rule_id))
         rows = []; seen_rid = set()
         for i, f in enumerate(sf):
-            oc = self._opcat(f); oc_col = OPCAT_COLOUR.get(oc,"#888")
+            oc = self._opcat(f); oc_col = OPCAT_COLOR.get(oc,"#888")
             anchor = f"f-{f.rule_id}" if f.rule_id not in seen_rid else f"f-{f.rule_id}-{i}"
             seen_rid.add(f.rule_id)
             rows.append(
@@ -6722,7 +7691,7 @@ class HTMLReporter:
                 f'data-cat="{self._e(oc)}" onclick="kcTog({i})" tabindex="0" role="button" '
                 f'onkeydown="if(event.key===\'Enter\'||event.key===\' \'){{event.preventDefault();kcTog({i})}}">'
                 f'<td><span id="ic-{i}" class="kc-toggle">+</span></td>'
-                f'<td><span class="kc-sev-pill" style="background:{f.sev_colour}">{self._e(f.severity)}</span></td>'
+                f'<td><span class="kc-sev-pill" style="background:{f.sev_color}">{self._e(f.severity)}</span></td>'
                 f'<td><span class="kc-cat-pill" style="background:{oc_col}">{self._e(oc)}</span></td>'
                 f'<td><code>{self._e(f.rule_id)}</code></td><td><strong>{self._e(f.title)}</strong></td>'
                 f'<td class="kc-num">{f.points}</td></tr>'
@@ -6730,7 +7699,7 @@ class HTMLReporter:
                 f'<td colspan="5"><div class="kc-panel">{self._finding_panel(f)}</div></td></tr>')
         catpills = "".join(
             f'<button class="kc-fp kc-fp-cat" data-f="cat:{self._e(c)}" onclick="kcFil(this)" '
-            f'style="--c:{OPCAT_COLOUR[c]}">{self._e(c)}</button>' for c in OPCAT_ORDER)
+            f'style="--c:{OPCAT_COLOR[c]}">{self._e(c)}</button>' for c in OPCAT_ORDER)
         pills = ('<button class="kc-fp kc-fp-on" data-f="sev:" onclick="kcFil(this)">All</button>'
                  '<button class="kc-fp" data-f="sev:CRITICAL" onclick="kcFil(this)" style="--c:#bd4234">Critical</button>'
                  '<button class="kc-fp" data-f="sev:HIGH" onclick="kcFil(this)" style="--c:#cb7a2f">High</button>'
@@ -6783,19 +7752,27 @@ class HTMLReporter:
             bars += (f'<div class="kc-bar-row"><div class="kc-bar-l">{self._e(os)}</div>'
                      f'<div class="kc-bar-t"><div class="kc-bar-f" style="width:{n/omax*100:.0f}%;background:{col}"></div></div>'
                      f'<div class="kc-bar-n">{n}</div></div>')
-        # trusts table (folded into inventory)
+        # trust map (folded into inventory): scope / transitivity / direction /
+        # SID-filtering + cross-domain risks — the reachable-domains view.
         trusts = ""
-        if d.trusts:
-            tt = {1:"Downlevel",2:"Uplevel",3:"MIT",4:"DCE"}; td = {0:"Disabled",1:"Inbound",2:"Outbound",3:"Bidirectional"}
+        tmap = getattr(d, "trust_map", None) or [classify_trust(t["attrs"]) for t in d.trusts]
+        if tmap:
             rows = ""
-            for t in d.trusts:
-                name = get_str(t["attrs"],"name") or get_str(t["attrs"],"trustPartner")
-                ta = get_int(t["attrs"],"trustAttributes")
-                sidf = "<span class='kc-ok'>yes</span>" if ta & TRUST_ATTR_QUARANTINED else "<span class='kc-bad'>no</span>"
-                rows += (f'<tr><td><strong>{self._e(name)}</strong></td><td>{tt.get(get_int(t["attrs"],"trustType"),"?")}</td>'
-                         f'<td>{td.get(get_int(t["attrs"],"trustDirection"),"?")}</td><td>{sidf}</td></tr>')
-            trusts = ('<div class="kc-sub-h">Trusts</div><table class="kc-table"><thead><tr><th>Partner</th>'
-                      '<th>Type</th><th>Direction</th><th>SID filtering</th></tr></thead>'
+            for c in tmap:
+                sidf = ("<span class='kc-ok'>yes</span>" if c["sid_filtering"]
+                        else "<span class='kc-bad'>no</span>")
+                trans = "yes" if c["transitive"] else "no"
+                risk = (f"<span class='kc-bad'>{self._e('; '.join(c['risks']))}</span>"
+                        if c["risks"] else "<span class='kc-muted'>—</span>")
+                rows += (f'<tr><td><strong>{self._e(c["name"])}</strong></td>'
+                         f'<td>{self._e(c["scope"])}</td><td>{self._e(c["direction"])}</td>'
+                         f'<td>{trans}</td><td>{sidf}</td><td class="kc-detail">{risk}</td></tr>')
+            trusts = ('<div class="kc-sub-h">Trust map <span style="font-weight:400;'
+                      'text-transform:none;letter-spacing:0;color:var(--faint)">— reachable '
+                      'domains & cross-domain risk</span></div>'
+                      '<table class="kc-table"><thead><tr><th>Partner</th><th>Scope</th>'
+                      '<th>Direction</th><th>Transitive</th><th>SID filtering</th>'
+                      '<th>Risk</th></tr></thead>'
                       f'<tbody>{rows}</tbody></table>')
         return ('<div class="kc-sub-h">Domain inventory</div>'
                 f'<div class="kc-stat-grid">{cells}</div>'
@@ -6805,16 +7782,23 @@ class HTMLReporter:
 
     # ── assemble ──────────────────────────────────────────────────────────────
     def render(self):
+        drawer = ('<div class="kc-drawer-ov" id="kc-drawer-ov" onclick="kcCloseDrawer()"></div>'
+                  '<aside class="kc-drawer" id="kc-drawer" aria-label="Node detail">'
+                  '<div class="kc-dw-h"><span class="nm" id="kc-dw-name"></span>'
+                  '<button class="kc-dw-x" onclick="kcCloseDrawer()" title="Close">✕</button></div>'
+                  '<div class="kc-dw-b" id="kc-dw-body"></div></aside>')
         body = (self._head() + self._nav() + '<main class="kc-container">' +
                 self._summary_section() + self._paths_section() +
-                self._privileged_section() + self._findings_section() + '</main>'
+                self._privileged_section() + self._findings_section() + '</main>' + drawer +
                 f'<footer class="kc-footer">{TOOL_NAME} v{VERSION} — authorized security assessment use only · '
                 f'generated {self._e(self.ts)}</footer>'
                 '<button class="kc-top" onclick="kcJump(\'top\')" title="Back to top">↑</button>')
+        registry = '<script>window.KC_NODES=' + self._node_registry_json() + ';</script>'
         return ('<!DOCTYPE html><html lang="en" data-theme="dark"><head><meta charset="utf-8">'
                 '<meta name="viewport" content="width=device-width,initial-scale=1">'
                 f'<title>{TOOL_NAME} — {self._e(self.domain)}</title><style>' + _KC_CSS +
-                '</style></head><body>' + body + '<script>' + _KC_JS + '</script></body></html>')
+                '</style></head><body>' + body + registry +
+                '<script>' + _KC_JS + '</script></body></html>')
 
     def _remediation(self, rule_id):
         r = (RULE_DOCS.get(rule_id, {}) or {}).get("remediation")
@@ -6901,12 +7885,15 @@ def main():
             traceback.print_exc()
 
     # ── control-path graph closure (who can become DA) ────────────────────────
-    try:
-        ControlPathAnalyzer(ad_conn, data, args).run()
-    except Exception as e:
-        if args.verbose:
-            print(f"[!] control-path analysis error: {e}")
-            traceback.print_exc()
+    if args.no_paths:
+        print("[*] Skipping control-path analysis (--no-paths).")
+    else:
+        try:
+            ControlPathAnalyzer(ad_conn, data, args).run()
+        except Exception as e:
+            if args.verbose:
+                print(f"[!] control-path analysis error: {e}")
+                traceback.print_exc()
 
     # ── run checks ───────────────────────────────────────────────────────────
     print("[*] Running security checks...")
@@ -6950,13 +7937,13 @@ def main():
     sorted_findings = sorted(findings,
         key=lambda f:(sev_order.get(f.severity,5),f.category))
     for f in sorted_findings:
-        colour_map = {"CRITICAL":"\033[91m","HIGH":"\033[93m",
+        color_map = {"CRITICAL":"\033[91m","HIGH":"\033[93m",
                       "MEDIUM":"\033[33m","LOW":"\033[32m","INFO":"\033[36m"}
         reset = "\033[0m"
         if args.no_color:
-            colour_map = defaultdict(str)
+            color_map = defaultdict(str)
             reset = ""
-        c = colour_map.get(f.severity,"")
+        c = color_map.get(f.severity,"")
         print(f"  {c}[{f.severity:8s}]{reset} [{f.rule_id}] {f.title}")
         if f.details and args.verbose:
             print(f"           {f.details[:120]}")
@@ -7009,8 +7996,9 @@ def main():
         print(f"[+] CSV findings saved: {cpath}")
 
     print()
-    # exit non-zero when an exploitable path / poor grade is present (useful in CI)
-    return 0 if (scores.get("exposure", 0) < 35 and scores.get("grade") in ("A", "B")) else 1
+    # exit non-zero when a Tier-0 path is exposed (useful in CI gating). The
+    # letter grade was removed from scoring, so key off exposure alone.
+    return 0 if scores.get("exposure", 0) < 35 else 1
 
 
 if __name__ == "__main__":
