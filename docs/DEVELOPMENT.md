@@ -131,9 +131,10 @@ Status as of the control-path overhaul:
 8. **Done.** `integrations/nxc/scout.py` is a NetExec `ldap` module that adopts
    nxc's already-authenticated impacket LDAP connection
    (`ADConnection.adopt_impacket()`) and runs the engine, writing SCOUT's HTML/
-   JSON report. LDAP-only (no SMB/SYSVOL). `make_args()` provides a fully
-   defaulted args namespace for embedders. Validated against a live DC:
-   `nxc ldap <dc> -u u -p p -M scout`.
+   JSON report. Directory data reuses nxc's LDAP connection; SMB/SYSVOL checks
+   open a separate SMB connection from the same credentials (`NO_SMB=true` to
+   skip). `make_args()` provides a fully defaulted args namespace for embedders.
+   Validated against a live DC: `nxc ldap <dc> -u u -p p -M scout`.
 9. **Done.** `classify_trust()` classifies every trust (scope: intra-forest /
    forest / external / realm; transitivity; direction; SID-filtering; selective
    auth; TGT delegation) into a reachable-domains "Trust map" in the report, with
