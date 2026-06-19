@@ -23,7 +23,7 @@ report plus optional JSON and CSV.
 # binding is enforced)
 ./scout.py -d corp.local -u jdoe -p 'P@ssw0rd' -k --dc-ip 10.0.0.10
 
-# Overpass-the-hash / AES key
+# Pass-the-hash / AES key
 ./scout.py -d corp.local -u jdoe -H :<NThash> -k --dc-ip 10.0.0.10
 ./scout.py -d corp.local -u jdoe --aes-key <hex> --dc-ip 10.0.0.10
 
