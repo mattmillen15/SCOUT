@@ -1,6 +1,6 @@
 # SCOUT
 
-![SCOUT HTML report](docs/img/report.png)
+![SCOUT HTML report](docs/img/scout_example_report.png)
 
 Security Configuration Observation & Understanding Tool — an offline Active
 Directory security assessment that runs from a non-domain-joined Linux host.
