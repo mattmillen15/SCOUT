@@ -10,8 +10,8 @@ against a rule set covering privilege escalation, credential access, lateral
 movement, persistence, and hygiene, and writes an interactive single-file HTML
 report plus optional JSON and CSV.
 
-## Usage
-**NOTE: This tool is currently in a BETA phase. This is largely AI generated, and there are errors, logic flaws, severity discrepencies, etc that need to be addressed. The more data the better. If you find something that is missing or run into an edge case / error -- submit an issue or PR.**
+## BETA WARNING
+**This tool is currently in a BETA phase. This is largely AI generated, and there are errors, logic flaws, severity discrepencies, etc that need to be addressed. The more data the better. If you find something that is missing or run into an edge case / error -- submit an issue or PR.**
 
 ## Usage
 
