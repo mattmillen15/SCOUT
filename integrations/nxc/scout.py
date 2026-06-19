@@ -10,12 +10,13 @@ Install:
 
 Usage:
     nxc ldap <dc> -u user -p pass -M scout
-    nxc ldap <dc> -u user -H :<nthash> -k -M scout -o OUTPUT=/tmp/r.html NO_PATHS=true
+    nxc ldap <dc> -u user -H :<nthash> -k -M scout -o OUTPUT=/tmp/r.html
     nxc ldap <dc> -u user -p pass -M scout -o PATH=/path/to/SCOUT/scout.py
 
-This reuses nxc's authenticated impacket LDAP connection (no second bind). It is
-an LDAP-only assessment: SMB/SYSVOL checks (GPP cpassword, SMB signing) are not
-run here — use nxc's own modules for those.
+Directory data reuses nxc's authenticated LDAP connection (no second bind).
+SMB/SYSVOL checks (SMB signing, SMBv1, GPP cpassword) open a separate SMB
+connection to the DC using the same credentials nxc authenticated with; disable
+them with NO_SMB=true.
 """
 import os
 import sys
@@ -44,12 +45,14 @@ class NXCModule:
         PATH      Path to scout.py (else $SCOUT_PATH, else ./scout.py).
         OUTPUT    HTML report path (default scout_<domain>.html in cwd).
         JSON      JSON output path ("true" for default name, or a path).
+        NO_SMB    "true" to skip SMB/SYSVOL checks (signing, SMBv1, GPP cpassword).
         NO_PATHS  "true" to skip the control-path graph closure (faster).
         NO_ADCS   "true" to skip ADCS certificate-template checks.
         """
         self.path = module_options.get("PATH") or os.environ.get("SCOUT_PATH") or "scout.py"
         self.output = module_options.get("OUTPUT")
         self.json = module_options.get("JSON")
+        self.no_smb = str(module_options.get("NO_SMB", "false")).lower() == "true"
         self.no_paths = str(module_options.get("NO_PATHS", "false")).lower() == "true"
         self.no_adcs = str(module_options.get("NO_ADCS", "false")).lower() == "true"
 
@@ -64,16 +67,40 @@ class NXCModule:
         spec.loader.exec_module(mod)
         return mod
 
+    def _creds_from_conn(self, connection):
+        """Map nxc's authenticated connection onto SCOUT's auth args so the SMB
+        checkers can reconnect with the same identity. SCOUT's SMB/SYSVOL classes
+        open their own SMB socket (they never use the LDAP connection)."""
+        nt = getattr(connection, "nthash", "") or ""
+        lm = getattr(connection, "lmhash", "") or ""
+        hashes = f"{lm}:{nt}" if nt else None
+        # Non-Kerberos: connection.host is the IP. Kerberos: it is the supplied
+        # target (hostname/FQDN), which impacket can still connect to over SMB.
+        dc_ip = (getattr(connection, "host", "") or getattr(connection, "hostname", "")
+                 or getattr(connection, "remoteName", ""))
+        remote = getattr(connection, "remoteName", "") or ""
+        dc_host = remote if "." in remote else getattr(connection, "hostname", "") or ""
+        return {
+            "username": getattr(connection, "username", "") or "",
+            "password": getattr(connection, "password", "") or "",
+            "hashes": hashes,
+            "aes_key": getattr(connection, "aesKey", None),
+            "kerberos": bool(getattr(connection, "kerberos", False)),
+            "dc_ip": dc_ip,
+            "dc_host": dc_host,
+        }
+
     def on_login(self, context, connection):
         scout = self._load_scout(context)
         if scout is None:
             return
 
         domain = getattr(connection, "domain", "") or getattr(connection, "targetDomain", "")
-        dc_ip = getattr(connection, "host", "") or getattr(connection, "target", "")
-        args = scout.make_args(domain=domain, dc_ip=dc_ip,
-                               no_smb=True, no_paths=self.no_paths, no_adcs=self.no_adcs,
-                               no_color=True, verbose=False)
+        creds = self._creds_from_conn(connection)
+        dc_ip = creds["dc_ip"]
+        args = scout.make_args(domain=domain,
+                               no_smb=self.no_smb, no_paths=self.no_paths, no_adcs=self.no_adcs,
+                               no_color=True, verbose=False, **creds)
 
         ad = scout.ADConnection(args)
         try:
@@ -81,7 +108,8 @@ class NXCModule:
         except Exception as e:
             context.log.fail(f"SCOUT: could not adopt nxc LDAP connection: {e}")
             return
-        context.log.display(f"SCOUT: assessing {domain or dc_ip} (base {ad.base_dn})")
+        smb_note = "" if self.no_smb else " (+SMB/SYSVOL)"
+        context.log.display(f"SCOUT: assessing {domain or dc_ip} (base {ad.base_dn}){smb_note}")
 
         # SCOUT's collection/analysis print operator-style progress to stdout;
         # capture it so nxc's output stays clean, then surface a summary.
@@ -90,12 +118,16 @@ class NXCModule:
             with contextlib.redirect_stdout(buf):
                 data = scout.ADData(ad, args)
                 data.collect()
+                if not self.no_smb:
+                    scout.SYSVOLChecker(args, data).run()
                 scout.ACLAnalyzer(ad, data, args).run()
                 if not self.no_paths:
                     scout.ControlPathAnalyzer(ad, data, args).run()
                 engine = scout.CheckEngine(data, args)
                 engine.run_all()
                 findings = engine.findings
+                if not self.no_smb:
+                    scout.SMBChecker(dc_ip, args, findings).run()
                 scores = scout.RiskScorer(findings, data).score()
         except Exception as e:
             context.log.fail(f"SCOUT: assessment failed: {e}")
