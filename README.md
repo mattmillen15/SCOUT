@@ -10,15 +10,6 @@ against a rule set covering privilege escalation, credential access, lateral
 movement, persistence, and hygiene, and writes an interactive single-file HTML
 report plus optional JSON and CSV.
 
-## Install
-
-Python 3.9+ and the packages in `requirements.txt` (`ldap3`, `impacket`,
-`pycryptodome`):
-
-```bash
-pip3 install -r requirements.txt
-```
-
 ## Usage
 
 ```bash
