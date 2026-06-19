@@ -512,7 +512,7 @@ RULE_MITRE: Dict[str, List[str]] = {
 
 # ── Graduated scoring: rule_id -> (points_per_affected, cap). When present, a
 # rule's contribution scales with the number of affected objects up to the cap,
-# scaling points with the number of affected objects. Falls back to flat points. ─
+# falling back to flat points otherwise. ─
 RULE_SCALE: Dict[str, Tuple[int, int]] = {
     "S-Inactive":        (1, 25),
     "S-C-Inactive":      (1, 25),
@@ -531,7 +531,7 @@ def scaled_points(rule_id: str, base_points: int, n_affected: int) -> int:
     """Return graduated points for a rule given how many objects it affects."""
     if rule_id in RULE_SCALE and n_affected > 0:
         per, cap = RULE_SCALE[rule_id]
-        return max(base_points if n_affected else 0, min(cap, per * n_affected))
+        return max(base_points, min(cap, per * n_affected))
     return base_points
 
 # ── Operational categories — how a pentester groups findings during an engagement
@@ -1999,7 +1999,6 @@ class ADConnection:
         Returns None when an existing ccache should be used instead (the bind
         will then load credentials from KRB5CCNAME).
         """
-        # Reuse an existing ticket cache if the operator pointed us at one.
         if self.args.ccache:
             if not os.path.exists(self.args.ccache):
                 raise FileNotFoundError(f"ccache file not found: {self.args.ccache}")
@@ -2345,7 +2344,7 @@ class ADData:
         self.laps_installed: bool = False
         self.adws_available: bool = False
         self.ds_heuristics:  str  = ""
-        self.ms_ds_other_settings: str = ""
+        self.ms_ds_other_settings: List[str] = []
         # populated by SYSVOLChecker
         self.sysvol_scanned: bool = False   # True only if SYSVOL was readable
         self.sysvol_data: Dict = {
@@ -2422,7 +2421,6 @@ class ADData:
         self.domain_level = getattr(c, "domain_func", -1)
         self.forest_level = getattr(c, "forest_func", -1)
 
-        # Schema version
         sv = c.search_one(self.sch, "(objectClass=dMD)", ["objectVersion"])
         if sv:
             self.schema_version = get_int(sv["attrs"], "objectVersion")
@@ -2434,14 +2432,12 @@ class ADData:
             ["dSHeuristics","msDS-Other-Settings"])
         if ds_obj:
             self.ds_heuristics = get_str(ds_obj["attrs"], "dSHeuristics")
-            self.ms_ds_other_settings = get_str(ds_obj["attrs"], "msDS-Other-Settings")
+            self.ms_ds_other_settings = get_list(ds_obj["attrs"], "msDS-Other-Settings")
 
-        # krbtgt
         self.krbtgt = c.search_one(self.base, "(sAMAccountName=krbtgt)", [
             "pwdLastSet","whenCreated","whenChanged","userAccountControl",
             "distinguishedName","msDS-SupportedEncryptionTypes"])
 
-        # guest
         self.guest = c.search_one(self.base, "(sAMAccountName=Guest)", [
             "userAccountControl","pwdLastSet","distinguishedName"])
 
@@ -3353,12 +3349,17 @@ class CheckEngine:
             self._add("A-DsHeuristicsAllowAnonNSPI",
                       "dSHeuristics position 3 = '1': anonymous NSPI access allowed.",
                       [f"dSHeuristics={h}"])
-        # LDAP security (position 7 must not allow relay)
-        ldap_sec = self.d.ms_ds_other_settings
-        if ldap_sec and "LDAPAddAutZVerifications" in ldap_sec:
-            self._add("A-DsHeuristicsLDAPSecurity",
-                      "msDS-Other-Settings may have CVE-2021-42291 mitigations disabled.",
-                      [f"msDS-Other-Settings: {ldap_sec[:100]}"])
+        # CVE-2021-42291: LDAPAddAutZVerifications=0 in msDS-Other-Settings means
+        # the AD-add authorization hardening is explicitly disabled. A present,
+        # non-zero value is the secure state, so only an explicit 0 is flagged.
+        for kv in (self.d.ms_ds_other_settings or []):
+            m = re.match(r"\s*LDAPAddAutZVerifications\s*=\s*(\d+)", kv)
+            if m and int(m.group(1)) == 0:
+                self._add("A-DsHeuristicsLDAPSecurity",
+                          "CVE-2021-42291 LDAP add-authorization hardening is explicitly "
+                          "disabled (LDAPAddAutZVerifications=0 in msDS-Other-Settings).",
+                          [f"msDS-Other-Settings: {'; '.join(self.d.ms_ds_other_settings)[:100]}"])
+                break
 
     def _a_laps(self):
         if not self.d.laps_installed:
@@ -3413,14 +3414,8 @@ class CheckEngine:
     def _a_lm_hash(self):
         if not self.d.domain_obj:
             return
-        # pwdProperties bit 2 = DOMAIN_PASSWORD_NO_CLEAR_CHANGE
-        # bit 1 = DOMAIN_PASSWORD_STORE_CLEARTEXT (reversible)
-        # LM hash disabled by NoLMHash policy — need to check GPO
-        # We can infer via domain pwdProperties bit 4 (DOMAIN_REFUSE_PASSWORD_CHANGE is bit 6)
-        # Actual LM hash GPO is a registry setting — check if we can detect it
-        # via domain object or defer to SMB checks
-        # Check domain functional level as proxy: if DFL >= 2003, LM should be off
-        # but we flag if DFL is old OR if we see evidence
+        # Old DFL (pre-2003) implies LM-hash storage may still be active; flag it
+        # so the "Do not store LAN Manager hash" GPO can be verified.
         if self.d.domain_level is not None and 0 <= self.d.domain_level < 2:
             self._add("A-LMHashAuthorized",
                       "Domain functional level suggests LM hash storage may be active. "
@@ -3476,8 +3471,9 @@ class CheckEngine:
                     if sid not in (AU_SID, EV_SID):
                         continue
                     mask = ace["Ace"]["Mask"]["Mask"]
-                    # ADS_RIGHT_DS_CREATE_CHILD = 0x1, GenericAll = 0xF01FF
-                    if mask & 0x1 or mask & 0xF01FF:
+                    # CreateChild = 0x1; generic-mapped GenericAll = 0x10000000,
+                    # GenericWrite = 0x40000000 (0xF01FF would match benign reads).
+                    if mask & 0x1 or mask & 0x10000000 or mask & 0x40000000:
                         risky_zones.append(zname)
                         break
             except Exception:
@@ -3852,10 +3848,10 @@ class CheckEngine:
                    get_str(dc["attrs"], "sAMAccountName")
             if not host:
                 continue
-            if not check_port(self.args.dc_ip, 445, timeout=3):
+            if not check_port(host, 445, timeout=3):
                 continue
             try:
-                strbind = epm.hept_map(self.args.dc_ip,
+                strbind = epm.hept_map(host,
                                        RPRN_UUID[0],
                                        protocol="ncacn_ip_tcp")
                 if strbind:
@@ -3968,7 +3964,6 @@ class CheckEngine:
         self._p_exchange_priv_esc()
         self._p_delegations()
         self._p_unprotected_ous()
-        self._p_everyone_privs()
 
     def _priv_last_logon_map(self) -> Dict[str, int]:
         """Roadmap item 7: max non-replicated lastLogon per privileged account
@@ -4183,16 +4178,20 @@ class CheckEngine:
                       active[:20])
 
     def _p_recycle_bin(self):
-        # Check for AD Recycle Bin optional feature
-        rb = self.d.conn.search_one(
-            f"CN=Optional Features,CN=Directory Service,CN=Windows NT,CN=Services,{self.d.cfg}",
-            "(cn=Recycle Bin Feature)",
-            ["msDS-EnabledFeature","distinguishedName"])
-        # If not found or enabledScopes list is empty, Recycle Bin is not enabled
+        # AD Recycle Bin: the feature OBJECT lives under CN=Optional Features, but
+        # whether it is ENABLED is recorded by msDS-EnabledFeature on the NC head
+        # (CN=Partitions,{cfg}), a forward-link listing the DNs of enabled features.
+        feat_dn = ("CN=Recycle Bin Feature,CN=Optional Features,CN=Directory "
+                   f"Service,CN=Windows NT,CN=Services,{self.d.cfg}").lower()
+        parts = self.d.conn.search_one(
+            f"CN=Partitions,{self.d.cfg}",
+            "(objectClass=crossRefContainer)",
+            ["msDS-EnabledFeature"])
         enabled = False
-        if rb:
-            enabled_scopes = get_list(rb["attrs"], "msDS-EnabledFeature")
-            enabled = len(enabled_scopes) > 0
+        if parts:
+            enabled_dns = [d.lower() for d in
+                           get_list(parts["attrs"], "msDS-EnabledFeature")]
+            enabled = feat_dn in enabled_dns
         if not enabled:
             self._add("P-RecycleBin",
                       "AD Recycle Bin is not enabled — deleted objects cannot be recovered "
@@ -4342,11 +4341,6 @@ class CheckEngine:
                       "its child objects.",
                       unprotected)
 
-    def _p_everyone_privs(self):
-        # Check if User Rights Assignment GPO grants sensitive privs to Everyone
-        # Can't read GPO content without SMB; flag for review
-        pass
-
     # =========================================================================
     # STALE CHECKS (S-)
     # =========================================================================
@@ -4369,7 +4363,6 @@ class CheckEngine:
         self._s_aes_not_enabled()
         self._s_primary_group()
         self._s_kerberos_armoring()
-        self._s_wsus_gpo()
         self._s_ms14_068()
         self._s_dc_subnet_missing()
 
@@ -4724,21 +4717,11 @@ class CheckEngine:
         # msDS-SupportedEncryptionTypes on DCs and domain should include FAST
         # Check if CLAIMS_SUPPORTED (0x40) is set in domain SupportedEncTypes
         # As a proxy, check if functional level >= 2012
-        if self.d.domain_level is not None and self.d.domain_level < 5:
+        if self.d.domain_level is not None and 0 <= self.d.domain_level < 5:
             self._add("S-KerberosArmoring",
                       "Domain functional level below 2012 — Kerberos FAST/armoring "
                       "(RFC 6113) is not available.",
                       [f"DFL={FUNCTIONAL_LEVELS.get(self.d.domain_level)}"])
-
-    def _s_wsus_gpo(self):
-        # Check for WSUS WUServer in GPOs — requires SYSVOL read via SMB
-        # Flag as review item
-        wsus_keys = self.d.conn.paged_search(
-            self.d.base,
-            "(objectClass=groupPolicyContainer)",
-            ["gPCFileSysPath","displayName"])
-        # Without SYSVOL content we can only flag for review
-        pass
 
     def _s_ms14_068(self):
         # MS14-068: PAC validation bypass — patched in KB3011780 (Nov 2014)
@@ -4840,9 +4823,10 @@ class CheckEngine:
                       [name])
 
         # SID filtering
-        # TRUST_ATTR_QUARANTINED_DOMAIN (0x4) = SID filtering enabled
-        # For outbound trust (domain trusts us), SID filtering should be on
-        if tdir in (TRUST_DIR_OUTBOUND, TRUST_DIR_BIDIRECT):
+        # TRUST_ATTR_QUARANTINED_DOMAIN (0x4) = SID filtering enabled.
+        # Inbound/bidirectional trusts let the partner's principals authenticate
+        # INTO this domain; without SID filtering that enables SID-history injection.
+        if tdir in (TRUST_DIR_INBOUND, TRUST_DIR_BIDIRECT):
             if not (attrs & TRUST_ATTR_QUARANTINED):
                 if not (attrs & TRUST_ATTR_WITHIN_FOREST):
                     self._add("T-SIDFiltering",
@@ -4867,7 +4851,7 @@ class CheckEngine:
                 sids = get_list(obj["attrs"], "sIDHistory")
                 for sid in sids:
                     sid_s = sid_to_str(sid) if isinstance(sid, bytes) else str(sid)
-                    if trust_sid_str and sid_s.startswith(trust_sid_str[:-3]):
+                    if trust_sid_str and sid_s.startswith(trust_sid_str + "-"):
                         sam = get_str(obj["attrs"], "sAMAccountName")
                         self._add("T-SIDHistoryDangerous",
                                   f"Object '{sam}' has SID history containing a SID from "
@@ -4903,7 +4887,6 @@ class CheckEngine:
         self._a_wdigest()
         self._a_lm_compat()
         self._a_wsus_http_gpo()
-        self._s_wsus_http_full()
         self._a_dsrm_logon()
         # Absence-based checks ("not configured via GPO") MUST NOT run if SYSVOL
         # could not be read — otherwise every setting looks unconfigured and we
@@ -5126,10 +5109,6 @@ class CheckEngine:
                           f"WSUS WUServer URL is HTTP: {url}. "
                           "HTTP WSUS allows MITM update injection to gain SYSTEM on any patching client. "
                           "Switch to HTTPS and enable SSL certificate validation.")
-
-    def _s_wsus_http_full(self):
-        # Also catch the older S-WSUS-HTTP rule for backward compat
-        pass
 
     # =========================================================================
     # ACL CHECKS  (populated after ACLAnalyzer runs)
@@ -5457,24 +5436,6 @@ class SYSVOLChecker:
         return guid
 
     def _scan_gpo(self, guid: str, display_name: str, base_path: str):
-        subdirs = ["Machine\\", "User\\",
-                   "Machine\\Preferences\\", "User\\Preferences\\",
-                   "Machine\\Preferences\\Groups\\",
-                   "User\\Preferences\\Groups\\",
-                   "Machine\\Preferences\\Services\\",
-                   "User\\Preferences\\Services\\",
-                   "Machine\\Preferences\\ScheduledTasks\\",
-                   "User\\Preferences\\ScheduledTasks\\",
-                   "Machine\\Preferences\\DataSources\\",
-                   "User\\Preferences\\DataSources\\",
-                   "Machine\\Preferences\\Printers\\",
-                   "User\\Preferences\\Printers\\",
-                   "Machine\\Preferences\\Drives\\",
-                   "User\\Preferences\\Drives\\",
-                   "Machine\\Microsoft\\Windows NT\\SecEdit\\",
-                   "Machine\\Registry.pol",
-                   "User\\Registry.pol",
-                   ]
         # Scan Registry.pol files
         for subpath in ["Machine\\Registry.pol", "User\\Registry.pol"]:
             full = base_path + subpath
@@ -5608,9 +5569,6 @@ _DCSYNC_GUIDS = {
     "89e95b76-444d-4c62-991a-0facbeda640c": "DS-Replication-Get-Changes-In-Filtered-Set",
 }
 
-# Write-member GUID (member attribute objectGuid in schema)
-_MEMBER_GUID = "bf9679c0-0de6-11d0-a285-00aa003049e2"
-
 
 def _guid_from_bytes(b: bytes) -> str:
     """Format a little-endian GUID bytes to string."""
@@ -5689,8 +5647,6 @@ class ACLAnalyzer:
                 if domain_sid:
                     self._broad[f"{domain_sid}-513"] = "Domain Users"
                     self._broad[f"{domain_sid}-515"] = "Domain Computers"
-                    self._broad[f"{domain_sid}-516"] = "Domain Controllers"  # not broad, but collect
-                    self._broad.pop(f"{domain_sid}-516", None)
 
     def _raw_sid_to_str(self, raw) -> str:
         if isinstance(raw, (bytes, bytearray)):
@@ -5995,8 +5951,12 @@ class ControlPathAnalyzer:
         [LDAP://cn={GUID},cn=policies,cn=system,DC=…;0][LDAP://…;2]."""
         if not gplink:
             return []
-        return [m.group(1).strip() for m in
-                re.finditer(r'\[LDAP://([^;\]]+);?\d*\]', gplink, re.I)]
+        out = []
+        for m in re.finditer(r'\[LDAP://([^;\]]+);?(\d*)\]', gplink, re.I):
+            if int(m.group(2) or 0) & 1:   # GPLINK_OPT_DISABLED -> link inactive
+                continue
+            out.append(m.group(1).strip())
+        return out
 
     def _gpo_edges(self):
         """GPO control -> Tier 0, with real gPLink resolution (roadmap 1). A GPO
@@ -6991,11 +6951,8 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')kcCloseDrawe
 
 
 class HTMLReporter:
-    """Single-file, dependency-free interactive HTML deliverable built for the
-    operator running the assessment: a slim header, an at-a-glance summary with
-    the target dossier, a BloodHound-style 'Paths to Domain Dominance' view, a
-    prioritized action plan, MITRE ATT&CK coverage, evidence tables and a
-    filterable finding register with copy-ready tradecraft. Light/dark + print."""
+    """Renders findings and scores into a single self-contained HTML report
+    (no external assets)."""
 
     _SEV_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
 

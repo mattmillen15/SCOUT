@@ -1,5 +1,7 @@
 # SCOUT
 
+![SCOUT HTML report](docs/img/report.png)
+
 Security Configuration Observation & Understanding Tool — an offline Active
 Directory security assessment that runs from a non-domain-joined Linux host.
 
@@ -8,19 +10,10 @@ against a rule set covering privilege escalation, credential access, lateral
 movement, persistence, and hygiene, and writes an interactive single-file HTML
 report plus optional JSON and CSV.
 
-Coverage includes: ACL/DCSync control paths, RBCD and constrained delegation,
-ADCS ESC1/2/3/4/7/8/9, SCCM and WSUS, Kerberoasting/AS-REP, GPP cpassword, LAPS,
-SMB signing and SMBv1, password-spray surface, and control-path closure to
-Tier 0. The report scores Exposure (0–100, easiest path to Tier 0) and Hygiene
-debt (0–100), groups findings by operation, and includes copy-ready exploitation
-and remediation commands per finding.
-
-## Requirements
+## Install
 
 Python 3.9+ and the packages in `requirements.txt` (`ldap3`, `impacket`,
-`pycryptodome`).
-
-## Install
+`pycryptodome`):
 
 ```bash
 pip3 install -r requirements.txt
@@ -55,38 +48,18 @@ KRB5CCNAME=jdoe.ccache ./scout.py -d corp.local --dc-ip 10.0.0.10
 When a bind returns `strongerAuthRequired` (signing/channel binding enforced) and
 usable credentials are present, SCOUT upgrades to Kerberos.
 
-## Options
-
-| Option | Purpose |
-| --- | --- |
-| `-k`, `--kerberos` | Request a TGT and bind with Kerberos |
-| `--ccache FILE` | Reuse an existing ccache (also honors `KRB5CCNAME`) |
-| `--save-ccache [FILE]` | Save the obtained TGT for reuse |
-| `--aes-key HEX` | Kerberos AES key |
-| `--ldaps` | Use LDAPS (636) |
-| `--dc-host FQDN` | DC FQDN for the Kerberos SPN (auto-resolved otherwise) |
-| `--no-smb` / `--no-adcs` / `--no-paths` | Skip SMB/SYSVOL, ADCS, or control-path analysis |
-| `--accurate-logon` | Reconcile `lastLogon` across every DC for privileged-inactivity findings |
-| `-o FILE` | HTML report path (default `scout_<domain>_<ts>.html`) |
-| `--json` / `--csv` | Also write JSON / CSV findings |
-| `--operator` / `--scope` | Report cover metadata |
-
-## NetExec module
+### NetExec
 
 `integrations/nxc/scout.py` runs the engine as a NetExec `ldap` module. Directory
 data reuses nxc's authenticated LDAP connection (no second bind); SMB/SYSVOL
 checks open a separate SMB connection using the same credentials.
 
-Deploy:
-
 ```bash
+# Deploy
 cp integrations/nxc/scout.py ~/.nxc/modules/scout.py
 export SCOUT_PATH=/path/to/SCOUT/scout.py   # or pass -o PATH=/path/to/scout.py
-```
 
-Run:
-
-```bash
+# Run
 nxc ldap <dc> -u user -p pass -M scout                 # writes scout_<domain>.html
 nxc ldap <dc> -u user -H :<NThash> -k -M scout
 nxc ldap <dc> -u user -p pass -M scout -o NO_SMB=true JSON=true
@@ -103,12 +76,21 @@ Module options (`-o KEY=value`):
 | `NO_PATHS` | Skip control-path analysis |
 | `NO_ADCS` | Skip ADCS checks |
 
-## Output
+### Options
 
-- `scout_<domain>_<ts>.html` — interactive report.
-- `--json` / `--csv` — findings for diffing across scans.
+| Option | Purpose |
+| --- | --- |
+| `-k`, `--kerberos` | Request a TGT and bind with Kerberos |
+| `--ccache FILE` | Reuse an existing ccache (also honors `KRB5CCNAME`) |
+| `--save-ccache [FILE]` | Save the obtained TGT for reuse |
+| `--aes-key HEX` | Kerberos AES key |
+| `--ldaps` | Use LDAPS (636) |
+| `--dc-host FQDN` | DC FQDN for the Kerberos SPN (auto-resolved otherwise) |
+| `--no-smb` / `--no-adcs` / `--no-paths` | Skip SMB/SYSVOL, ADCS, or control-path analysis |
+| `--accurate-logon` | Reconcile `lastLogon` across every DC for privileged-inactivity findings |
+| `-o FILE` | HTML report path (default `scout_<domain>_<ts>.html`) |
+| `--json` / `--csv` | Also write JSON / CSV findings |
+| `--operator` / `--scope` | Report cover metadata |
 
-## Authorization
-
-For authorized assessments only. SCOUT reads directory and SYSVOL data with the
-rights of the supplied account; it does not modify the directory.
+The HTML report is always written (`scout_<domain>_<ts>.html` by default, or `-o`);
+`--json` / `--csv` add machine-readable findings for diffing across scans.
