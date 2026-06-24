@@ -60,21 +60,22 @@ Three numbers, deliberately *not* one saturating gauge for everything:
 - **Hygiene debt (0–100, higher = worse)** = sum of `HYGIENE_WEIGHTS`
   contributions; `pct_users`/`pct_comps` entries scale by the fraction of
   enabled objects affected.
-- **Posture score (0–100, higher = BETTER) + A–F grade** = the headline, à la
-  Insight Recon ("77 · C · Moderate Risk"). `RiskScorer.posture()` = `100 −
-  severity-weighted finding deductions (per-severity caps) − exposure penalty`,
-  so it *differentiates* (a clean domain = A; a few mediums = C; crits / a live
-  Tier-0 path = F) instead of pinning. `RiskScorer.grade()` maps it to A/B/C/D/F
-  + a risk word + color.
+- **Posture score (0–100, higher = BETTER)** = the headline number. `RiskScorer.
+  posture()` = `100 − severity-weighted finding deductions (per-severity caps) −
+  exposure penalty`, so it *differentiates* (a clean domain ~90+; a few mediums
+  ~70; crits / a live Tier-0 path ~20–40) instead of pinning. The report shows the
+  number out of 100 plus a **risk word** (Strong / Good / Moderate risk / Weak /
+  Critical risk) and a colour — **no letter grade** (a "36 = F" letter tested as
+  confusing; the number speaks for itself). `RiskScorer.grade()` still derives the
+  word+colour from the same bands; its letter return value is unused.
 - **Verdict** = `RiskScorer.verdict(exposure)` — the plain-English exposure band
   ("Domain compromisable" … "No direct path"), still shown alongside.
 - `RULE_SCALE` graduates per-finding `points` (used for finding sort).
 
 History note: a *single saturating* A–F gauge was removed once because it pinned
-at the extremes. The current grade is a **deduction model with caps**, which
-behaves like Insight Recon's and was re-added deliberately (the maturity/CMMI
-table remains computed but unused). See `ROADMAP.md` for the full Insight-Recon
-parity plan.
+at the extremes; a deduction-model letter grade replaced it, then the letter was
+dropped too in favour of the bare 0–100 number (clearer). The maturity/CMMI table
+remains computed but unused. See `ROADMAP.md` for the Insight-Recon parity plan.
 
 ## Adding a rule
 

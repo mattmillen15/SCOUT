@@ -6492,8 +6492,12 @@ class ControlPathAnalyzer:
         control of it WITHOUT being a member (the shadow-admin set), each with the
         resolved path. Computed from the in-memory control graph (adj/radj)."""
         from collections import deque
+        # Tier-0 groups + the domain root, plus broad "Domain Computers" (515) —
+        # not Tier-0, but control over it is a notable exposure worth surfacing.
+        sensitive = [f"{self.dsid}-{r}" for r in (515,) if self.dsid]
         targets = list(dict.fromkeys(
-            [s for s in self.tier0_groups if s in self.sid2name] + [self.domain_root]))
+            [s for s in self.tier0_groups if s in self.sid2name]
+            + [s for s in sensitive if s in self.sid2name] + [self.domain_root]))
         out = []
         for t in targets:
             # 1) membership closure of t (reverse over membership-only edges)
@@ -6922,13 +6926,13 @@ class RiskScorer:
     def score(self) -> Dict[str, Any]:
         exp = self.exposure(); hyg = self.hygiene()
         word, _ = self.verdict(exp)
-        pos = self.posture(); letter, gword, _ = self.grade(pos)
+        pos = self.posture(); _, gword, _ = self.grade(pos)
         cat_counts = defaultdict(int)
         for f in self.findings:
             cat_counts[f.category] += 1
         return {
             "exposure": exp, "hygiene": hyg, "verdict": word,
-            "posture": pos, "grade": letter, "grade_word": gword,
+            "posture": pos, "grade_word": gword,
             "cat_counts": {c: cat_counts.get(c, 0) for c in ("Anomaly","Privileged","Stale","Trust")},
         }
 
@@ -7456,9 +7460,8 @@ html[data-theme=light] .kc-term{background:#21250e;color:#dfe6c4}
   border-top:3px solid var(--g,var(--accent));padding:14px 12px;text-align:center}
 .kc-grade-ring{position:relative;width:118px;height:118px;display:flex;align-items:center;justify-content:center}
 .kc-grade-ring svg{position:absolute;inset:0}
-.kc-grade-letter{font-size:50px;font-weight:800;line-height:1;color:var(--g,var(--accent))}
-.kc-grade-score{font-family:var(--mono);font-size:13px;font-weight:700;color:var(--text);margin-top:5px}
-.kc-grade-score small{color:var(--muted);font-weight:400}
+.kc-grade-num{font-size:44px;font-weight:800;line-height:1;color:var(--g,var(--accent))}
+.kc-grade-num span{font-size:15px;font-weight:600;color:var(--muted)}
 .kc-grade-word{font-size:13px;font-weight:700;color:var(--g,var(--accent));margin-top:5px;line-height:1.2}
 .kc-grade-cap{font-family:var(--mono);font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint);margin-top:3px}
 .kc-hero-mid{flex:1;min-width:300px;display:flex;flex-direction:column;justify-content:center;gap:13px;
@@ -7821,13 +7824,12 @@ class HTMLReporter:
     def _scoreband(self):
         s = self.scores
         exp = s.get("exposure",0); hyg = s.get("hygiene",0)
-        pos = s.get("posture",0); letter = s.get("grade","?"); gword = s.get("grade_word","")
+        pos = s.get("posture",0); gword = s.get("grade_word","")
         _, _, gcol = RiskScorer.grade(pos)
         word, vcol = RiskScorer.verdict(exp)
         grade_card = (f'<div class="kc-grade" style="--g:{gcol}">'
                       f'<div class="kc-grade-ring">{self._grade_ring(pos, gcol)}'
-                      f'<div class="kc-grade-letter">{self._e(letter)}</div></div>'
-                      f'<div class="kc-grade-score">{pos}<small>/100</small></div>'
+                      f'<div class="kc-grade-num">{pos}<span>/100</span></div></div>'
                       f'<div class="kc-grade-word">{self._e(gword)}</div>'
                       '<div class="kc-grade-cap">Posture score</div></div>')
         mid = ('<div class="kc-hero-mid">'
@@ -9216,8 +9218,7 @@ def main():
     for f in findings:
         sevc[f.severity] += 1
     print(f"\n{'='*60}")
-    print(f"  POSTURE GRADE : {scores.get('grade','?')}  {scores.get('posture',0):3d}/100  "
-          f"({scores.get('grade_word','')})")
+    print(f"  POSTURE       : {scores.get('posture',0):3d}/100  ({scores.get('grade_word','')})")
     print(f"  EXPOSURE      : {scores['exposure']:3d}/100  ({scores.get('verdict','')})")
     print(f"  HYGIENE DEBT  : {scores['hygiene']:3d}/100  (misconfig & stale load)")
     print(f"{'='*60}")
@@ -9266,7 +9267,7 @@ def main():
             "tool": TOOL_NAME, "version": VERSION,
             "domain": args.domain, "dc_ip": args.dc_ip, "auth_mode": auth_mode,
             "timestamp": now_iso,
-            "scores": {k: scores[k] for k in ("posture","grade","grade_word","exposure","hygiene","verdict","cat_counts") if k in scores},
+            "scores": {k: scores[k] for k in ("posture","grade_word","exposure","hygiene","verdict","cat_counts") if k in scores},
             "findings": [
                 {"rule_id": f.rule_id, "title": f.title,
                  "category": f.category, "operation": op_category(f.rule_id, f.category),
