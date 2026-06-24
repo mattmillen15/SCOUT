@@ -6354,14 +6354,18 @@ class SMBChecker:
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── SCOUT risk model ──────────────────────────────────────────────────────────
-# Two orthogonal axes instead of one saturating gauge:
+# Two orthogonal RISK axes (higher = worse) feed one POSTURE score (higher = better):
 #   EXPOSURE (0-100) = how reachable Tier-0 is, defined by the *easiest* attack
 #       path available to the operator. A domain with one ESC1 template and a
 #       domain with GPP+DCSync are both bad, but a hardened domain with no path
 #       scores near zero — so the number actually differentiates.
 #   HYGIENE DEBT (0-100) = prevalence-graded misconfiguration/stale debt, so size
 #       and sloppiness of the estate move the number continuously.
-# A combined A-F POSTURE GRADE is the headline. (No 4x cap-at-100 "max" gauge.)
+#   POSTURE (0-100, higher = stronger) + A-F GRADE = the headline (Insight-Recon
+#       style: "77 · C · Moderate Risk"). 100 − severity-weighted finding
+#       deductions (per-severity caps) − an exposure penalty, so it differentiates
+#       (clean = A; a few mediums = C; crits / a live Tier-0 path = F) rather than
+#       pinning at 100/0 like a single saturating gauge would.
 
 # rule_id -> attacker effort to convert it into Tier-0 access (higher = easier).
 EXPOSURE_WEIGHTS = {
@@ -6388,7 +6392,7 @@ EXPOSURE_WEIGHTS = {
     "P-RBCD":55, "A-ReversiblePwd":52, "S-Reversible":52, "P-MachineAccountQuota":48,
     "A-DCLdapSign":45, "A-SMB2SignatureNotRequired":45, "A-DCLdapsChannelBinding":42,
     "S-DesEnabled":45, "A-NullSession":40, "P-AdminCountOrphan":35,
-    "A-SCCM":72, "A-Pre2kComputer":78, "A-WeakLockout":40,
+    "A-SCCM":72, "A-Pre2kComputer":78, "A-WeakLockout":40, "S-OS-NT":78,
     "A-CertCAManageLowPriv":88, "A-CertTemplateESC9":80,
     "P-ControlPathDA":92, "P-ControlPathIndirectEveryone":95, "P-ControlPathIndirectMany":70,
     "A-SCCMContainerACL":75, "P-GMSAReadable":88, "A-KDSRootKey":90,
@@ -6416,6 +6420,16 @@ HYGIENE_WEIGHTS = {
     "S-SIDHistory":("flat",4), "A-RestrictRemoteSAM":("flat",3), "P-MachineAccountQuota":("flat",5),
 }
 
+
+
+# Posture-grade deduction model (higher posture = stronger). Per-severity point
+# cost and a cap on how much any one severity tier can drag the score down, so
+# breadth degrades the grade smoothly without one tier alone zeroing it. Tuned so
+# a clean domain = A, a few mediums = B/C, several highs = C/D — while the
+# exposure ceiling (RiskScorer.posture) keeps a reachable/compromisable domain
+# capped at D/F no matter how few findings drive it.
+POSTURE_DEDUCT = {"CRITICAL":12.0, "HIGH":4.0, "MEDIUM":2.0, "LOW":0.6, "INFO":0.0}
+POSTURE_CAP    = {"CRITICAL":40.0, "HIGH":24.0, "MEDIUM":12.0, "LOW":6.0, "INFO":0.0}
 
 
 class RiskScorer:
@@ -6461,6 +6475,38 @@ class RiskScorer:
                 debt += w * min(1.0, len(f.affected) / nc)
         return int(min(100, round(debt)))
 
+    def posture(self) -> int:
+        """Overall AD posture, 0–100 where HIGHER = STRONGER (Insight-Recon
+        convention). 100 minus severity-weighted finding deductions (deduped by
+        rule, each tier capped) minus a small exposure penalty, then clamped by
+        an *exposure ceiling*: a domain whose Tier-0 is reachable
+        (exposure ≥ 60) or one-step compromisable (≥ 85) cannot read as a healthy
+        grade no matter how few findings drove it. Differentiates A–D for
+        defensible domains while keeping owned domains honestly at F."""
+        seen = {}
+        for f in self.findings:
+            seen.setdefault(f.rule_id, f)
+        sev_count = defaultdict(int)
+        for f in seen.values():
+            sev_count[f.severity] += 1
+        deduction = 0.0
+        for sev, n in sev_count.items():
+            per = POSTURE_DEDUCT.get(sev, 0.0); cap = POSTURE_CAP.get(sev, 0.0)
+            deduction += min(cap, per * n)
+        exp = self.exposure()
+        raw = 100 - deduction - min(18.0, exp * 0.18)
+        ceiling = 39 if exp >= 85 else 64 if exp >= 60 else 79 if exp >= 35 else 100
+        return int(max(0, min(100, round(min(raw, ceiling)))))
+
+    @staticmethod
+    def grade(posture: int) -> Tuple[str, str, str]:
+        """(letter, risk word, color) from a posture score (higher = better)."""
+        if posture >= 90: return "A", "Strong",        "#6f8f3f"
+        if posture >= 80: return "B", "Good",          "#869150"
+        if posture >= 70: return "C", "Moderate risk", "#cda52b"
+        if posture >= 60: return "D", "Weak",          "#cb7a2f"
+        return                     "F", "Critical risk","#bd4234"
+
     def maturity(self) -> int:
         """Achieved CMMI maturity = lowest level still gated by a failing rule
         (5 = perfect; one failing level-1 rule pins the whole domain at 1)."""
@@ -6480,11 +6526,13 @@ class RiskScorer:
     def score(self) -> Dict[str, Any]:
         exp = self.exposure(); hyg = self.hygiene()
         word, _ = self.verdict(exp)
+        pos = self.posture(); letter, gword, _ = self.grade(pos)
         cat_counts = defaultdict(int)
         for f in self.findings:
             cat_counts[f.category] += 1
         return {
             "exposure": exp, "hygiene": hyg, "verdict": word,
+            "posture": pos, "grade": letter, "grade_word": gword,
             "cat_counts": {c: cat_counts.get(c, 0) for c in ("Anomaly","Privileged","Stale","Trust")},
         }
 
@@ -6532,6 +6580,88 @@ RULE_EFFORT = {
     "P-ProtectedUsers":"High","A-Krbtgt":"High","S-FunctionalLevel1":"High","S-FunctionalLevel3":"High",
     "P-ComputerInPrivGroup":"High","P-ServiceDomainAdmin":"High",
 }
+EFFORT_ORDER = {"Low":0, "Moderate":1, "High":2}
+EFFORT_COLOR = {"Low":"#74934a", "Moderate":"#cda52b", "High":"#cb7a2f"}
+
+def rule_effort(rule_id: str) -> str:
+    """Remediation effort for a rule (Low / Moderate / High). Anything not
+    explicitly classified defaults to Moderate."""
+    return RULE_EFFORT.get(rule_id, "Moderate")
+
+# ── Framework mappings beyond ATT&CK techniques (RULE_MITRE) ──────────────────
+# Per-operational-category defaults for CIS Controls v8 + NIST CSF, plus per-rule
+# MITRE ATT&CK *Mitigations* (Mxxxx) for the high-signal rules. These are coarse,
+# defensible mappings — STIG V-ID mapping is on the roadmap (deliberately not
+# fabricated offline).
+OPCAT_COMPLIANCE = {
+    "Privilege Escalation": {"cis":["CIS 5","CIS 6"],  "nist":["PR.AC-1","PR.AC-4"]},
+    "Credential Access":    {"cis":["CIS 5","CIS 6"],  "nist":["PR.AC-1","PR.DS-1"]},
+    "Lateral Movement":     {"cis":["CIS 4","CIS 12"], "nist":["PR.PT-3","PR.AC-5"]},
+    "Persistence":          {"cis":["CIS 8"],          "nist":["DE.CM-1","PR.AC-1"]},
+    "Recon & Exposure":     {"cis":["CIS 4"],          "nist":["PR.AC-3","PR.AC-4"]},
+    "Hygiene & Legacy":     {"cis":["CIS 4","CIS 7"],  "nist":["PR.IP-1","ID.AM-2"]},
+}
+RULE_MITIGATION = {
+    "A-WDigest":["M1027","M1041"], "A-LMCompatibilityLevel":["M1015","M1037"],
+    "A-LMHashAuthorized":["M1027","M1041"], "A-ReversiblePwd":["M1027","M1041"],
+    "S-Reversible":["M1027","M1041"], "S-C-Reversible":["M1027","M1041"],
+    "P-GPPPassword":["M1015","M1047"], "P-DCSync":["M1015","M1026"],
+    "P-DangerousACLDomain":["M1015","M1026"], "P-DangerousACLDA":["M1015","M1026"],
+    "P-WriteToPrivGroup":["M1026","M1015"], "P-OwnsPrivObject":["M1026","M1015"],
+    "P-ModifiableGPO":["M1015","M1026"], "P-DangerousACLGPO":["M1015","M1026"],
+    "A-MembershipEveryone":["M1026","M1018"], "P-DangerousExtendedRight":["M1026","M1015"],
+    "A-CertTempCustomSubject":["M1015","M1026"], "A-CertTemplateESC4":["M1015","M1026"],
+    "A-CertTempAgent":["M1015","M1026"], "A-CertTempAnyPurpose":["M1015","M1026"],
+    "A-CertEnrollHttp":["M1037","M1035"], "A-CertCAManageLowPriv":["M1026","M1015"],
+    "A-CertTemplateESC9":["M1015","M1041"],
+    "P-UnconstrainedDelegation":["M1015","M1026"], "P-RBCD-Dangerous":["M1015","M1026"],
+    "P-RBCD":["M1015","M1018"], "P-ConstrainedDelegService":["M1015","M1026"],
+    "P-DelegationDCt2a4d":["M1015","M1026"], "P-DelegationDCa2d2":["M1015","M1026"],
+    "S-KerberoastableAdmin":["M1027","M1026"], "S-Kerberoastable":["M1027","M1015"],
+    "P-Kerberoasting":["M1027","M1026"], "S-NoPreAuth":["M1027","M1015"],
+    "S-NoPreAuthAdmin":["M1027","M1026"], "S-DesEnabled":["M1041","M1015"],
+    "A-LAPS-Not-Installed":["M1026","M1027"], "A-LocalAdminPassword":["M1026","M1027"],
+    "A-LAPS-Joined-Computers":["M1026","M1027"],
+    "A-LLMNR":["M1037","M1042"], "A-NBTNSDisabled":["M1037","M1042"],
+    "A-DCLdapSign":["M1037","M1015"], "A-DCLdapsChannelBinding":["M1037","M1015"],
+    "A-LDAPSigningDisabled":["M1037","M1015"], "A-SMB2SignatureNotRequired":["M1037","M1015"],
+    "A-SMB2SignatureNotEnabled":["M1037","M1015"], "A-HardenedPaths":["M1037","M1015"],
+    "P-MachineAccountQuota":["M1015","M1018"], "A-Krbtgt":["M1015","M1027"],
+    "S-SIDHistory":["M1015"], "S-SIDHistoryPrivileged":["M1015","M1026"],
+    "T-SIDHistoryDangerous":["M1015"], "T-SIDFiltering":["M1015"], "T-TGTDelegation":["M1015"],
+    "A-DC-Coerce":["M1042","M1037"], "A-DC-Spooler":["M1042","M1037"],
+    "A-DC-WebClient":["M1042","M1037"],
+    "A-NullSession":["M1035","M1015"], "A-RestrictRemoteSAM":["M1035","M1015"],
+    "A-PreWin2000Anonymous":["M1035","M1015"], "A-DsHeuristicsAnonymous":["M1035","M1015"],
+    "A-Guest":["M1018","M1026"], "A-WeakLockout":["M1027","M1036"],
+    "A-Pre2kComputer":["M1027","M1018"], "A-SCCM":["M1037","M1035"],
+    "P-GMSAReadable":["M1026","M1015"], "A-KDSRootKey":["M1026","M1015"],
+    "A-AADConnectSync":["M1026","M1032"], "A-SeamlessSSO":["M1026","M1032"],
+    "P-ServiceDomainAdmin":["M1026","M1018"], "P-ComputerInPrivGroup":["M1026","M1018"],
+    "P-AdminNum":["M1026","M1018"], "A-BadSuccessor":["M1015","M1026"],
+    "A-DnsZoneAUCreateChild":["M1015","M1037"], "A-WSUS-HTTP":["M1037","M1051"],
+    "S-SMB-v1":["M1042","M1051"], "S-Vuln-MS17_010":["M1051","M1042"],
+    "S-Vuln-MS14-068":["M1051","M1015"], "S-OS-XP":["M1051","M1042"],
+    "S-OS-Vista":["M1051","M1042"], "S-OS-NT":["M1051","M1042"],
+    "S-FunctionalLevel1":["M1051"], "S-FunctionalLevel3":["M1051"],
+    "P-ExchangePrivEsc":["M1026","M1015"], "P-DNSAdmin":["M1026","M1018"],
+}
+# Human-readable expansion for the framework chips' tooltips.
+MITIGATION_NAME = {
+    "M1015":"Active Directory Configuration", "M1018":"User Account Management",
+    "M1026":"Privileged Account Management", "M1027":"Password Policies",
+    "M1032":"Multi-factor Authentication", "M1035":"Limit Access to Resource Over Network",
+    "M1036":"Account Use Policies", "M1037":"Filter Network Traffic",
+    "M1041":"Encrypt Sensitive Information", "M1042":"Disable or Remove Feature or Program",
+    "M1047":"Audit", "M1051":"Update Software",
+}
+
+def rule_compliance(rule_id: str, opcat: str) -> Dict[str, List[str]]:
+    """Framework mappings for a rule: CIS Controls v8 + NIST CSF (by operational
+    category) and MITRE ATT&CK Mitigations (per rule)."""
+    base = OPCAT_COMPLIANCE.get(opcat, {})
+    return {"cis": list(base.get("cis", [])), "nist": list(base.get("nist", [])),
+            "mitigation": list(RULE_MITIGATION.get(rule_id, []))}
 
 # Plain, non-condensed system fonts — a condensed display face made headings look
 # vertically stretched. Used both in CSS and (literally) inside SVG <text>.
@@ -6845,12 +6975,74 @@ tr.kc-notable td{background:rgba(189,66,52,.06)}
 html[data-theme=light] .kc-term{background:#21250e;color:#dfe6c4}
 .kc-term .t-ok{color:var(--accent)}
 
+/* ── exec hero: posture grade + severity chips + meters ── */
+.kc-hero{display:flex;gap:16px;flex-wrap:wrap;align-items:stretch;margin-bottom:18px}
+.kc-grade{flex:0 0 auto;width:208px;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:1px;border-radius:var(--r);background:var(--surface2);border:1px solid var(--border);
+  border-top:3px solid var(--g,var(--accent));padding:14px 12px;text-align:center}
+.kc-grade-ring{position:relative;width:118px;height:118px;display:flex;align-items:center;justify-content:center}
+.kc-grade-ring svg{position:absolute;inset:0}
+.kc-grade-letter{font-size:50px;font-weight:800;line-height:1;color:var(--g,var(--accent))}
+.kc-grade-score{font-family:var(--mono);font-size:13px;font-weight:700;color:var(--text);margin-top:5px}
+.kc-grade-score small{color:var(--muted);font-weight:400}
+.kc-grade-word{font-size:13px;font-weight:700;color:var(--g,var(--accent));margin-top:5px;line-height:1.2}
+.kc-grade-cap{font-family:var(--mono);font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint);margin-top:3px}
+.kc-hero-mid{flex:1;min-width:300px;display:flex;flex-direction:column;justify-content:center;gap:13px;
+  background:var(--surface2);border:1px solid var(--border);border-radius:var(--r);padding:15px 18px}
+.kc-sevchips{display:flex;gap:8px;flex-wrap:wrap}
+.kc-sevchip{display:flex;align-items:center;gap:8px;background:var(--surface3);border:1px solid var(--border2);
+  border-left:3px solid var(--c,var(--accent));border-radius:var(--r-sm);padding:5px 12px 5px 9px}
+.kc-sevchip b{font-size:18px;font-weight:800;color:var(--c,var(--accent));font-variant-numeric:tabular-nums;line-height:1}
+.kc-sevchip span{font-family:var(--mono);font-size:10px;letter-spacing:.05em;text-transform:uppercase;color:var(--muted)}
+.kc-sevchip.zero{opacity:.45}
+.kc-verdictline{font-family:var(--mono);font-size:11px;color:var(--muted)}
+.kc-verdictline b{font-weight:700}
+
+/* ── priorities (ranked by exploitability) + quick wins ── */
+.kc-prio-grid{display:grid;grid-template-columns:1.45fr 1fr;gap:22px;align-items:start}
+@media(max-width:1000px){.kc-prio-grid{grid-template-columns:1fr}}
+.kc-prio,.kc-qw{list-style:none}
+.kc-prio li{display:flex;align-items:center;gap:12px;padding:9px 0;border-bottom:1px dashed var(--border)}
+.kc-prio li:last-child,.kc-qw li:last-child{border-bottom:none}
+.kc-prio-rank{font-family:var(--mono);font-size:13px;font-weight:800;color:var(--faint);width:22px;text-align:right;flex-shrink:0}
+.kc-prio-body{flex:1;min-width:0}
+.kc-prio-title{font-weight:700;display:block;line-height:1.3}
+.kc-prio-title a{color:var(--text)}
+.kc-prio-note{color:var(--muted);font-size:12px}
+.kc-prio-meta{display:flex;flex-direction:column;align-items:flex-end;gap:5px;flex-shrink:0;width:132px}
+.kc-prio-tags{display:flex;gap:5px;align-items:center;flex-wrap:wrap;justify-content:flex-end}
+.kc-xbar{width:124px;height:6px;background:var(--track);border-radius:3px;overflow:hidden}
+.kc-xbar i{display:block;height:6px;border-radius:3px}
+.kc-xlabel{font-family:var(--mono);font-size:9px;letter-spacing:.04em;text-transform:uppercase;color:var(--faint)}
+.kc-qw li{display:flex;align-items:baseline;gap:9px;padding:8px 0;border-bottom:1px dashed var(--border)}
+.kc-qw-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;transform:translateY(2px)}
+.kc-qw-t{flex:1;min-width:0} .kc-qw-t a{color:var(--text);font-weight:600}
+.kc-prio-empty{color:var(--muted);font-size:13px}
+
+/* ── remediation-effort badge + framework chips ── */
+.kc-effort{display:inline-block;font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:.04em;
+  text-transform:uppercase;padding:1px 7px;border-radius:3px;border:1px solid var(--e,var(--border2));color:var(--e,var(--muted))}
+.kc-fw{display:flex;flex-wrap:wrap;gap:5px;margin-top:2px}
+.kc-fwgrp{display:flex;align-items:center;gap:5px;flex-wrap:wrap}
+.kc-fwlbl{font-family:var(--mono);font-size:9px;letter-spacing:.06em;text-transform:uppercase;color:var(--faint)}
+.kc-fwchip{font-family:var(--mono);font-size:10px;background:var(--surface2);border:1px solid var(--border2);
+  color:var(--muted);border-radius:3px;padding:1px 6px}
+.kc-fwchip.attck{color:var(--deck)}
+
+/* ── rich affected-object table + inline CSV export ── */
+.kc-aff-tbl{margin-top:4px}
+.kc-aff-tools{display:flex;justify-content:flex-end;margin-top:7px}
+.kc-csvbtn{font-family:var(--mono);font-size:10px;background:var(--surface3);border:1px solid var(--border2);
+  color:var(--muted);border-radius:3px;padding:3px 10px;cursor:pointer}
+.kc-csvbtn:hover{border-color:var(--accent);color:var(--accent)}
+.kc-aff-more{color:var(--faint);font-size:11.5px;font-style:italic;margin-top:5px}
+
 @media print{
   @page{size:A4;margin:13mm}
   html[data-theme]{--bg:#fff;--surface:#fff;--surface2:#f5f3ea;--surface3:#edebde;--border:#bbb;--border2:#999;
     --track:#e4e2d6;--text:#1a1a12;--muted:#444;--faint:#666;--shadow:none}
   body{background:#fff}
-  .kc-nav,.kc-top,.kc-toolbar,.kc-iconbtn,.kc-copy{display:none!important}
+  .kc-nav,.kc-top,.kc-toolbar,.kc-iconbtn,.kc-copy,.kc-csvbtn{display:none!important}
   .kc-section{break-inside:avoid;box-shadow:none;border:1px solid #ccc}
   .kc-frow,.kc-drow{display:table-row!important}
   .kc-cmd li code{background:#f5f3ea;color:#1a1a12;border:1px solid #ccc}
@@ -6947,6 +7139,26 @@ function kcNode(el){
 function kcCloseDrawer(){var dw=document.getElementById('kc-drawer'),ov=document.getElementById('kc-drawer-ov');
   if(dw)dw.classList.remove('open');if(ov)ov.classList.remove('open');}
 document.addEventListener('keydown',function(e){if(e.key==='Escape')kcCloseDrawer();});
+/* ── inline CSV export of an affected-items table ── */
+function kcCsv(btn){
+  var wrap=btn.closest('.kc-aff-tbl');if(!wrap)return;
+  var tbl=wrap.querySelector('table');if(!tbl)return;
+  var rows=[];
+  tbl.querySelectorAll('tr').forEach(function(tr){
+    var cells=[];
+    tr.querySelectorAll('th,td').forEach(function(c){
+      var t=(c.textContent||'').replace(/\s+/g,' ').trim();
+      if(/^[=+\-@\t\r]/.test(t))t="'"+t;
+      if(/[",\n]/.test(t))t='"'+t.replace(/"/g,'""')+'"';
+      cells.push(t);});
+    if(cells.length)rows.push(cells.join(','));});
+  var blob=new Blob([rows.join('\r\n')],{type:'text/csv'});
+  var url=URL.createObjectURL(blob);var a=document.createElement('a');
+  a.href=url;a.download=(btn.getAttribute('data-fn')||'scout-affected')+'.csv';
+  document.body.appendChild(a);a.click();document.body.removeChild(a);
+  setTimeout(function(){URL.revokeObjectURL(url)},1000);
+  var o=btn.textContent;btn.textContent='exported ✓';setTimeout(function(){btn.textContent=o},1300);
+}
 """
 
 
@@ -6971,6 +7183,16 @@ class HTMLReporter:
         self.by_rule = {}
         for f in findings:
             self.by_rule.setdefault(f.rule_id, f)
+        # sAMAccountName(lower) -> object, for resolving a finding's affected
+        # strings back to their user/computer object (rich affected tables).
+        self._obj_index = {}
+        try:
+            for o in list(getattr(data, "users", []) or []) + list(getattr(data, "computers", []) or []):
+                sam = get_str(o["attrs"], "sAMAccountName")
+                if sam:
+                    self._obj_index.setdefault(sam.lower(), o)
+        except Exception:
+            self._obj_index = {}
 
     # ── helpers ───────────────────────────────────────────────────────────────
     def _e(self, s):
@@ -7020,8 +7242,9 @@ class HTMLReporter:
             '</header>')
 
     def _nav(self):
-        items = [("summary","Summary",""),("paths","Attack Paths",""),
-                 ("priv","Privileged",""),("findings","Findings",str(len(self.findings)))]
+        items = [("summary","Summary",""),("priorities","Priorities",""),
+                 ("paths","Attack Paths",""),("priv","Privileged",""),
+                 ("findings","Findings",str(len(self.findings)))]
         links = ""
         for sid, name, badge in items:
             b = f'<span class="kc-navb">{badge}</span>' if badge else ""
@@ -7088,22 +7311,51 @@ class HTMLReporter:
                 f'<small>{self._e(hint)}</small></b><span class="v" style="color:{col}">{value}<small>/100</small></span></div>'
                 f'<div class="kc-meter-t"><div class="kc-meter-f" style="width:{value}%;background:{col}"></div></div></div>')
 
+    def _grade_ring(self, posture, color):
+        """SVG progress ring around the grade letter (posture fraction)."""
+        cx = cy = 59; r = 52
+        frac = max(0.0, min(1.0, posture / 100.0))
+        circ = 2 * math.pi * r
+        return (f'<svg width="118" height="118" viewBox="0 0 118 118" aria-hidden="true">'
+                f'<circle cx="{cx}" cy="{cy}" r="{r}" fill="none" stroke="var(--track)" stroke-width="9"/>'
+                f'<circle cx="{cx}" cy="{cy}" r="{r}" fill="none" stroke="{color}" stroke-width="9" '
+                f'stroke-linecap="round" stroke-dasharray="{circ*frac:.1f} {circ:.1f}" '
+                f'transform="rotate(-90 {cx} {cy})"/></svg>')
+
+    def _sev_chips(self):
+        sc = self._sev_counts()
+        names = {"CRITICAL":"Crit","HIGH":"High","MEDIUM":"Med","LOW":"Low","INFO":"Info"}
+        chips = ""
+        for s in ("CRITICAL","HIGH","MEDIUM","LOW","INFO"):
+            n = sc.get(s, 0)
+            if s == "INFO" and not n:
+                continue
+            chips += (f'<div class="kc-sevchip{"" if n else " zero"}" style="--c:{SEV_COLOR[s]}">'
+                      f'<b>{n}</b><span>{names[s]}</span></div>')
+        return f'<div class="kc-sevchips">{chips}</div>'
+
     def _scoreband(self):
         s = self.scores
         exp = s.get("exposure",0); hyg = s.get("hygiene",0)
+        pos = s.get("posture",0); letter = s.get("grade","?"); gword = s.get("grade_word","")
+        _, _, gcol = RiskScorer.grade(pos)
         word, vcol = RiskScorer.verdict(exp)
-        return ('<div class="kc-scoreband">'
-                f'<div class="kc-verdict" style="border-color:{vcol}">'
-                f'<div class="ev" style="color:{vcol}">{exp}</div>'
-                f'<div class="evl">Exposure</div>'
-                f'<div class="evw" style="color:{vcol}">{self._e(word)}</div></div>'
-                '<div class="kc-meters">'
-                f'{self._meter("Exposure", exp, "easiest path to Tier 0")}'
-                f'{self._meter("Hygiene debt", hyg, "misconfiguration & stale-object load")}'
-                '</div>'
-                '<div class="kc-readout">'
-                f'<div class="col">{self._donut()}{self._sev_legend()}</div>'
-                '</div></div>')
+        grade_card = (f'<div class="kc-grade" style="--g:{gcol}">'
+                      f'<div class="kc-grade-ring">{self._grade_ring(pos, gcol)}'
+                      f'<div class="kc-grade-letter">{self._e(letter)}</div></div>'
+                      f'<div class="kc-grade-score">{pos}<small>/100</small></div>'
+                      f'<div class="kc-grade-word">{self._e(gword)}</div>'
+                      '<div class="kc-grade-cap">Posture score</div></div>')
+        mid = ('<div class="kc-hero-mid">'
+               f'{self._sev_chips()}'
+               f'{self._meter("Exposure", exp, "easiest path to Tier 0")}'
+               f'{self._meter("Hygiene debt", hyg, "misconfiguration & stale-object load")}'
+               f'<div class="kc-verdictline">Exposure verdict: '
+               f'<b style="color:{vcol}">{self._e(word)}</b> · higher posture = stronger AD</div>'
+               '</div>')
+        readout = ('<div class="kc-readout"><div class="col">'
+                   f'{self._donut()}{self._sev_legend()}</div></div>')
+        return f'<div class="kc-hero">{grade_card}{mid}{readout}</div>'
 
     def _narrative(self):
         s = self.scores
@@ -7203,6 +7455,89 @@ class HTMLReporter:
                 f'{self._category_strip()}'
                 f'{self._inventory_block()}'
                 f'{self._collection_notes()}</section>')
+
+    # ── Priorities: top priorities (ranked by exploitability) + quick wins ────
+    _PSEUDO_WEIGHT = {"CRITICAL":80, "HIGH":55, "MEDIUM":30, "LOW":12, "INFO":0}
+
+    def _attacker_note(self, f):
+        """One-line 'here's how this gets you owned' blurb for the priorities list."""
+        note = self._MARQUEE.get(f.rule_id)
+        if note:
+            return note[0].upper() + note[1:]
+        doc = self._doc(f.rule_id)
+        txt = doc.get("why") or doc.get("description") or f.details or ""
+        return txt if len(txt) <= 116 else txt[:113] + "…"
+
+    def _effort_badge(self, rule_id):
+        e = rule_effort(rule_id); col = EFFORT_COLOR.get(e, "var(--muted)")
+        return (f'<span class="kc-effort" style="--e:{col}" '
+                f'title="Estimated remediation effort">{self._e(e)} effort</span>')
+
+    def _priorities_section(self):
+        uniq = list(self.by_rule.values())
+        # Top priorities — ranked by exploitability: EXPOSURE_WEIGHTS is the
+        # attacker's effort-to-Tier-0 (higher = easier). To order by real attacker
+        # impact while never silently dropping a high-severity finding, we include
+        # every exposure-weighted path AND every CRITICAL/HIGH finding, ranking by
+        # the weight where modelled and falling back to a severity proxy otherwise
+        # (the same key Quick Wins uses, so a CRIT/HIGH can't score 0 and vanish).
+        # Rank by the same value we display: the modelled exploitability weight
+        # where we have one, else a severity proxy — so the list stays monotonic
+        # (a shown "exploitability 64" can't sort above a shown "72").
+        def prio_key(f):
+            return EXPOSURE_WEIGHTS.get(f.rule_id, 0) or self._PSEUDO_WEIGHT.get(f.severity, 0)
+        ranked = sorted(
+            [f for f in uniq if EXPOSURE_WEIGHTS.get(f.rule_id, 0) > 0 or f.severity in ("CRITICAL","HIGH")],
+            key=lambda f: (-prio_key(f), self._SEV_ORDER.get(f.severity, 9), -len(f.affected)))[:12]
+        prio_items = ""
+        for i, f in enumerate(ranked, 1):
+            w = EXPOSURE_WEIGHTS.get(f.rule_id, 0)
+            naff = len(f.affected)
+            aff = f' · <span class="kc-mono">{naff} affected</span>' if naff else ""
+            if w:   # a modelled path to Tier-0 — show its exploitability score
+                bar_w, bar_col = w, RiskScorer.risk_label(w)[1]
+                xlabel = f'exploitability {w}/100'
+            else:   # high-severity, but not a modelled one-step Tier-0 primitive
+                bar_w, bar_col = self._PSEUDO_WEIGHT.get(f.severity, 0), f.sev_color
+                xlabel = f'{self._e(f.severity.title())} severity'
+            prio_items += (
+                f'<li><span class="kc-prio-rank">{i}</span>'
+                '<div class="kc-prio-body">'
+                f'<span class="kc-prio-title"><a href="#f-{self._e(f.rule_id)}" '
+                f'onclick="kcJump(\'f-{self._e(f.rule_id)}\');return false">{self._e(f.title)}</a></span>'
+                f'<span class="kc-prio-note">{self._e(self._attacker_note(f))}{aff}</span></div>'
+                '<div class="kc-prio-meta"><div class="kc-prio-tags">'
+                f'<span class="kc-sev-pill" style="background:{f.sev_color}">{self._e(f.severity)}</span>'
+                f'{self._effort_badge(f.rule_id)}</div>'
+                f'<div class="kc-xbar"><i style="width:{bar_w}%;background:{bar_col}"></i></div>'
+                f'<span class="kc-xlabel">{xlabel}</span></div></li>')
+        prio = (f'<ul class="kc-prio">{prio_items}</ul>' if prio_items
+                else '<p class="kc-prio-empty">No critical or high-severity findings surfaced — '
+                     'work the Quick Wins and the full Findings list.</p>')
+        # Quick wins — low remediation effort, meaningful risk reduction first.
+        def impact(f):
+            return max(EXPOSURE_WEIGHTS.get(f.rule_id, 0), self._PSEUDO_WEIGHT.get(f.severity, 0))
+        qw = sorted([f for f in uniq if rule_effort(f.rule_id) == "Low" and f.severity != "INFO"],
+                    key=lambda f: -impact(f))[:8]
+        qw_items = "".join(
+            f'<li><span class="kc-qw-dot" style="background:{f.sev_color}"></span>'
+            f'<span class="kc-qw-t"><a href="#f-{self._e(f.rule_id)}" '
+            f'onclick="kcJump(\'f-{self._e(f.rule_id)}\');return false">{self._e(f.title)}</a></span>'
+            f'<span class="kc-xlabel">{self._e(f.severity.title())}</span></li>' for f in qw)
+        qw_html = (f'<ul class="kc-qw">{qw_items}</ul>' if qw_items
+                   else '<p class="kc-prio-empty">No low-effort quick wins identified.</p>')
+        return ('<section class="kc-section" id="sec-priorities">'
+                '<h2 class="kc-h2">Priorities<span class="tag">what to fix first</span></h2>'
+                '<div class="kc-prio-grid">'
+                '<div><div class="kc-sub-h">Top priorities '
+                '<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--faint)">'
+                '— ranked by exploitability, then severity (easiest path to Tier-0 first)</span></div>'
+                f'{prio}</div>'
+                '<div><div class="kc-sub-h">Quick wins '
+                '<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--faint)">'
+                '— low remediation effort, high payoff</span></div>'
+                f'{qw_html}</div>'
+                '</div></section>')
 
     # ── Paths to Domain Dominance (control-path chains) ───────────────────────
     def _node(self, label, kind="", icon=""):
@@ -7588,6 +7923,98 @@ class HTMLReporter:
         return ('<table class="kc-table"><thead><tr><th>Username</th><th>Cracked password</th>'
                 f'<th>GPO</th><th>File</th></tr></thead><tbody>{rows}</tbody></table>')
 
+    # ── rich affected-object tables (Insight-Recon style) ─────────────────────
+    def _resolve_affected(self, f, limit=400):
+        """Split a finding's affected strings into (resolved objects, leftover
+        strings) by matching the leading token against the sAMAccountName index."""
+        resolved = []; unresolved = []
+        for a in f.affected[:limit]:
+            s = str(a).strip()
+            token = s.split()[0] if s else ""
+            obj = self._obj_index.get(token.rstrip(",:;").lower())
+            if obj:
+                resolved.append(obj)
+            else:
+                unresolved.append(s)
+        return resolved, unresolved
+
+    def _fmt_created(self, attrs):
+        v = get_str(attrs, "whenCreated")
+        if not v:
+            return "—"
+        if len(v) >= 10 and v[4] == "-" and v[7] == "-":   # ldap3 datetime str
+            return v[:10]
+        if len(v) >= 8 and v[:8].isdigit():                 # impacket generalized time
+            return f"{v[0:4]}-{v[4:6]}-{v[6:8]}"
+        return v[:10]
+
+    def _aff_flags(self, a):
+        uac = get_int(a, "userAccountControl"); fl = []
+        if uac_has(uac, UAC_DONT_REQUIRE_PREAUTH): fl.append("AS-REP roastable")
+        if get_list(a, "servicePrincipalName") and not (get_str(a,"sAMAccountName") or "").endswith("$"):
+            fl.append("kerberoastable")
+        if uac_has(uac, UAC_DONT_EXPIRE_PASSWORD): fl.append("pwd never expires")
+        if uac_has(uac, UAC_TRUSTED_FOR_DELEGATION): fl.append("unconstrained")
+        if uac_has(uac, UAC_PASSWD_NOTREQD): fl.append("no pwd required")
+        if get_int(a, "adminCount") == 1: fl.append("adminCount=1")
+        return ", ".join(fl) or "—"
+
+    def _affected_table(self, f, resolved, unresolved):
+        shown = resolved[:60]; rows = ""
+        for o in shown:
+            a = o["attrs"]
+            sam = get_str(a, "sAMAccountName")
+            name = get_str(a, "displayName") or get_str(a, "name") or ""
+            disabled = uac_has(get_int(a, "userAccountControl"), UAC_ACCOUNTDISABLE)
+            en = ('<span class="kc-bad">no</span>' if disabled
+                  else '<span class="kc-ok">yes</span>')
+            pw = days_since(filetime_to_dt(get_int(a, "pwdLastSet")))
+            ll = days_since(filetime_to_dt(get_int(a, "lastLogonTimestamp")))
+            rows += (f'<tr><td><strong>{self._e(sam)}</strong></td><td>{self._e(name)}</td>'
+                     f'<td>{en}</td><td class="kc-mono">{self._e(self._fmt_created(a))}</td>'
+                     f'<td class="kc-num">{pw if pw is not None else "—"}</td>'
+                     f'<td class="kc-num">{ll if ll is not None else "—"}</td>'
+                     f'<td class="kc-detail">{self._e(self._aff_flags(a))}</td></tr>')
+        total = len(f.affected); more = ""
+        if total > len(shown):
+            more += (f'<div class="kc-aff-more">Showing first {len(shown)} of {total} affected — '
+                     'full set via <code>--csv</code> / <code>--json</code>.</div>')
+        if unresolved:
+            u = ", ".join(self._e(x.split()[0]) for x in unresolved[:10])
+            more += (f'<div class="kc-aff-more">Also affected: {u}'
+                     f'{" …" if len(unresolved) > 10 else ""}.</div>')
+        fn = "scout-" + f.rule_id.lower()
+        return ('<div class="kc-aff-tbl"><table class="kc-table"><thead><tr>'
+                '<th>Account</th><th>Name</th><th>Enabled</th><th>Created</th>'
+                '<th class="kc-num">Pwd set (d)</th><th class="kc-num">Last logon (d)</th>'
+                '<th>Flags</th></tr></thead>'
+                f'<tbody>{rows}</tbody></table>'
+                f'<div class="kc-aff-tools"><button class="kc-csvbtn" data-fn="{self._e(fn)}" '
+                'onclick="kcCsv(this)">Export CSV ⤓</button></div>'
+                f'{more}</div>')
+
+    def _frameworks_block(self, f):
+        comp = rule_compliance(f.rule_id, self._opcat(f))
+        groups = []
+        if f.mitre:
+            chips = "".join(f'<span class="kc-fwchip attck" title="{self._e(m)}">'
+                            f'{self._e(m.split(":")[0])}</span>' for m in f.mitre)
+            groups.append(f'<div class="kc-fwgrp"><span class="kc-fwlbl">ATT&amp;CK</span>{chips}</div>')
+        if comp["mitigation"]:
+            chips = "".join(f'<span class="kc-fwchip" title="{self._e(MITIGATION_NAME.get(m, m))}">'
+                            f'{self._e(m)}</span>' for m in comp["mitigation"])
+            groups.append(f'<div class="kc-fwgrp"><span class="kc-fwlbl">Mitigations</span>{chips}</div>')
+        if comp["cis"]:
+            chips = "".join(f'<span class="kc-fwchip">{self._e(c)}</span>' for c in comp["cis"])
+            groups.append(f'<div class="kc-fwgrp"><span class="kc-fwlbl">CIS v8</span>{chips}</div>')
+        if comp["nist"]:
+            chips = "".join(f'<span class="kc-fwchip">{self._e(c)}</span>' for c in comp["nist"])
+            groups.append(f'<div class="kc-fwgrp"><span class="kc-fwlbl">NIST CSF</span>{chips}</div>')
+        if not groups:
+            return ""
+        return ('<div class="kc-block"><div class="kc-bh">Frameworks</div>'
+                f'<div class="kc-fw">{"".join(groups)}</div></div>')
+
     def _finding_panel(self, f):
         doc = self._doc(f.rule_id); desc = doc.get("description") or ""
         parts = []
@@ -7595,21 +8022,29 @@ class HTMLReporter:
         path = self._inline_path(f.rule_id)
         if path:
             parts.append(f'<div class="kc-block"><div class="kc-bh">Attack path</div>{path}</div>')
-        # 2) evidence — terminal-style "what SCOUT observed"
-        term = f'<span class="t-ok">[+]</span> {self._e(f.details)}\n' if f.details else ""
+        # 2) evidence — what SCOUT observed. Resolve affected objects into a rich
+        # account/computer table (enabled / created / pwd-set / last-logon / flags)
+        # when possible; otherwise fall back to the terminal-style list.
+        det = f'<span class="t-ok">[+]</span> {self._e(f.details)}' if f.details else ""
+        rich = ""; flat = ""
         if f.rule_id == "P-GPPPassword":
-            ev_extra = self._gpp_table()
-        else:
-            ev_extra = ""
-        if f.affected:
-            n = len(f.affected); shown = f.affected[:120]
-            term += "\n".join(f'    {self._e(a)}' for a in shown)
-            if n > len(shown):
-                term += f'\n    … and {n-len(shown)} more'
-        if term.strip() or ev_extra:
-            hdr = f'Evidence' + (f' — {len(f.affected)} affected' if f.affected else '')
-            block = f'<pre class="kc-term">{term or self._e(f.details)}</pre>' if term.strip() else ""
-            parts.append(f'<div class="kc-block"><div class="kc-bh">{hdr}</div>{block}{ev_extra}</div>')
+            rich = self._gpp_table()
+        elif f.affected:
+            resolved, unresolved = self._resolve_affected(f)
+            if resolved and len(resolved) >= len(unresolved):
+                rich = self._affected_table(f, resolved, unresolved)
+            else:
+                n = len(f.affected); shown = f.affected[:120]
+                flat = "\n".join(f'    {self._e(a)}' for a in shown)
+                if n > len(shown):
+                    flat += f'\n    … and {n-len(shown)} more'
+        if det or rich or flat:
+            hdr = 'Evidence' + (f' — {len(f.affected)} affected' if f.affected else '')
+            term_block = ""
+            if det or flat:
+                content = det + ("\n" if det and flat else "") + flat
+                term_block = f'<pre class="kc-term">{content}</pre>'
+            parts.append(f'<div class="kc-block"><div class="kc-bh">{hdr}</div>{term_block}{rich}</div>')
         # 3) narrative
         if desc:
             parts.append(f'<div class="kc-block"><div class="kc-bh">What it is</div><div class="kc-bb">{self._e(desc)}</div></div>')
@@ -7624,8 +8059,15 @@ class HTMLReporter:
         if doc.get("remediation"):
             items = "".join(f'<li>{self._e(x)}</li>' for x in doc["remediation"])
             parts.append(f'<div class="kc-block kc-fix"><div class="kc-bh">Remediation</div><ul class="kc-fixlist">{items}</ul></div>')
+        # 5) framework mappings (ATT&CK / Mitigations / CIS / NIST)
+        fw = self._frameworks_block(f)
+        if fw:
+            parts.append(fw)
+        # 6) footer meta: rule id, operation, remediation effort, references
         refs = doc.get("refs") or []
-        meta = f'<span class="kc-mini">{self._e(f.rule_id)}</span>' + "".join(f'<span class="kc-mini">{self._e(m.split(":")[0])}</span>' for m in f.mitre)
+        meta = (f'<span class="kc-mini">{self._e(f.rule_id)}</span>'
+                f'<span class="kc-mini">{self._e(self._opcat(f))}</span> '
+                f'{self._effort_badge(f.rule_id)}')
         if refs:
             meta += "".join(f' <a href="{self._e(u)}" target="_blank" rel="noopener" style="font-size:11px">ref↗</a>' for u in refs)
         parts.append(f'<div class="kc-block" style="border-top:1px solid var(--border);padding-top:8px">{meta}</div>')
@@ -7643,6 +8085,7 @@ class HTMLReporter:
             oc = self._opcat(f); oc_col = OPCAT_COLOR.get(oc,"#888")
             anchor = f"f-{f.rule_id}" if f.rule_id not in seen_rid else f"f-{f.rule_id}-{i}"
             seen_rid.add(f.rule_id)
+            eff = rule_effort(f.rule_id); ecol = EFFORT_COLOR.get(eff, "var(--muted)")
             rows.append(
                 f'<tr class="kc-frow" id="{self._e(anchor)}" data-i="{i}" data-sev="{f.severity}" '
                 f'data-cat="{self._e(oc)}" onclick="kcTog({i})" tabindex="0" role="button" '
@@ -7651,9 +8094,10 @@ class HTMLReporter:
                 f'<td><span class="kc-sev-pill" style="background:{f.sev_color}">{self._e(f.severity)}</span></td>'
                 f'<td><span class="kc-cat-pill" style="background:{oc_col}">{self._e(oc)}</span></td>'
                 f'<td><code>{self._e(f.rule_id)}</code></td><td><strong>{self._e(f.title)}</strong></td>'
+                f'<td><span class="kc-effort" style="--e:{ecol}">{self._e(eff)}</span></td>'
                 f'<td class="kc-num">{f.points}</td></tr>'
                 f'<tr class="kc-drow" id="dr-{i}" style="display:none"><td></td>'
-                f'<td colspan="5"><div class="kc-panel">{self._finding_panel(f)}</div></td></tr>')
+                f'<td colspan="6"><div class="kc-panel">{self._finding_panel(f)}</div></td></tr>')
         catpills = "".join(
             f'<button class="kc-fp kc-fp-cat" data-f="cat:{self._e(c)}" onclick="kcFil(this)" '
             f'style="--c:{OPCAT_COLOR[c]}">{self._e(c)}</button>' for c in OPCAT_ORDER)
@@ -7671,8 +8115,9 @@ class HTMLReporter:
                 '<button class="kc-fp" onclick="kcAll(0)">Collapse</button></div></div>'
                 '<div class="kc-showing" id="kc-showing"></div>'
                 '<table class="kc-table kc-ftable"><thead><tr><th style="width:28px"></th><th style="width:84px">Severity</th>'
-                '<th style="width:160px">Operation</th><th style="width:190px">Rule</th>'
-                '<th>Title</th><th style="width:48px" class="kc-num">Pts</th></tr></thead>'
+                '<th style="width:150px">Operation</th><th style="width:180px">Rule</th>'
+                '<th>Title</th><th style="width:84px">Effort</th>'
+                '<th style="width:48px" class="kc-num">Pts</th></tr></thead>'
                 f'<tbody>{"".join(rows)}</tbody></table></section>')
 
     # ── inventory ─────────────────────────────────────────────────────────────
@@ -7745,7 +8190,7 @@ class HTMLReporter:
                   '<button class="kc-dw-x" onclick="kcCloseDrawer()" title="Close">✕</button></div>'
                   '<div class="kc-dw-b" id="kc-dw-body"></div></aside>')
         body = (self._head() + self._nav() + '<main class="kc-container">' +
-                self._summary_section() + self._paths_section() +
+                self._summary_section() + self._priorities_section() + self._paths_section() +
                 self._privileged_section() + self._findings_section() + '</main>' + drawer +
                 f'<footer class="kc-footer">{TOOL_NAME} v{VERSION} — authorized security assessment use only · '
                 f'generated {self._e(self.ts)}</footer>'
@@ -7882,6 +8327,8 @@ def main():
     for f in findings:
         sevc[f.severity] += 1
     print(f"\n{'='*60}")
+    print(f"  POSTURE GRADE : {scores.get('grade','?')}  {scores.get('posture',0):3d}/100  "
+          f"({scores.get('grade_word','')})")
     print(f"  EXPOSURE      : {scores['exposure']:3d}/100  ({scores.get('verdict','')})")
     print(f"  HYGIENE DEBT  : {scores['hygiene']:3d}/100  (misconfig & stale load)")
     print(f"{'='*60}")
@@ -7925,7 +8372,7 @@ def main():
             "tool": TOOL_NAME, "version": VERSION,
             "domain": args.domain, "dc_ip": args.dc_ip, "auth_mode": auth_mode,
             "timestamp": datetime.datetime.now().isoformat(),
-            "scores": {k: scores[k] for k in ("exposure","hygiene","verdict","cat_counts") if k in scores},
+            "scores": {k: scores[k] for k in ("posture","grade","grade_word","exposure","hygiene","verdict","cat_counts") if k in scores},
             "findings": [
                 {"rule_id": f.rule_id, "title": f.title,
                  "category": f.category, "operation": op_category(f.rule_id, f.category),
@@ -7944,17 +8391,25 @@ def main():
         cpath = args.csv if args.csv != "__AUTO__" else f"scout_{args.domain}.csv"
         with open(cpath, "w", encoding="utf-8", newline="") as cf:
             w = _csv.writer(cf)
+            # Neutralize spreadsheet formula injection: a leading = + - @ (or
+            # tab/CR) in attacker-controlled AD data could execute when opened in
+            # Excel/LibreOffice, so prefix such cells with a single quote.
+            def _safe(v):
+                s = str(v)
+                return "'" + s if s[:1] in ("=", "+", "-", "@", "\t", "\r") else s
             w.writerow(["rule_id", "title", "operation", "severity",
                         "points", "mitre", "affected_count", "details", "affected"])
             for f in sorted_findings:
-                w.writerow([f.rule_id, f.title, op_category(f.rule_id, f.category), f.severity,
-                            f.points, "; ".join(f.mitre), len(f.affected),
-                            f.details, " | ".join(map(str, f.affected))])
+                w.writerow([_safe(x) for x in
+                            (f.rule_id, f.title, op_category(f.rule_id, f.category), f.severity,
+                             f.points, "; ".join(f.mitre), len(f.affected),
+                             f.details, " | ".join(map(str, f.affected)))])
         print(f"[+] CSV findings saved: {cpath}")
 
     print()
-    # exit non-zero when a Tier-0 path is exposed (useful in CI gating). The
-    # letter grade was removed from scoring, so key off exposure alone.
+    # exit non-zero when a Tier-0 path is exposed (useful in CI gating). We gate
+    # on exposure (the easiest path to Tier-0), not the posture grade, since a
+    # broad-but-not-instantly-exploitable estate can still be a clean pentest pass.
     return 0 if scores.get("exposure", 0) < 35 else 1
 
 

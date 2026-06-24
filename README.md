@@ -10,6 +10,24 @@ against a rule set covering privilege escalation, credential access, lateral
 movement, persistence, and hygiene, and writes an interactive single-file HTML
 report plus optional JSON and CSV.
 
+## The report
+
+- **Posture score + A–F grade** headline (higher = stronger), backed by two risk
+  axes: **Exposure** (easiest path to Tier-0) and **Hygiene debt**.
+- **Priorities — ranked by exploitability.** A "Top Priorities" list ordered by
+  real attacker impact (effort-to-Tier-0), plus **Quick Wins** (low remediation
+  effort, high payoff). Every finding carries a **remediation-effort** rating.
+- **Findings you can act on.** Each finding expands to attack-path, evidence, an
+  attacker view, copy-able exploitation commands, remediation, and **framework
+  mappings** (MITRE ATT&CK + Mitigations, CIS Controls v8, NIST CSF).
+- **Rich affected-object tables** (enabled / created / password-set / last-logon
+  / flags) with per-table **CSV export**.
+- **Attack paths** and a clickable **control-path graph** to Domain Admin, a
+  **privileged-accounts** explorer, inventory, and a **trust map**.
+
+See `examples/sample_report.html` for a full example and `docs/ROADMAP.md` for
+what's next.
+
 ## Install
 
 Python 3.9+ and the packages in `requirements.txt` (`ldap3`, `impacket`,
