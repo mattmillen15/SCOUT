@@ -2934,8 +2934,8 @@ class CheckEngine:
                      "(recoverable only with decryption rights).") if enc_only else ""
             self._add("P-LAPSReadable",
                       f"The supplied credentials can read cleartext LAPS passwords for {len(hits)} "
-                      "computer(s) — LAPS read rights are delegated too broadly; recover the local "
-                      f"Administrator password and move laterally.{extra}",
+                      "computer(s) — LAPS read rights are delegated too broadly, so the local "
+                      f"Administrator password of those hosts is exposed to this principal.{extra}",
                       hits)
 
     def _m_managed_accounts(self):
@@ -6393,8 +6393,20 @@ class ControlPathAnalyzer:
             if p:
                 paths.append((self.sid2name.get(s, s), p, s in self.broad))
         nodes, edges = self._build_node_registry(paths)
+        hv = self._high_value_targets()
+        # ensure every node rendered in the HV view — target, controllers AND the
+        # intermediate hops on each controller's path — resolves in the click drawer
+        for g in hv:
+            names = [g["name"]]
+            for c in g["controllers"]:
+                names.append(c["name"])
+                names += [dst for (_s, _l, dst) in c["path"]]
+            for nm in names:
+                if nm not in nodes:
+                    nodes[nm] = self._node_meta(nm)
         self.data.control_paths = {"count": len(control), "broad": _dedup_keep_order(broad),
-                                   "paths": paths, "nodes": nodes, "edges": edges}
+                                   "paths": paths, "nodes": nodes, "edges": edges,
+                                   "hv_targets": hv}
 
     def _acct_info(self, kind, obj) -> Dict:
         """Per-principal facts the report shows in the node drawer (PingCastle-
@@ -6473,6 +6485,64 @@ class ControlPathAnalyzer:
                     seen_edge.add(ek)
                     edges.append({"src": src, "label": label, "dst": dst})
         return nodes, edges
+
+    def _high_value_targets(self):
+        """PingCastle-style per-target control paths: for each high-value group
+        (and the domain root) list its members AND the principals that can take
+        control of it WITHOUT being a member (the shadow-admin set), each with the
+        resolved path. Computed from the in-memory control graph (adj/radj)."""
+        from collections import deque
+        targets = list(dict.fromkeys(
+            [s for s in self.tier0_groups if s in self.sid2name] + [self.domain_root]))
+        out = []
+        for t in targets:
+            # 1) membership closure of t (reverse over membership-only edges)
+            members_sids = set(); dq = deque([t])
+            while dq:
+                n = dq.popleft()
+                for src, _lbl in self.radj.get(n, []):
+                    if src in members_sids:
+                        continue
+                    if any(dst == n for dst in self.medges.get(src, [])):
+                        members_sids.add(src); dq.append(src)
+            # 2) reverse-reachability over ALL edges, recording next hop toward t
+            #    (BFS => shortest controller->target path)
+            nexthop = {}; reach = set(); dq = deque([t])
+            while dq:
+                n = dq.popleft()
+                for src, lbl in self.radj.get(n, []):
+                    if src == t or src in reach:
+                        continue
+                    reach.add(src); nexthop[src] = (n, lbl); dq.append(src)
+            controllers = []
+            for s in reach:
+                if (s not in self.sid2name or s.startswith("GPO:")
+                        or s in members_sids or s in self.tier0_groups or s == self.domain_root):
+                    continue
+                # nexthop is a BFS tree rooted at t, so following it always reaches
+                # t; the cap (graph size) is a defensive bound, never a real truncation.
+                path, cur, guard, cap = [], s, 0, len(nexthop) + 2
+                while cur != t and cur in nexthop and guard < cap:
+                    nh, lbl = nexthop[cur]
+                    path.append((self._node_name(cur), lbl, self._node_name(nh)))
+                    cur = nh; guard += 1
+                ent = self.sid2obj.get(s)
+                controllers.append({"name": self._node_name(s),
+                                    "type": ent[0] if ent else "group",
+                                    "broad": s in self.broad, "path": path})
+            controllers.sort(key=lambda c: (0 if c["broad"] else 1, len(c["path"]), c["name"].lower()))
+            members = []
+            for ms in members_sids:
+                ent = self.sid2obj.get(ms)
+                members.append(self._acct_info(ent[0], ent[1]) if ent
+                               else {"sam": self._node_name(ms), "kind": "group", "enabled": None,
+                                     "pwd_age": None, "logon_age": None, "spn": False, "stale": False})
+            members.sort(key=lambda m: (m.get("sam") or "").lower())
+            out.append({"name": self._node_name(t), "sid": t, "is_domain": t == self.domain_root,
+                        "member_count": len(members_sids), "members": members[:200],
+                        "controller_count": len(controllers), "controllers": controllers[:50]})
+        out.sort(key=lambda g: (-g["controller_count"], g["name"]))
+        return out
 
     def _shortest(self, start):
         from collections import deque
@@ -8257,8 +8327,10 @@ class HTMLReporter:
                  f'<div class="kc-pstat"><b>{unconstrained}</b><span>unconstrained hosts</span></div>'
                  f'</div>')
         return ('<section class="kc-section kc-critborder" id="sec-paths">'
-                '<h2 class="kc-h2">Attack paths<span class="tag">low-priv → Tier 0</span></h2>'
-                '<p class="kc-sub">Routes to domain compromise, with the tradecraft to walk each.</p>'
+                '<h2 class="kc-h2">Attack paths<span class="tag">foothold → Tier 0</span></h2>'
+                '<p class="kc-sub">Identified routes from a low-privileged position to Tier-0, '
+                'with the technique and supporting tooling noted for each (for validation — '
+                'SCOUT does not execute anything).</p>'
                 f'{stats}{body}</section>')
 
     # ── action plan ────────────────────────────────────────────────────────────
@@ -8309,26 +8381,117 @@ class HTMLReporter:
                 f'<td class="kc-num">{ll_age if ll_age is not None else "—"}</td>'
                 f'<td>{fhtml}</td></tr>')
 
+    def _hv_member_facts_table(self, facts):
+        """Member table from control-path account facts (used when full objects
+        aren't in priv_group_members)."""
+        rows = ""
+        for m in facts[:80]:
+            kind = m.get("kind"); en = m.get("enabled")
+            if kind in ("group", "external"):
+                st = f'<span class="kc-muted">{self._e(kind)}</span>'   # not an account — no enabled/disabled state
+            else:
+                st = ('<span class="kc-bad">disabled</span>' if en is False
+                      else ('<span class="kc-ok">enabled</span>' if en else '—'))
+            fl = []
+            if m.get("spn"): fl.append('<span class="kc-aflag bad">kerberoastable</span>')
+            if m.get("stale"): fl.append('<span class="kc-aflag warn">stale</span>')
+            fhtml = " ".join(fl) or '<span class="kc-aflag ok">clean</span>'
+            pw, ll = m.get("pwd_age"), m.get("logon_age")
+            rows += (f'<tr><td><strong>{self._e(m.get("sam",""))}</strong></td><td>{st}</td>'
+                     f'<td class="kc-num">{pw if pw is not None else "—"}</td>'
+                     f'<td class="kc-num">{ll if ll is not None else "—"}</td><td>{fhtml}</td></tr>')
+        return ('<table class="kc-table"><thead><tr><th>Account</th><th>Status</th>'
+                '<th class="kc-num">Pwd age (d)</th><th class="kc-num">Last logon (d)</th>'
+                f'<th>Flags</th></tr></thead><tbody>{rows}</tbody></table>')
+
+    def _hv_controllers_html(self, g):
+        """Inbound control paths to a high-value target — the principals that can
+        take control of it WITHOUT being a member, each with the resolved path."""
+        ctrls = g["controllers"]
+        if not ctrls:
+            return ('<p class="kc-ap-sub" style="margin-top:12px"><span class="kc-ok">'
+                    'No principal outside the membership can take control of this group.</span></p>')
+        chains = ""
+        for c in ctrls:
+            ne = [self._pnode(c["name"], "attacker")]
+            if c["path"]:
+                for (_src, label, dst) in c["path"]:
+                    ne += [label, self._pnode(dst, "crown" if dst == g["name"] else "")]
+            else:   # defensive: a controller always has a >=1-hop path, but never crash
+                ne += ["controls", self._pnode(g["name"], "crown")]
+            chains += self._chain(ne, "CRITICAL" if c["broad"] else "HIGH", "")
+        extra = g["controller_count"] - len(ctrls)
+        more = f'<p class="kc-ap-sub">… and {extra} more principal(s).</p>' if extra > 0 else ""
+        return ('<div class="kc-sub-h" style="margin-top:14px">Can take control — not a member '
+                '<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--faint)">'
+                f'— {g["controller_count"]} principal(s) have a control path to this group; click any node</span></div>'
+                f'{chains}{more}')
+
     def _privileged_section(self):
         pgm = self.data.priv_group_members
-        groups = [g for g in self._PRIV_ORDER if pgm.get(g)]
-        groups += [g for g in pgm if g not in self._PRIV_ORDER and pgm.get(g)]
-        blocks = ""
-        gi = 0
-        for g in groups:
-            members = pgm[g]
-            # de-dup by dn
+        cp = self._cp()
+        hv = cp.get("hv_targets") or []
+        # order: domain root first, then most-controllable, then standard precedence
+        def rank(g):
+            if g.get("is_domain"): return -1
+            try: return self._PRIV_ORDER.index(g["name"])
+            except ValueError: return 99
+        hv = sorted(hv, key=lambda g: (0 if (g["controller_count"] or g["is_domain"] or pgm.get(g["name"])) else 1,
+                                       -g["controller_count"], rank(g)))
+        hv_names = {g["name"] for g in hv}
+
+        # 1) high-value targets — members + who can take control of them
+        gi = 0; hv_blocks = ""
+        for g in hv:
+            name = g["name"]
+            objs = pgm.get(name)
+            if objs:
+                seen = set(); uniq = []
+                for m in objs:
+                    if m["dn"] in seen: continue
+                    seen.add(m["dn"]); uniq.append(m)
+                mem_count = len(uniq)
+                rows = "".join(self._priv_member_row(m) for m in sorted(
+                    uniq, key=lambda m: (0 if self._acct_flags(m)[1] else 1,
+                                         get_str(m["attrs"], "sAMAccountName").lower()))[:80])
+                mem_tbl = ('<div class="kc-sub-h">Members</div><table class="kc-table"><thead><tr>'
+                           '<th>Account</th><th>Status</th><th class="kc-num">Admin</th>'
+                           '<th class="kc-num">Pwd age (d)</th><th class="kc-num">Last logon (d)</th>'
+                           f'<th>Flags</th></tr></thead><tbody>{rows}</tbody></table>')
+            elif g["is_domain"]:
+                mem_count = 0; mem_tbl = ""
+            else:
+                mem_count = g["member_count"]
+                mem_tbl = ('<div class="kc-sub-h">Members</div>' + self._hv_member_facts_table(g["members"])
+                           if g["members"] else "")
+            cc = g["controller_count"]
+            warn = (f' · <span class="kc-bad">{cc} can take control</span>' if cc
+                    else ' · <span class="kc-ok">no external control path</span>')
+            head_n = ("domain head" if g["is_domain"] else f"{mem_count} member(s)") + warn
+            gid = f"hv-{gi}"; gi += 1
+            hv_blocks += (
+                f'<div class="kc-pg"><div class="kc-pg-h" onclick="kcRowTog(\'{gid}\')">'
+                f'<span class="kc-pg-ar" id="ar-{gid}">▸</span> <strong>{self._e(name)}</strong>'
+                f'<span class="kc-pg-n">{head_n}</span></div>'
+                f'<div class="kc-pg-b" id="{gid}" style="display:none">'
+                f'{mem_tbl}{self._hv_controllers_html(g)}</div></div>')
+
+        # 2) other privileged groups (not Tier-0 targets) — membership roster
+        others = [g for g in self._PRIV_ORDER if g in pgm and g not in hv_names and pgm.get(g)]
+        others += [g for g in pgm if g not in self._PRIV_ORDER and g not in hv_names and pgm.get(g)]
+        other_blocks = ""
+        for g in others:
             seen = set(); uniq = []
-            for m in members:
+            for m in pgm[g]:
                 if m["dn"] in seen: continue
                 seen.add(m["dn"]); uniq.append(m)
             notable_n = sum(1 for m in uniq if self._acct_flags(m)[1])
-            rows = "".join(self._priv_member_row(m) for m in
-                           sorted(uniq, key=lambda m: (0 if self._acct_flags(m)[1] else 1,
-                                                       get_str(m["attrs"],"sAMAccountName").lower()))[:80])
+            rows = "".join(self._priv_member_row(m) for m in sorted(
+                uniq, key=lambda m: (0 if self._acct_flags(m)[1] else 1,
+                                     get_str(m["attrs"], "sAMAccountName").lower()))[:80])
             gid = f"pg-{gi}"; gi += 1
             warn = f' · <span class="kc-bad">{notable_n} notable</span>' if notable_n else ""
-            blocks += (
+            other_blocks += (
                 f'<div class="kc-pg"><div class="kc-pg-h" onclick="kcRowTog(\'{gid}\')">'
                 f'<span class="kc-pg-ar" id="ar-{gid}">▸</span> <strong>{self._e(g)}</strong>'
                 f'<span class="kc-pg-n">{len(uniq)} member(s){warn}</span></div>'
@@ -8337,38 +8500,28 @@ class HTMLReporter:
                 '<th class="kc-num">Admin</th><th class="kc-num">Pwd age (d)</th>'
                 '<th class="kc-num">Last logon (d)</th><th>Flags</th></tr></thead>'
                 f'<tbody>{rows}</tbody></table></div></div>')
-        # control-path closure: shortest paths to Domain Admin (PingCastle /
-        # BloodHound-style). Nodes are clickable — click one to open the drawer
-        # with its members / account facts; the graph gives the visual overview.
-        cpaths = self._cp()
-        cp = ""
-        if cpaths.get("paths"):
-            chains = ""
-            for name, path, is_broad in cpaths["paths"]:
-                if not path:
-                    continue
-                ne = [self._pnode(path[0][0], "attacker")]
-                for k, (src, label, dst) in enumerate(path):
-                    last = (k == len(path) - 1)
-                    ne += [label, self._pnode(dst, "crown" if last else "")]
-                chains += self._chain(ne, "CRITICAL" if is_broad else "HIGH",
-                                      "membership + ACL / ownership")
-            extra = cpaths.get("count", 0) - len(cpaths["paths"])
-            more = f'<p class="kc-sub">… and {extra} more principal(s) with a path to Tier-0.</p>' if extra > 0 else ""
-            graph = self._control_graph_svg()
-            graph_hdr = ('<div class="kc-sub-h">Control-path graph '
-                         '<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--faint)">'
-                         '— click any node for members / account detail</span></div>') if graph else ""
-            cp = (graph_hdr + graph +
-                  '<div class="kc-sub-h">Shortest paths to Domain Admin '
-                  f'<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--faint)">'
-                  f'— {cpaths.get("count",0)} non-privileged principal(s) can reach Tier-0; click a node</span></div>'
-                  f'{chains}{more}')
-        if not blocks and not cp:
+
+        # 3) control-path map (visual overview)
+        graph = self._control_graph_svg()
+        graph_blk = (('<div class="kc-sub-h">Control-path map '
+                      '<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--faint)">'
+                      '— principals (left) to Tier-0 (right); click any node for detail</span></div>'
+                      + graph) if graph else "")
+        if not hv_blocks and not other_blocks and not graph_blk:
             return ""
-        return ('<section class="kc-section" id="sec-priv"><h2 class="kc-h2">Privileged accounts'
-                '<span class="tag">click a group — notable = stale / kerberoastable / no-expiry</span></h2>'
-                f'{blocks}{cp}</section>')
+        n_ctrl = cp.get("count", 0)
+        intro = (f'<p class="kc-sub">Who holds privilege, and who can <em>take</em> it. '
+                 f'{n_ctrl} non-privileged principal(s) have a control path to a Tier-0 group. '
+                 'Expand a target to see its members and exactly who can take control of it.</p>'
+                 if hv else '<p class="kc-sub">Privileged group membership.</p>')
+        hv_hdr = ('<div class="kc-sub-h">High-value targets '
+                  '<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--faint)">'
+                  '— click a group: members + who can take control</span></div>') if hv_blocks else ""
+        other_hdr = ('<div class="kc-sub-h" style="margin-top:18px">Other privileged groups</div>'
+                     if other_blocks else "")
+        return ('<section class="kc-section" id="sec-priv"><h2 class="kc-h2">Privileged accounts &amp; control paths'
+                '<span class="tag">who is privileged · who can take control</span></h2>'
+                f'{intro}{graph_blk}{hv_hdr}{hv_blocks}{other_hdr}{other_blocks}</section>')
 
     # ── PKI / AD CS attack surface ─────────────────────────────────────────────
     _ESC_RULE_LABEL = {"A-CertTempCustomSubject":"ESC1", "A-CertTempAnyPurpose":"ESC2",
@@ -8459,7 +8612,7 @@ class HTMLReporter:
                 if len(rows_data) > 60 else "")
         t_tbl = (('<div class="kc-sub-h">Certificate templates '
                   '<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--faint)">'
-                  '— published; abusable templates first. ESS = enrollee-supplies-subject</span></div>'
+                  '— published; vulnerable templates first. ESS = enrollee-supplies-subject</span></div>'
                   '<table class="kc-table"><thead><tr><th>Template</th><th class="kc-num">Schema</th>'
                   '<th>Auth EKU</th><th>ESS</th><th>Mgr approval</th><th>Abuse</th></tr></thead>'
                   f'<tbody>{t_rows}</tbody></table>{more}')
@@ -8475,12 +8628,12 @@ class HTMLReporter:
         stats = (f'<div class="kc-paths-tag">'
                  f'<div class="kc-pstat"><b>{len(cas)}</b><span>certificate authorities</span></div>'
                  f'<div class="kc-pstat"><b>{len(rows_data)}</b><span>published templates</span></div>'
-                 f'<div class="kc-pstat"><b style="color:var(--crit)">{n_vuln}</b><span>abusable templates</span></div>'
+                 f'<div class="kc-pstat"><b style="color:var(--crit)">{n_vuln}</b><span>vulnerable templates</span></div>'
                  f'</div>')
         return ('<section class="kc-section" id="sec-pki"><h2 class="kc-h2">PKI / AD CS'
                 '<span class="tag">certificate attack surface</span></h2>'
                 '<p class="kc-sub">Certificate authorities and the templates they issue — '
-                'the ones flagged here are enrollable by a low-privileged principal and abusable to '
+                'the flagged templates are enrollable by a low-privileged principal and lead to '
                 'a Domain Admin certificate.</p>'
                 f'{stats}{ca_tbl}{t_tbl}{esc14}</section>')
 
@@ -8537,10 +8690,10 @@ class HTMLReporter:
             who = ", ".join(self._e(w) for w in r["writers"][:4]) + ("…" if len(r["writers"]) > 4 else "")
             wrows += (f'<tr class="{"kc-notable" if r["dc_linked"] else ""}"><td><strong>{self._e(r["name"])}</strong></td>'
                       f'<td>{who}</td><td>{scope}</td></tr>')
-        weap_tbl = (('<div class="kc-sub-h">Weaponizable GPOs '
+        weap_tbl = (('<div class="kc-sub-h">GPOs controllable by non-Tier-0 principals '
                      '<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--faint)">'
-                     '— writable by a non-Tier-0 principal → code execution in the GPO scope</span></div>'
-                     '<table class="kc-table"><thead><tr><th>GPO</th><th>Writable by</th>'
+                     '— a non-admin can edit these; the policy applies (runs) across the GPO scope</span></div>'
+                     '<table class="kc-table"><thead><tr><th>GPO</th><th>Controlled by</th>'
                      '<th>Applies to</th></tr></thead>'
                      f'<tbody>{wrows}</tbody></table>')
                     if wrows else '<p class="kc-sub">No GPO is writable by a broad / non-Tier-0 principal.</p>')
@@ -8562,7 +8715,7 @@ class HTMLReporter:
                  f'<div class="kc-pstat"><b>{len(orphaned)}</b><span>orphaned</span></div>'
                  f'</div>')
         return ('<section class="kc-section" id="sec-gpo"><h2 class="kc-h2">Group Policy'
-                '<span class="tag">GPO takeover paths</span></h2>'
+                '<span class="tag">GPO control paths</span></h2>'
                 f'{stats}{weap_tbl}{gpp_blk}{t0_blk}{orph_blk}</section>')
 
     # ── findings register ──────────────────────────────────────────────────────

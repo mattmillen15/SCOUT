@@ -121,6 +121,19 @@ Insight Recon: "Risk Posture Score over time", "New / Remediated / Modified / Un
 - **P-LAPSReadable** — LAPS local-admin password actually readable by the scanning
   principal (delegated-read misconfig → lateral movement; plaintext surfaced).
 
+## Shipped — parity v4 (control-path views, PingCastle-style)
+
+- **Per-high-value-target control paths.** The Privileged section is now organised
+  around the Tier-0 groups (Domain Admins/Enterprise/Schema/Administrators/Operators
+  /GPO Creators + the domain root): click a target to see **its members** and **who
+  can take control of it without being a member** — the inbound controllers, each
+  with the resolved path (`HELPDESK →[GenericAll]→ WS-ADMIN$ →[member of]→ Domain
+  Admins`), broad principals flagged. Clean "no external control path" where none
+  exists. Computed in `ControlPathAnalyzer._high_value_targets()` (reverse
+  reachability over the full membership+ACL graph).
+- Identification voice throughout (SCOUT never executes — commands are reference for
+  validation only).
+
 ## Next up (highest leverage first)
 
 1. **Risk-posture-over-time** sparkline + local scan-history store — §6.2.
