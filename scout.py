@@ -342,6 +342,10 @@ RULES: Dict[str, Tuple[str, str, int, str]] = {
     "A-CertTemplateESC4":     ("Certificate template ACL writable by low-privileged principal (ESC4)","Anomaly",50,"CRITICAL"),
     "A-CertCAManageLowPriv":  ("Low-privileged principal holds CA management rights (ESC7)","Anomaly",50,"CRITICAL"),
     "A-CertTemplateESC9":     ("Certificate template has no security extension — weak cert mapping (ESC9)","Anomaly",40,"HIGH"),
+    "A-CertTemplateESC5":     ("Dangerous ACL on CA / PKI AD object — object takeover (ESC5)","Anomaly",50,"CRITICAL"),
+    "A-CertTemplateESC13":    ("Certificate template issuance policy linked to a privileged group (ESC13)","Anomaly",50,"CRITICAL"),
+    "A-CertTemplateESC15":    ("Schema V1 template allows enrollee-supplied application policies (ESC15 / CVE-2024-49019)","Anomaly",40,"HIGH"),
+    "A-CertWeakMapping":      ("Weak explicit certificate mapping on account (ESC14)","Anomaly",30,"HIGH"),
     "P-ControlPathDA":        ("Non-privileged principals have a control path to Domain Admin","Privileged",75,"CRITICAL"),
     "A-SCCMContainerACL":     ("System Management (SCCM) container writable by a broad principal","Anomaly",40,"HIGH"),
     "A-SCCM":                 ("SCCM/MECM site infrastructure exposed (relay / NAA / PXE attack surface)","Anomaly",40,"HIGH"),
@@ -353,6 +357,8 @@ RULES: Dict[str, Tuple[str, str, int, str]] = {
     "A-AADConnectSync":       ("Entra/Azure AD Connect sync account present (DCSync-capable)","Anomaly",25,"HIGH"),
     "A-SeamlessSSO":          ("Entra Seamless SSO computer account (AZUREADSSOACC$) key is stale","Anomaly",25,"HIGH"),
     "S-OrphanedGPO":          ("Orphaned / unlinked GPOs present","Stale",5,"LOW"),
+    "A-PasswordInDescription":("Possible credential in an account description/info attribute","Anomaly",50,"HIGH"),
+    "P-LAPSReadable":         ("LAPS local-admin password readable by the current principal","Privileged",75,"CRITICAL"),
 }
 
 # Field/army palette — oxide red, rust, mustard/brass, olive drab, field gray.
@@ -389,7 +395,9 @@ RULE_MATURITY: Dict[str, int] = {
     "P-ModifiableGPO":1, "P-DangerousACLGPO":1, "P-ServiceDomainAdmin":1,
     "P-UnconstrainedDelegation":1, "A-CertTempCustomSubject":1, "A-CertTempNoSecurity":1,
     "A-CertTempAnyone":1, "A-CertTempAnyPurpose":1, "A-CertTempAgent":1,
-    "A-CertEnrollHttp":1, "A-CertTemplateESC4":1,
+    "A-CertEnrollHttp":1, "A-CertTemplateESC4":1, "A-CertTemplateESC5":1,
+    "A-CertTemplateESC13":1, "A-CertTemplateESC15":1,
+    "A-PasswordInDescription":1, "P-LAPSReadable":1,
     "S-KerberoastableAdmin":1, "S-NoPreAuthAdmin":1, "S-Vuln-MS14-068":1,
     "S-Vuln-MS17_010":1, "A-DC-Coerce":1, "A-MD5RootCert":1, "A-SHA0RootCert":1,
     "A-BadSuccessor":1, "T-SIDHistoryDangerous":1, "T-TGTDelegation":1,
@@ -498,6 +506,12 @@ RULE_MITRE: Dict[str, List[str]] = {
     "A-SCCMContainerACL": ["T1222.001: ACL Modification", "T1557.001: SMB Relay"],
     "A-CertCAManageLowPriv": ["T1649: Authentication Certificates (ESC7)"],
     "A-CertTemplateESC9": ["T1649: Authentication Certificates (ESC9)"],
+    "A-CertTemplateESC5": ["T1649: Authentication Certificates (ESC5)", "T1222.001: ACL Modification"],
+    "A-CertTemplateESC13": ["T1649: Authentication Certificates (ESC13)", "T1098: Account Manipulation"],
+    "A-CertTemplateESC15": ["T1649: Authentication Certificates (ESC15)"],
+    "A-CertWeakMapping": ["T1649: Steal/Forge Authentication Certificates (ESC14)", "T1556: Modify Authentication Process"],
+    "A-PasswordInDescription": ["T1552.001: Credentials In Files", "T1078: Valid Accounts"],
+    "P-LAPSReadable": ["T1555: Credentials from Password Stores", "T1078: Valid Accounts"],
     "P-ControlPathDA": ["T1222.001: ACL Modification", "T1098: Account Manipulation"],
     "P-ControlPathIndirectEveryone": ["T1222.001: ACL Modification"],
     "P-ControlPathIndirectMany": ["T1222.001: ACL Modification"],
@@ -562,6 +576,9 @@ OP_CATEGORY = {
     "A-CertTempAgent":"Privilege Escalation","A-CertTemplateESC4":"Privilege Escalation",
     "A-CertEnrollHttp":"Privilege Escalation","A-CertCAManageLowPriv":"Privilege Escalation",
     "A-CertTemplateESC9":"Privilege Escalation","P-ControlPathDA":"Privilege Escalation",
+    "A-CertTemplateESC5":"Privilege Escalation","A-CertTemplateESC13":"Privilege Escalation",
+    "A-CertTemplateESC15":"Privilege Escalation","A-CertWeakMapping":"Privilege Escalation",
+    "A-PasswordInDescription":"Credential Access","P-LAPSReadable":"Credential Access",
     "P-ControlPathIndirectEveryone":"Privilege Escalation","P-ControlPathIndirectMany":"Privilege Escalation",
     "P-GMSAReadable":"Privilege Escalation",
     # Credential access / harvesting
@@ -1463,6 +1480,94 @@ RULE_DOCS: Dict[str, Dict[str, Any]] = {
         ],
         "refs": ["https://github.com/ly4k/Certipy"],
     },
+    "A-CertTemplateESC5": {
+        "description": "A broad / low-privileged principal has object-takeover rights (GenericAll/GenericWrite/WriteDacl/WriteOwner) over a CA / PKI AD object — ESC5.",
+        "why": "ESC5 is escalation via the PKI's AD objects rather than a template. Control of the enterprise CA object (or the PKI containers) lets an attacker publish a vulnerable template, enable a template, add themselves as a CA officer, or flip dangerous CA flags — any of which leads to minting an authentication certificate for a Domain Admin.",
+        "technical": "pKIEnrollmentService (CA) object nTSecurityDescriptor grants GenericAll/GenericWrite/WriteDacl/WriteOwner to Everyone / Authenticated Users / Domain Users / Domain Computers / BUILTIN\\Users.",
+        "exploit": [
+            "certipy find -vulnerable    # flags ESC5 on the CA object",
+            "After taking ownership, publish/enable a vulnerable template and enroll as a privileged user.",
+        ],
+        "remediation": [
+            "Restrict the CA object (and the Public Key Services containers) ACL to PKI administrators / Tier-0 only.",
+            "Remove GenericAll/Write/WriteDacl/WriteOwner ACEs granted to broad principals.",
+        ],
+        "refs": ["https://posts.specterops.io/certified-pre-owned-d95910965cd2",
+                 "https://github.com/ly4k/Certipy"],
+    },
+    "A-CertTemplateESC13": {
+        "description": "A published, low-priv-enrollable certificate template carries an issuance policy whose OID is linked (msDS-OIDToGroupLink) to a privileged group — ESC13.",
+        "why": "When an issuance-policy OID is linked to a group, a certificate issued from a template bearing that policy grants the holder that group's membership at authentication time. If a low-privileged principal can enroll in the template and the linked group is privileged, enrolling yields privileged access with no other prerequisite.",
+        "technical": "Template msPKI-Certificate-Policy references an msPKI-Enterprise-Oid object (CN=OID,CN=Public Key Services,CN=Services,CN=Configuration) whose msDS-OIDToGroupLink points to a privileged group, and a broad principal holds Enroll on the template.",
+        "exploit": [
+            "certipy find -vulnerable    # flags ESC13",
+            "certipy req -template <tmpl> -ca <ca>    # the issued cert confers the linked group",
+        ],
+        "remediation": [
+            "Remove the msDS-OIDToGroupLink, or restrict enrollment on templates that carry the policy to trusted principals.",
+            "Avoid linking issuance policies to privileged groups.",
+        ],
+        "refs": ["https://posts.specterops.io/adcs-esc13-abuse-technique-fda4272fbd53"],
+    },
+    "A-CertTemplateESC15": {
+        "description": "A published, low-priv-enrollable schema V1 template allows the requester to supply Subject and inject arbitrary application policies — ESC15 / CVE-2024-49019 (\"EKUwu\").",
+        "why": "Schema-version-1 templates do not constrain the EKUs/application policies of the issued certificate, so a requester who can supply the subject can also inject application policies such as Client Authentication or Certificate Request Agent — authenticating as, or enrolling on behalf of, any user (including Domain Admins). The default 'WebServer' template is the canonical target.",
+        "technical": "msPKI-Template-Schema-Version = 1, CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT set, no manager approval, and a broad principal holds Enroll.",
+        "exploit": [
+            "certipy req -template <v1tmpl> -ca <ca> -application-policies 'Client Authentication' -upn administrator@domain",
+        ],
+        "remediation": [
+            "Patch DCs/CA (CVE-2024-49019); republish affected templates at schema version 2+.",
+            "Require manager approval or remove enrollee-supplied-subject on V1 templates; restrict enrollment.",
+        ],
+        "refs": ["https://www.tarlogic.com/blog/ad-cs-esc15-vulnerability/",
+                 "https://github.com/ly4k/Certipy"],
+    },
+    "A-CertWeakMapping": {
+        "description": "An account has a weak explicit certificate mapping in altSecurityIdentities (issuer+subject, subject-only, or RFC822/email) — ESC14.",
+        "why": "Weak explicit mappings bind a certificate to the account by easily-forged fields (issuer+subject DN, or email) instead of a strong serial / SKI / public-key binding. An attacker who can obtain or issue a certificate matching those fields — from any template/CA the account trusts, or a low-bar/misconfigured CA — authenticates as the mapped account via PKINIT/Schannel. A planted weak mapping is also a stealthy persistence backdoor.",
+        "technical": "altSecurityIdentities contains X509IssuerSubject (<I>..<S>..), X509SubjectOnly (<S>..) or an RFC822/email mapping — none include a strong binding (<SR> serial, <SKI>, or <SHA1-PUKEY>). Post-KB5014754 only the strong forms are safe.",
+        "exploit": [
+            "Obtain/forge a cert whose issuer+subject (or email) match the mapping, then PKINIT as the account.",
+            "certipy req ... then certipy auth -pfx <cert> -username <mapped account>",
+        ],
+        "remediation": [
+            "Replace weak mappings with a strong one (X509IssuerSerialNumber / SKI / SHA1PublicKey).",
+            "Remove unexpected altSecurityIdentities entries (possible backdoor).",
+            "Enforce StrongCertificateBindingEnforcement=2 on DCs (KB5014754).",
+        ],
+        "refs": ["https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/manage/certificate-mapping",
+                 "https://github.com/ly4k/Certipy"],
+    },
+    "A-PasswordInDescription": {
+        "description": "An account's description / info attribute contains text that looks like a stored password or secret.",
+        "why": "Admins routinely stash service-account or initial passwords in the description/info fields — which every authenticated user can read over LDAP. A single valid credential is often a domain foothold or a lateral-movement primitive: one of the highest-yield, lowest-effort wins on an internal assessment.",
+        "technical": "description / info matched a credential heuristic (a 'pwd/pass/pw:' label or a complex high-entropy token). Review the value — it may be stale or a decoy.",
+        "exploit": [
+            "The candidate secret is shown in the evidence below — validate it:",
+            "nxc smb <dc> -u <account> -p '<value>'   # or kerbrute / spray across the domain",
+        ],
+        "remediation": [
+            "Remove the secret from the attribute and rotate the exposed credential.",
+            "Store secrets in a vault / use gMSA / LAPS instead of AD free-text attributes.",
+        ],
+        "refs": [],
+    },
+    "P-LAPSReadable": {
+        "description": "The scanning principal can READ stored LAPS local-administrator passwords (ms-Mcs-AdmPwd / msLAPS-Password).",
+        "why": "If a non-Tier-0 account can read LAPS passwords it can recover the local Administrator password of those hosts and move laterally / escalate immediately — exactly what LAPS exists to prevent. SCOUT read at least one LAPS password with the supplied credentials, so any holder of this account can too.",
+        "technical": "ms-Mcs-AdmPwd (legacy LAPS, cleartext) or msLAPS-Password (Windows LAPS) returned a value to this principal — CONTROL_ACCESS/ReadProperty on the attribute is delegated too broadly. (msLAPS-EncryptedPassword additionally needs decryption rights.)",
+        "exploit": [
+            "Legacy-LAPS plaintext is in the evidence below.",
+            "nxc ldap <dc> -u <user> -p <pass> -M laps",
+            "Then pass-the-password to the host as Administrator (nxc smb / wmiexec).",
+        ],
+        "remediation": [
+            "Restrict ms-Mcs-AdmPwd / msLAPS-Password read rights to defined admin groups only.",
+            "Audit delegated read on the computer OUs; force-rotate exposed passwords.",
+        ],
+        "refs": [],
+    },
     "A-SCCMContainerACL": {
         "description": "The System Management container (SCCM/MECM) is writable by a broad / non-Tier-0 principal.",
         "why": "Write access to the System Management container lets an attacker publish a rogue management point and coerce clients/site servers to authenticate to it (relay), or tamper with SCCM site data — a common path to SCCM, and from there domain-wide, compromise.",
@@ -1785,6 +1890,10 @@ Examples:
                      help="Also write JSON findings (optional path; default scout_<domain>.json)")
     out.add_argument("--csv",    metavar="FILE", nargs="?", const="__AUTO__",
                      help="Also write a CSV of findings (optional path; default scout_<domain>.csv)")
+    out.add_argument("--baseline", metavar="FILE",
+                     help="A prior SCOUT JSON to diff against — report New / Fixed / "
+                          "Unchanged / Modified findings and per-finding 'first seen'. "
+                          "Pair with --json to keep history across scans.")
     out.add_argument("--operator", metavar="NAME", default="",
                      help="Operator/author name printed on the report cover")
     out.add_argument("--scope",    metavar="TEXT", default="",
@@ -2480,7 +2589,8 @@ class ADData:
             "mail","distinguishedName","userPrincipalName","description",
             "whenCreated","accountExpires","badPasswordTime","badPwdCount",
             "msDS-AllowedToDelegateTo","msDS-AllowedToActOnBehalfOfOtherIdentity",
-            "primaryGroupID","objectSid","name","displayName"])
+            "primaryGroupID","objectSid","name","displayName",
+            "altSecurityIdentities","info"])
 
     # ── computers ────────────────────────────────────────────────────────────
 
@@ -2494,7 +2604,8 @@ class ADData:
             "msDS-AllowedToDelegateTo","msDS-AllowedToActOnBehalfOfOtherIdentity",
             "ms-Mcs-AdmPwdExpirationTime","msLAPS-PasswordExpirationTime",
             "distinguishedName","msDS-IsRODC","primaryGroupID","whenCreated",
-            "objectSid","name","logonCount"])
+            "objectSid","name","logonCount","altSecurityIdentities","description",
+            "ms-Mcs-AdmPwd","msLAPS-Password","msLAPS-EncryptedPassword"])
 
     # ── groups ────────────────────────────────────────────────────────────────
 
@@ -2632,7 +2743,7 @@ class ADData:
             "msPKI-Enrollment-Flag","msPKI-RA-Signature",
             "pKIExtendedKeyUsage","nTSecurityDescriptor",
             "msPKI-Private-Key-Flag","msPKI-Template-Schema-Version",
-            "msPKI-Cert-Template-OID","flags"])
+            "msPKI-Cert-Template-OID","msPKI-Certificate-Policy","flags"])
         self.enrollment_svcs = self.conn.paged_search(
             f"CN=Enrollment Services,{pks_base}",
             "(objectClass=pKIEnrollmentService)", [
@@ -2715,7 +2826,117 @@ class CheckEngine:
         self._m_kds_root_key()
         self._m_entra()
         self._m_orphaned_gpos()
+        self._m_weak_cert_mapping()
+        self._m_password_in_description()
+        self._m_laps_readable()
         self._m_control_paths()
+
+    def _priv_sam_set(self) -> Set[str]:
+        """Lowercase sAMAccountNames of every member of a privileged group."""
+        out: Set[str] = set()
+        for members in self.d.priv_group_members.values():
+            for m in members:
+                sam = get_str(m.get("attrs", {}), "sAMAccountName") if isinstance(m, dict) else str(m)
+                if sam:
+                    out.add(sam.lower())
+        return out
+
+    # ── ESC14: weak explicit certificate mappings (altSecurityIdentities) ──────
+    def _m_weak_cert_mapping(self):
+        # A mapping is STRONG only if it carries a serial (<SR>), subject-key-id
+        # (<SKI>) or public-key hash (<SHA1-PUKEY>). Issuer+subject, subject-only
+        # and RFC822/email mappings are weak and forgeable (ESC14 / KB5014754).
+        def is_weak(m: str) -> bool:
+            s = (m or "").strip()
+            if not s.upper().startswith("X509:"):
+                return False
+            up = s.upper()
+            if any(tok in up for tok in ("<SR>", "<SKI>", "<SHA1-PUKEY>")):
+                return False
+            return ("<I>" in up) or ("<S>" in up) or ("<RFC822>" in up)
+        priv_sams = self._priv_sam_set()
+        for o in list(self.d.users) + list(self.d.computers):
+            a = o["attrs"]
+            maps = get_list(a, "altSecurityIdentities")
+            if not maps:
+                continue
+            weak = [m for m in maps if is_weak(m)]
+            if not weak:
+                continue
+            sam = get_str(a, "sAMAccountName") or dn_base(o["dn"])
+            privd = sam.lower() in priv_sams
+            note = " (PRIVILEGED account)" if privd else ""
+            self._add("A-CertWeakMapping",
+                      f"{sam}{note} has a weak explicit certificate mapping: "
+                      f"{'; '.join(weak[:3])}. An attacker who obtains a certificate matching "
+                      "this issuer/subject (or email) can authenticate as this account; the "
+                      "mapping may also be a planted backdoor. Replace with a strong "
+                      "(serial/SKI/public-key) mapping.",
+                      [f"{sam} -> {m}" for m in weak])
+
+    # ── credentials stashed in description / info attributes ───────────────────
+    _PW_LABEL_RE = re.compile(r'(?i)\b(pass(word|wd)?|pwd|pw|secret|creds?)\b\s*[:=]\s*\S')
+    _PW_SYMBOLS = set("!@#$%^&*()+|:;\"'<>?/~`")
+    def _looks_like_secret(self, text: str) -> bool:
+        if not text:
+            return False
+        if self._PW_LABEL_RE.search(text):
+            return True
+        # Otherwise only a lone complex token carrying ALL four classes incl. a real
+        # password symbol, standing nearly alone — this deliberately skips hostnames
+        # (DESKTOP-AB12CD3), SIDs (S-1-5-…), DN fragments (CN=…,OU=…) and tool stamps
+        # (Foo_v2.3), whose only "symbol" is - _ . , = and which lack mixed classes.
+        toks = text.split()
+        if len(toks) > 3:
+            return False
+        for tok in toks:
+            if len(tok) < 8 or len(tok) > 64 or tok.startswith("S-1-") or "=" in tok:
+                continue
+            if (any(c.islower() for c in tok) and any(c.isupper() for c in tok)
+                    and any(c.isdigit() for c in tok)
+                    and any(c in self._PW_SYMBOLS for c in tok)):
+                return True
+        return False
+
+    def _m_password_in_description(self):
+        for o in list(self.d.users) + list(self.d.computers):
+            a = o["attrs"]
+            sam = get_str(a, "sAMAccountName") or dn_base(o["dn"])
+            for attr in ("description", "info"):
+                val = get_str(a, attr)
+                if val and self._looks_like_secret(val):
+                    snippet = val if len(val) <= 120 else val[:117] + "…"
+                    self._add("A-PasswordInDescription",
+                              f"{sam} {attr} contains a possible credential: \"{snippet}\". "
+                              "Any authenticated user can read it over LDAP — validate and spray.",
+                              [f"{sam} [{attr}]: {snippet}"])
+                    break
+
+    # ── LAPS local-admin passwords readable by the current principal ───────────
+    def _m_laps_readable(self):
+        hits = []; enc_only = 0
+        for c in self.d.computers:
+            a = c["attrs"]
+            sam = get_str(a, "sAMAccountName") or dn_base(c["dn"])
+            clear = get_str(a, "ms-Mcs-AdmPwd")
+            new = get_str(a, "msLAPS-Password")
+            if clear:
+                hits.append(f"{sam} : {clear}")
+            elif new:
+                # Windows LAPS cleartext blob is JSON {... "p":"<pwd>" ...}.
+                hits.append(f"{sam} : {new if len(new) <= 200 else new[:197] + '…'}")
+            elif a.get("msLAPS-EncryptedPassword"):
+                # readable, but DPAPI-NG-encrypted to a designated decryptor — NOT
+                # recoverable over LDAP, so it is not a readable-password finding.
+                enc_only += 1
+        if hits:
+            extra = (f" A further {enc_only} host(s) expose only an encrypted LAPS blob "
+                     "(recoverable only with decryption rights).") if enc_only else ""
+            self._add("P-LAPSReadable",
+                      f"The supplied credentials can read cleartext LAPS passwords for {len(hits)} "
+                      "computer(s) — LAPS read rights are delegated too broadly, so the local "
+                      f"Administrator password of those hosts is exposed to this principal.{extra}",
+                      hits)
 
     def _m_managed_accounts(self):
         """gMSA / dMSA whose managed password a broad principal may read (roadmap
@@ -3541,6 +3762,8 @@ class CheckEngine:
                           [host])
 
         published = getattr(self.d, "_published_templates", set())
+        # ESC13: map issuance-policy OID -> linked group DN (msDS-OIDToGroupLink)
+        oid_group = self._oid_to_group_map()
 
         for tmpl in self.d.cert_templates:
             cn         = get_str(tmpl["attrs"], "cn")
@@ -3548,6 +3771,8 @@ class CheckEngine:
             enroll_flag= get_int(tmpl["attrs"], "msPKI-Enrollment-Flag")
             ra_sig     = get_int(tmpl["attrs"], "msPKI-RA-Signature")
             ekus       = get_list(tmpl["attrs"], "pKIExtendedKeyUsage")
+            schema_ver = get_int(tmpl["attrs"], "msPKI-Template-Schema-Version")
+            policies   = get_list(tmpl["attrs"], "msPKI-Certificate-Policy")
 
             # Only check templates published to at least one CA
             if published and cn not in published:
@@ -3629,6 +3854,36 @@ class CheckEngine:
                           f"to a victim's userPrincipalName this allows authenticating as them.{enroll_note}",
                           [cn])
 
+            # ESC15 (CVE-2024-49019): schema V1 + enrollee-supplied subject, no
+            # approval — a low-priv requester can inject arbitrary application
+            # policies (e.g. Client Authentication) that the V1 template doesn't
+            # constrain, and authenticate as any user.
+            if (schema_ver == 1 and (name_flag & self._CT_ENROLLEE_SUPPLIES_SUBJECT)
+                    and not manager_approval and enroll_reachable):
+                self._add("A-CertTemplateESC15",
+                          f"ESC15: schema V1 template '{cn}' allows enrollee-supplied subject "
+                          f"with no manager approval, so the requester can inject application "
+                          f"policies (e.g. Client Authentication) the V1 template does not "
+                          f"enforce — authenticate as any user.{enroll_note} "
+                          "certipy req -template "
+                          f"{cn} -application-policies 'Client Authentication' -upn administrator@domain",
+                          [cn])
+
+            # ESC13: an issuance policy on this template is linked to a privileged
+            # group (msDS-OIDToGroupLink). Enrolling grants that group membership.
+            for pol in policies:
+                glink = oid_group.get(pol)
+                if not (glink and enroll_reachable):
+                    continue
+                gname = dn_base(glink)
+                if self._group_is_privileged(glink):
+                    self._add("A-CertTemplateESC13",
+                              f"ESC13: template '{cn}' carries issuance policy {pol} linked to "
+                              f"privileged group '{gname}' (msDS-OIDToGroupLink). A low-priv "
+                              f"enroller obtains a certificate that grants '{gname}' membership "
+                              f"at authentication.{enroll_note} certipy req -template {cn}.",
+                              [f"{cn} -> {gname}"])
+
         # ESC7: low-privileged principal holds CA management rights
         for svc in self.d.enrollment_svcs:
             writers = self._esc7_ca_managers(svc)
@@ -3639,6 +3894,17 @@ class CheckEngine:
                           "flip EDITF_ATTRIBUTESUBJECTALTNAME2 (→ESC6) or approve their own "
                           "request to mint a DA certificate. certipy ca -add-officer / -enable-template.",
                           [f"{get_str(svc['attrs'],'cn')}: {p}" for p in writers])
+
+            # ESC5: object-takeover ACL on the CA AD object by a broad principal
+            esc5 = self._esc5_ca_object_writers(svc)
+            if esc5:
+                ca = get_str(svc['attrs'], 'cn')
+                self._add("A-CertTemplateESC5",
+                          f"ESC5: CA object '{ca}' is writable (GenericAll/GenericWrite/WriteDacl/"
+                          f"WriteOwner — object takeover) by: {', '.join(esc5)}. They can publish "
+                          "or enable a vulnerable template, add a CA officer, or flip dangerous CA "
+                          "flags, then mint a Domain Admin certificate. certipy find -vulnerable.",
+                          [f"{ca}: {p}" for p in esc5])
 
     # Access-mask bits that let a principal rewrite a template into ESC1.
     _ADS_GENERIC_ALL   = 0x10000000
@@ -3788,6 +4054,64 @@ class CheckEngine:
                 if guid in self._ENROLL_GUIDS:
                     out.append(broad[sidstr])
         return _dedup_keep_order(out), True
+
+    def _oid_to_group_map(self) -> Dict[str, str]:
+        """ESC13 support: issuance-policy OID -> linked group DN (msDS-OIDToGroupLink)."""
+        out: Dict[str, str] = {}
+        cfg = getattr(self.d, "cfg", "") or ""
+        if not cfg:
+            return out
+        try:
+            oids = self.d.conn.paged_search(
+                f"CN=OID,CN=Public Key Services,CN=Services,{cfg}",
+                "(objectClass=msPKI-Enterprise-Oid)",
+                ["msPKI-Cert-Template-OID", "msDS-OIDToGroupLink", "displayName"])
+        except Exception:
+            return out
+        for o in oids or []:
+            link = get_str(o["attrs"], "msDS-OIDToGroupLink")
+            toid = get_str(o["attrs"], "msPKI-Cert-Template-OID")
+            if link and toid:
+                out[toid] = link
+        return out
+
+    def _group_is_privileged(self, group_dn: str) -> bool:
+        """True only if a DN names a Tier-0-relevant privileged group (for ESC13
+        triage). Restricted to PRIV_GROUPS_SENSITIVE — the broader
+        priv_group_members set includes protection/operator groups that would
+        produce CRITICAL false positives for an issuance-policy link."""
+        return dn_base(group_dn).lower() in {g.lower() for g in self.PRIV_GROUPS_SENSITIVE}
+
+    def _esc5_ca_object_writers(self, svc: Dict) -> List[str]:
+        """ESC5: broad principals with object-takeover rights on the CA AD object."""
+        if not HAS_IMPACKET_LDAP:
+            return []
+        raw = svc["attrs"].get("nTSecurityDescriptor")
+        if isinstance(raw, list):
+            raw = raw[0] if raw else None
+        if not isinstance(raw, (bytes, bytearray)):
+            return []
+        try:
+            sd = _ldaptypes.SR_SECURITY_DESCRIPTOR(data=raw)
+        except Exception:
+            return []
+        broad = self._broad_low_priv_sids()
+        takeover = (self._ADS_GENERIC_ALL | self._ADS_GENERIC_WRITE
+                    | self._ADS_WRITE_DACL | self._ADS_WRITE_OWNER)
+        out: List[str] = []
+        dacl = sd["Dacl"]
+        if not dacl:
+            return []
+        for ace in dacl["Data"]:
+            try:
+                if ace["AceType"] not in (0x00, 0x05):
+                    continue
+                mask = int(ace["Ace"]["Mask"]["Mask"]); sidstr = ace["Ace"]["Sid"].formatCanonical()
+            except Exception:
+                continue
+            if sidstr in broad and (mask & takeover):
+                out.append(broad[sidstr])
+        return _dedup_keep_order(out)
 
     def _a_member_everyone(self):
         everyone_patterns = ["everyone","s-1-1-0","authenticated users",
@@ -6069,8 +6393,20 @@ class ControlPathAnalyzer:
             if p:
                 paths.append((self.sid2name.get(s, s), p, s in self.broad))
         nodes, edges = self._build_node_registry(paths)
+        hv = self._high_value_targets()
+        # ensure every node rendered in the HV view — target, controllers AND the
+        # intermediate hops on each controller's path — resolves in the click drawer
+        for g in hv:
+            names = [g["name"]]
+            for c in g["controllers"]:
+                names.append(c["name"])
+                names += [dst for (_s, _l, dst) in c["path"]]
+            for nm in names:
+                if nm not in nodes:
+                    nodes[nm] = self._node_meta(nm)
         self.data.control_paths = {"count": len(control), "broad": _dedup_keep_order(broad),
-                                   "paths": paths, "nodes": nodes, "edges": edges}
+                                   "paths": paths, "nodes": nodes, "edges": edges,
+                                   "hv_targets": hv}
 
     def _acct_info(self, kind, obj) -> Dict:
         """Per-principal facts the report shows in the node drawer (PingCastle-
@@ -6128,7 +6464,7 @@ class ControlPathAnalyzer:
                 if me:
                     members.append(self._acct_info(me[0], me[1]))
                 else:
-                    members.append({"sam": dn_base(mdn), "kind": "external",
+                    members.append({"sam": dn_base(mdn), "kind": "foreign",
                                     "enabled": None, "pwd_age": None,
                                     "logon_age": None, "spn": False, "stale": False})
             meta["members"] = members
@@ -6149,6 +6485,64 @@ class ControlPathAnalyzer:
                     seen_edge.add(ek)
                     edges.append({"src": src, "label": label, "dst": dst})
         return nodes, edges
+
+    def _high_value_targets(self):
+        """PingCastle-style per-target control paths: for each high-value group
+        (and the domain root) list its members AND the principals that can take
+        control of it WITHOUT being a member (the shadow-admin set), each with the
+        resolved path. Computed from the in-memory control graph (adj/radj)."""
+        from collections import deque
+        targets = list(dict.fromkeys(
+            [s for s in self.tier0_groups if s in self.sid2name] + [self.domain_root]))
+        out = []
+        for t in targets:
+            # 1) membership closure of t (reverse over membership-only edges)
+            members_sids = set(); dq = deque([t])
+            while dq:
+                n = dq.popleft()
+                for src, _lbl in self.radj.get(n, []):
+                    if src in members_sids:
+                        continue
+                    if any(dst == n for dst in self.medges.get(src, [])):
+                        members_sids.add(src); dq.append(src)
+            # 2) reverse-reachability over ALL edges, recording next hop toward t
+            #    (BFS => shortest controller->target path)
+            nexthop = {}; reach = set(); dq = deque([t])
+            while dq:
+                n = dq.popleft()
+                for src, lbl in self.radj.get(n, []):
+                    if src == t or src in reach:
+                        continue
+                    reach.add(src); nexthop[src] = (n, lbl); dq.append(src)
+            controllers = []
+            for s in reach:
+                if (s not in self.sid2name or s.startswith("GPO:")
+                        or s in members_sids or s in self.tier0_groups or s == self.domain_root):
+                    continue
+                # nexthop is a BFS tree rooted at t, so following it always reaches
+                # t; the cap (graph size) is a defensive bound, never a real truncation.
+                path, cur, guard, cap = [], s, 0, len(nexthop) + 2
+                while cur != t and cur in nexthop and guard < cap:
+                    nh, lbl = nexthop[cur]
+                    path.append((self._node_name(cur), lbl, self._node_name(nh)))
+                    cur = nh; guard += 1
+                ent = self.sid2obj.get(s)
+                controllers.append({"name": self._node_name(s),
+                                    "type": ent[0] if ent else "group",
+                                    "broad": s in self.broad, "path": path})
+            controllers.sort(key=lambda c: (0 if c["broad"] else 1, len(c["path"]), c["name"].lower()))
+            members = []
+            for ms in members_sids:
+                ent = self.sid2obj.get(ms)
+                members.append(self._acct_info(ent[0], ent[1]) if ent
+                               else {"sam": self._node_name(ms), "kind": "group", "enabled": None,
+                                     "pwd_age": None, "logon_age": None, "spn": False, "stale": False})
+            members.sort(key=lambda m: (m.get("sam") or "").lower())
+            out.append({"name": self._node_name(t), "sid": t, "is_domain": t == self.domain_root,
+                        "member_count": len(members_sids), "members": members[:200],
+                        "controller_count": len(controllers), "controllers": controllers[:50]})
+        out.sort(key=lambda g: (-g["controller_count"], g["name"]))
+        return out
 
     def _shortest(self, start):
         from collections import deque
@@ -6354,14 +6748,18 @@ class SMBChecker:
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── SCOUT risk model ──────────────────────────────────────────────────────────
-# Two orthogonal axes instead of one saturating gauge:
+# Two orthogonal RISK axes (higher = worse) feed one POSTURE score (higher = better):
 #   EXPOSURE (0-100) = how reachable Tier-0 is, defined by the *easiest* attack
 #       path available to the operator. A domain with one ESC1 template and a
 #       domain with GPP+DCSync are both bad, but a hardened domain with no path
 #       scores near zero — so the number actually differentiates.
 #   HYGIENE DEBT (0-100) = prevalence-graded misconfiguration/stale debt, so size
 #       and sloppiness of the estate move the number continuously.
-# A combined A-F POSTURE GRADE is the headline. (No 4x cap-at-100 "max" gauge.)
+#   POSTURE (0-100, higher = stronger) + A-F GRADE = the headline (Insight-Recon
+#       style: "77 · C · Moderate Risk"). 100 − severity-weighted finding
+#       deductions (per-severity caps) − an exposure penalty, so it differentiates
+#       (clean = A; a few mediums = C; crits / a live Tier-0 path = F) rather than
+#       pinning at 100/0 like a single saturating gauge would.
 
 # rule_id -> attacker effort to convert it into Tier-0 access (higher = easier).
 EXPOSURE_WEIGHTS = {
@@ -6388,8 +6786,10 @@ EXPOSURE_WEIGHTS = {
     "P-RBCD":55, "A-ReversiblePwd":52, "S-Reversible":52, "P-MachineAccountQuota":48,
     "A-DCLdapSign":45, "A-SMB2SignatureNotRequired":45, "A-DCLdapsChannelBinding":42,
     "S-DesEnabled":45, "A-NullSession":40, "P-AdminCountOrphan":35,
-    "A-SCCM":72, "A-Pre2kComputer":78, "A-WeakLockout":40,
+    "A-SCCM":72, "A-Pre2kComputer":78, "A-WeakLockout":40, "S-OS-NT":78,
     "A-CertCAManageLowPriv":88, "A-CertTemplateESC9":80,
+    "A-CertTemplateESC5":88, "A-CertTemplateESC13":84, "A-CertTemplateESC15":84,
+    "A-CertWeakMapping":78, "A-PasswordInDescription":82, "P-LAPSReadable":88,
     "P-ControlPathDA":92, "P-ControlPathIndirectEveryone":95, "P-ControlPathIndirectMany":70,
     "A-SCCMContainerACL":75, "P-GMSAReadable":88, "A-KDSRootKey":90,
     "A-AADConnectSync":70, "A-SeamlessSSO":60,
@@ -6416,6 +6816,16 @@ HYGIENE_WEIGHTS = {
     "S-SIDHistory":("flat",4), "A-RestrictRemoteSAM":("flat",3), "P-MachineAccountQuota":("flat",5),
 }
 
+
+
+# Posture-grade deduction model (higher posture = stronger). Per-severity point
+# cost and a cap on how much any one severity tier can drag the score down, so
+# breadth degrades the grade smoothly without one tier alone zeroing it. Tuned so
+# a clean domain = A, a few mediums = B/C, several highs = C/D — while the
+# exposure ceiling (RiskScorer.posture) keeps a reachable/compromisable domain
+# capped at D/F no matter how few findings drive it.
+POSTURE_DEDUCT = {"CRITICAL":12.0, "HIGH":4.0, "MEDIUM":2.0, "LOW":0.6, "INFO":0.0}
+POSTURE_CAP    = {"CRITICAL":40.0, "HIGH":24.0, "MEDIUM":12.0, "LOW":6.0, "INFO":0.0}
 
 
 class RiskScorer:
@@ -6461,6 +6871,38 @@ class RiskScorer:
                 debt += w * min(1.0, len(f.affected) / nc)
         return int(min(100, round(debt)))
 
+    def posture(self) -> int:
+        """Overall AD posture, 0–100 where HIGHER = STRONGER (Insight-Recon
+        convention). 100 minus severity-weighted finding deductions (deduped by
+        rule, each tier capped) minus a small exposure penalty, then clamped by
+        an *exposure ceiling*: a domain whose Tier-0 is reachable
+        (exposure ≥ 60) or one-step compromisable (≥ 85) cannot read as a healthy
+        grade no matter how few findings drove it. Differentiates A–D for
+        defensible domains while keeping owned domains honestly at F."""
+        seen = {}
+        for f in self.findings:
+            seen.setdefault(f.rule_id, f)
+        sev_count = defaultdict(int)
+        for f in seen.values():
+            sev_count[f.severity] += 1
+        deduction = 0.0
+        for sev, n in sev_count.items():
+            per = POSTURE_DEDUCT.get(sev, 0.0); cap = POSTURE_CAP.get(sev, 0.0)
+            deduction += min(cap, per * n)
+        exp = self.exposure()
+        raw = 100 - deduction - min(18.0, exp * 0.18)
+        ceiling = 39 if exp >= 85 else 64 if exp >= 60 else 79 if exp >= 35 else 100
+        return int(max(0, min(100, round(min(raw, ceiling)))))
+
+    @staticmethod
+    def grade(posture: int) -> Tuple[str, str, str]:
+        """(letter, risk word, color) from a posture score (higher = better)."""
+        if posture >= 90: return "A", "Strong",        "#6f8f3f"
+        if posture >= 80: return "B", "Good",          "#869150"
+        if posture >= 70: return "C", "Moderate risk", "#cda52b"
+        if posture >= 60: return "D", "Weak",          "#cb7a2f"
+        return                     "F", "Critical risk","#bd4234"
+
     def maturity(self) -> int:
         """Achieved CMMI maturity = lowest level still gated by a failing rule
         (5 = perfect; one failing level-1 rule pins the whole domain at 1)."""
@@ -6480,11 +6922,13 @@ class RiskScorer:
     def score(self) -> Dict[str, Any]:
         exp = self.exposure(); hyg = self.hygiene()
         word, _ = self.verdict(exp)
+        pos = self.posture(); letter, gword, _ = self.grade(pos)
         cat_counts = defaultdict(int)
         for f in self.findings:
             cat_counts[f.category] += 1
         return {
             "exposure": exp, "hygiene": hyg, "verdict": word,
+            "posture": pos, "grade": letter, "grade_word": gword,
             "cat_counts": {c: cat_counts.get(c, 0) for c in ("Anomaly","Privileged","Stale","Trust")},
         }
 
@@ -6526,12 +6970,172 @@ RULE_EFFORT = {
     "A-RestrictRemoteSAM":"Low","A-NTLMAudit":"Low","A-DSRMLogon":"Low","A-HardenedPaths":"Low",
     "A-CredentialGuard":"Low","A-PowerShellLogging":"Low","P-MachineAccountQuota":"Low",
     "A-DnsZoneUpdate1":"Low","P-RecycleBin":"Low","A-WSUS-HTTP":"Low","P-AdminCountOrphan":"Low",
-    "A-DCLdapsChannelBinding":"Low","S-SIDHistory":"Low",
+    "A-DCLdapsChannelBinding":"Low","S-SIDHistory":"Low","A-PasswordInDescription":"Low",
     "A-LAPS-Not-Installed":"High","A-LocalAdminPassword":"High","P-UnconstrainedDelegation":"High",
     "S-OS-XP":"High","S-OS-Vista":"High","S-OS-NT":"High","S-SMB-v1":"High","P-AdminNum":"High",
     "P-ProtectedUsers":"High","A-Krbtgt":"High","S-FunctionalLevel1":"High","S-FunctionalLevel3":"High",
-    "P-ComputerInPrivGroup":"High","P-ServiceDomainAdmin":"High",
+    "P-ComputerInPrivGroup":"High","P-ServiceDomainAdmin":"High","A-CertTemplateESC5":"High",
 }
+EFFORT_ORDER = {"Low":0, "Moderate":1, "High":2}
+EFFORT_COLOR = {"Low":"#74934a", "Moderate":"#cda52b", "High":"#cb7a2f"}
+
+def rule_effort(rule_id: str) -> str:
+    """Remediation effort for a rule (Low / Moderate / High). Anything not
+    explicitly classified defaults to Moderate."""
+    return RULE_EFFORT.get(rule_id, "Moderate")
+
+# ── Framework mappings beyond ATT&CK techniques (RULE_MITRE) ──────────────────
+# Per-operational-category defaults for CIS Controls v8 + NIST CSF, plus per-rule
+# MITRE ATT&CK *Mitigations* (Mxxxx) for the high-signal rules. These are coarse,
+# defensible mappings — STIG V-ID mapping is on the roadmap (deliberately not
+# fabricated offline).
+OPCAT_COMPLIANCE = {
+    "Privilege Escalation": {"cis":["CIS 5","CIS 6"],  "nist":["PR.AC-1","PR.AC-4"]},
+    "Credential Access":    {"cis":["CIS 5","CIS 6"],  "nist":["PR.AC-1","PR.DS-1"]},
+    "Lateral Movement":     {"cis":["CIS 4","CIS 12"], "nist":["PR.PT-3","PR.AC-5"]},
+    "Persistence":          {"cis":["CIS 8"],          "nist":["DE.CM-1","PR.AC-1"]},
+    "Recon & Exposure":     {"cis":["CIS 4"],          "nist":["PR.AC-3","PR.AC-4"]},
+    "Hygiene & Legacy":     {"cis":["CIS 4","CIS 7"],  "nist":["PR.IP-1","ID.AM-2"]},
+}
+RULE_MITIGATION = {
+    "A-WDigest":["M1027","M1041"], "A-LMCompatibilityLevel":["M1015","M1037"],
+    "A-LMHashAuthorized":["M1027","M1041"], "A-ReversiblePwd":["M1027","M1041"],
+    "S-Reversible":["M1027","M1041"], "S-C-Reversible":["M1027","M1041"],
+    "P-GPPPassword":["M1015","M1047"], "P-DCSync":["M1015","M1026"],
+    "P-DangerousACLDomain":["M1015","M1026"], "P-DangerousACLDA":["M1015","M1026"],
+    "P-WriteToPrivGroup":["M1026","M1015"], "P-OwnsPrivObject":["M1026","M1015"],
+    "P-ModifiableGPO":["M1015","M1026"], "P-DangerousACLGPO":["M1015","M1026"],
+    "A-MembershipEveryone":["M1026","M1018"], "P-DangerousExtendedRight":["M1026","M1015"],
+    "A-CertTempCustomSubject":["M1015","M1026"], "A-CertTemplateESC4":["M1015","M1026"],
+    "A-CertTempAgent":["M1015","M1026"], "A-CertTempAnyPurpose":["M1015","M1026"],
+    "A-CertEnrollHttp":["M1037","M1035"], "A-CertCAManageLowPriv":["M1026","M1015"],
+    "A-CertTemplateESC9":["M1015","M1041"], "A-CertTemplateESC5":["M1015","M1026"],
+    "A-CertTemplateESC13":["M1015","M1026"], "A-CertTemplateESC15":["M1015","M1026"],
+    "A-CertWeakMapping":["M1015"], "A-PasswordInDescription":["M1027","M1017"],
+    "P-LAPSReadable":["M1026","M1015"],
+    "P-UnconstrainedDelegation":["M1015","M1026"], "P-RBCD-Dangerous":["M1015","M1026"],
+    "P-RBCD":["M1015","M1018"], "P-ConstrainedDelegService":["M1015","M1026"],
+    "P-DelegationDCt2a4d":["M1015","M1026"], "P-DelegationDCa2d2":["M1015","M1026"],
+    "S-KerberoastableAdmin":["M1027","M1026"], "S-Kerberoastable":["M1027","M1015"],
+    "P-Kerberoasting":["M1027","M1026"], "S-NoPreAuth":["M1027","M1015"],
+    "S-NoPreAuthAdmin":["M1027","M1026"], "S-DesEnabled":["M1041","M1015"],
+    "A-LAPS-Not-Installed":["M1026","M1027"], "A-LocalAdminPassword":["M1026","M1027"],
+    "A-LAPS-Joined-Computers":["M1026","M1027"],
+    "A-LLMNR":["M1037","M1042"], "A-NBTNSDisabled":["M1037","M1042"],
+    "A-DCLdapSign":["M1037","M1015"], "A-DCLdapsChannelBinding":["M1037","M1015"],
+    "A-LDAPSigningDisabled":["M1037","M1015"], "A-SMB2SignatureNotRequired":["M1037","M1015"],
+    "A-SMB2SignatureNotEnabled":["M1037","M1015"], "A-HardenedPaths":["M1037","M1015"],
+    "P-MachineAccountQuota":["M1015","M1018"], "A-Krbtgt":["M1015","M1027"],
+    "S-SIDHistory":["M1015"], "S-SIDHistoryPrivileged":["M1015","M1026"],
+    "T-SIDHistoryDangerous":["M1015"], "T-SIDFiltering":["M1015"], "T-TGTDelegation":["M1015"],
+    "A-DC-Coerce":["M1042","M1037"], "A-DC-Spooler":["M1042","M1037"],
+    "A-DC-WebClient":["M1042","M1037"],
+    "A-NullSession":["M1035","M1015"], "A-RestrictRemoteSAM":["M1035","M1015"],
+    "A-PreWin2000Anonymous":["M1035","M1015"], "A-DsHeuristicsAnonymous":["M1035","M1015"],
+    "A-Guest":["M1018","M1026"], "A-WeakLockout":["M1027","M1036"],
+    "A-Pre2kComputer":["M1027","M1018"], "A-SCCM":["M1037","M1035"],
+    "P-GMSAReadable":["M1026","M1015"], "A-KDSRootKey":["M1026","M1015"],
+    "A-AADConnectSync":["M1026","M1032"], "A-SeamlessSSO":["M1026","M1032"],
+    "P-ServiceDomainAdmin":["M1026","M1018"], "P-ComputerInPrivGroup":["M1026","M1018"],
+    "P-AdminNum":["M1026","M1018"], "A-BadSuccessor":["M1015","M1026"],
+    "A-DnsZoneAUCreateChild":["M1015","M1037"], "A-WSUS-HTTP":["M1037","M1051"],
+    "S-SMB-v1":["M1042","M1051"], "S-Vuln-MS17_010":["M1051","M1042"],
+    "S-Vuln-MS14-068":["M1051","M1015"], "S-OS-XP":["M1051","M1042"],
+    "S-OS-Vista":["M1051","M1042"], "S-OS-NT":["M1051","M1042"],
+    "S-FunctionalLevel1":["M1051"], "S-FunctionalLevel3":["M1051"],
+    "P-ExchangePrivEsc":["M1026","M1015"], "P-DNSAdmin":["M1026","M1018"],
+}
+# Human-readable expansion for the framework chips' tooltips.
+MITIGATION_NAME = {
+    "M1015":"Active Directory Configuration", "M1018":"User Account Management",
+    "M1026":"Privileged Account Management", "M1027":"Password Policies",
+    "M1032":"Multi-factor Authentication", "M1035":"Limit Access to Resource Over Network",
+    "M1036":"Account Use Policies", "M1037":"Filter Network Traffic",
+    "M1041":"Encrypt Sensitive Information", "M1042":"Disable or Remove Feature or Program",
+    "M1047":"Audit", "M1051":"Update Software",
+}
+
+# DISA STIG control-area references (per rule). These are *control areas* in the
+# relevant STIG (Windows Server / AD Domain / Defender), not version-pinned V-IDs
+# — exact V-numbers shift every quarterly STIG release, so we point at the control
+# rather than fabricate an ID. Curated for the high-signal rules.
+RULE_STIG = {
+    "A-LMCompatibilityLevel": "Win STIG: NTLMv2 only (refuse LM & NTLM)",
+    "A-LMHashAuthorized": "Win STIG: do not store LM hash",
+    "A-WDigest": "Win STIG: WDigest UseLogonCredential disabled",
+    "A-LLMNR": "Win STIG: multicast name resolution (LLMNR) disabled",
+    "A-NBTNSDisabled": "Win STIG: NetBIOS-over-TCP disabled",
+    "A-Guest": "Win STIG: built-in Guest account disabled",
+    "A-SMB2SignatureNotRequired": "Win STIG: SMB server packet signing required",
+    "A-SMB2SignatureNotEnabled": "Win STIG: SMB server packet signing enabled",
+    "A-DCLdapSign": "Win STIG: LDAP server signing required",
+    "A-DCLdapsChannelBinding": "Win STIG: LDAP channel binding required",
+    "A-MinPwdLen": "Win STIG: minimum password length >= 14",
+    "A-PwdComplexity": "Win STIG: password complexity enabled",
+    "A-PwdHistory": "Win STIG: password history >= 24",
+    "A-WeakLockout": "Win STIG: account lockout threshold configured",
+    "A-ReversiblePwd": "Win STIG: reversible encryption disabled",
+    "S-Reversible": "Win STIG: reversible encryption disabled",
+    "A-RestrictRemoteSAM": "Win STIG: RestrictRemoteSAM (anonymous SAM) enforced",
+    "A-NullSession": "AD Domain STIG: anonymous LDAP access restricted",
+    "A-Krbtgt": "AD Domain STIG: KRBTGT password rotation",
+    "A-LAPS-Not-Installed": "Win STIG: local admin password managed (LAPS)",
+    "A-LocalAdminPassword": "Win STIG: local admin password managed (LAPS)",
+    "S-NoPreAuth": "AD STIG: Kerberos pre-authentication required",
+    "S-NoPreAuthAdmin": "AD STIG: Kerberos pre-authentication required",
+    "S-PwdNeverExpires": "Win STIG: passwords must expire",
+    "S-PwdNotRequired": "Win STIG: password required on all accounts",
+    "P-MachineAccountQuota": "AD Domain STIG: ms-DS-MachineAccountQuota = 0",
+    "S-SMB-v1": "Win STIG: SMBv1 removed/disabled",
+    "S-OS-XP": "Win STIG: unsupported OS removed",
+    "S-OS-Vista": "Win STIG: unsupported OS removed",
+    "S-OS-NT": "Win STIG: unsupported OS removed",
+    "P-ProtectedUsers": "AD STIG: privileged accounts in Protected Users",
+    "P-LAPSReadable": "Win STIG: local admin password read access restricted (LAPS)",
+}
+
+# Copy-able PowerShell / ADUC remediation, one entry per rule. {domain} / {dc}
+# are substituted with the assessed environment at render time. Kept accurate and
+# minimal — destructive/bulk operations are scoped with -WhatIf guidance in docs.
+RULE_POWERSHELL = {
+    "A-LMCompatibilityLevel": ["Set-ItemProperty 'HKLM:\\System\\CurrentControlSet\\Control\\Lsa' -Name LmCompatibilityLevel -Value 5"],
+    "A-WDigest": ["Set-ItemProperty 'HKLM:\\System\\CurrentControlSet\\Control\\SecurityProviders\\WDigest' -Name UseLogonCredential -Value 0"],
+    "A-LLMNR": ["New-ItemProperty 'HKLM:\\Software\\Policies\\Microsoft\\Windows NT\\DNSClient' -Name EnableMulticast -Value 0 -PropertyType DWord -Force"],
+    "A-Guest": ["Disable-ADAccount -Identity Guest -Server {domain}"],
+    "A-SMB2SignatureNotRequired": ["Set-SmbServerConfiguration -RequireSecuritySignature $true -Force   # apply via DC GPO"],
+    "S-NoPreAuth": ["Get-ADUser -Filter 'useraccountcontrol -band 4194304' -Server {domain} | Set-ADAccountControl -DoesNotRequirePreAuth $false"],
+    "S-NoPreAuthAdmin": ["Get-ADUser -Filter 'useraccountcontrol -band 4194304' -Server {domain} | Set-ADAccountControl -DoesNotRequirePreAuth $false"],
+    "S-Kerberoastable": ["Set-ADUser <svcaccount> -KerberosEncryptionType AES128,AES256 -Server {domain}   # kill RC4; prefer migrating to a gMSA"],
+    "S-KerberoastableAdmin": ["# Remove the SPN or migrate to a gMSA; never run services as a Domain Admin",
+                              "Get-ADUser <svcaccount> -Server {domain} -Properties servicePrincipalName"],
+    "S-PwdNeverExpires": ["Get-ADUser -Filter 'PasswordNeverExpires -eq $true -and Enabled -eq $true' -Server {domain} | Set-ADUser -PasswordNeverExpires $false"],
+    "S-PwdNotRequired": ["Get-ADUser -Filter 'useraccountcontrol -band 32' -Server {domain} | Set-ADAccountControl -PasswordNotRequired $false"],
+    "A-ReversiblePwd": ["Get-ADUser -Filter 'useraccountcontrol -band 128' -Server {domain} | Set-ADAccountControl -AllowReversiblePasswordEncryption $false"],
+    "S-Reversible": ["Get-ADUser -Filter 'useraccountcontrol -band 128' -Server {domain} | Set-ADAccountControl -AllowReversiblePasswordEncryption $false"],
+    "P-MachineAccountQuota": ["Set-ADDomain -Identity {domain} -Replace @{'ms-DS-MachineAccountQuota'='0'}"],
+    "A-WeakLockout": ["Set-ADDefaultDomainPasswordPolicy -Identity {domain} -LockoutThreshold 10 -LockoutDuration 00:15:00 -LockoutObservationWindow 00:15:00"],
+    "A-MinPwdLen": ["Set-ADDefaultDomainPasswordPolicy -Identity {domain} -MinPasswordLength 14"],
+    "A-PwdComplexity": ["Set-ADDefaultDomainPasswordPolicy -Identity {domain} -ComplexityEnabled $true"],
+    "A-LAPS-Not-Installed": ["Update-LapsADSchema -Confirm:$false",
+                             "Set-LapsADComputerSelfPermission -Identity 'OU=Computers,DC=...'"],
+    "P-ProtectedUsers": ["Add-ADGroupMember -Identity 'Protected Users' -Members (Get-ADGroupMember 'Domain Admins' -Server {domain})"],
+    "A-ProtectedUsers": ["Add-ADGroupMember -Identity 'Protected Users' -Members (Get-ADGroupMember 'Domain Admins' -Server {domain})"],
+    "A-Krbtgt": ["# Microsoft New-KrbtgtKeys.ps1 — reset twice, ~24h apart, to invalidate cached tickets"],
+    "P-AdminPwdTooOld": ["Get-ADUser <admin> -Server {domain} | Set-ADAccountPassword -Reset"],
+    "A-PasswordInDescription": ["Set-ADUser <user> -Server {domain} -Clear description,info   # after rotating the exposed secret"],
+    "P-LAPSReadable": ["# Re-scope LAPS read rights to admins only, then force rotation:",
+                       "Find-LapsADExtendedRights -Identity 'OU=Computers,DC=...'",
+                       "Reset-LapsPassword -Identity <computer>"],
+}
+
+def rule_compliance(rule_id: str, opcat: str) -> Dict[str, List[str]]:
+    """Framework mappings for a rule: CIS Controls v8 + NIST CSF (by operational
+    category), MITRE ATT&CK Mitigations and DISA STIG control areas (per rule)."""
+    base = OPCAT_COMPLIANCE.get(opcat, {})
+    stig = RULE_STIG.get(rule_id)
+    return {"cis": list(base.get("cis", [])), "nist": list(base.get("nist", [])),
+            "mitigation": list(RULE_MITIGATION.get(rule_id, [])),
+            "stig": [stig] if stig else []}
 
 # Plain, non-condensed system fonts — a condensed display face made headings look
 # vertically stretched. Used both in CSS and (literally) inside SVG <text>.
@@ -6845,12 +7449,74 @@ tr.kc-notable td{background:rgba(189,66,52,.06)}
 html[data-theme=light] .kc-term{background:#21250e;color:#dfe6c4}
 .kc-term .t-ok{color:var(--accent)}
 
+/* ── exec hero: posture grade + severity chips + meters ── */
+.kc-hero{display:flex;gap:16px;flex-wrap:wrap;align-items:stretch;margin-bottom:18px}
+.kc-grade{flex:0 0 auto;width:208px;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:1px;border-radius:var(--r);background:var(--surface2);border:1px solid var(--border);
+  border-top:3px solid var(--g,var(--accent));padding:14px 12px;text-align:center}
+.kc-grade-ring{position:relative;width:118px;height:118px;display:flex;align-items:center;justify-content:center}
+.kc-grade-ring svg{position:absolute;inset:0}
+.kc-grade-letter{font-size:50px;font-weight:800;line-height:1;color:var(--g,var(--accent))}
+.kc-grade-score{font-family:var(--mono);font-size:13px;font-weight:700;color:var(--text);margin-top:5px}
+.kc-grade-score small{color:var(--muted);font-weight:400}
+.kc-grade-word{font-size:13px;font-weight:700;color:var(--g,var(--accent));margin-top:5px;line-height:1.2}
+.kc-grade-cap{font-family:var(--mono);font-size:9px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint);margin-top:3px}
+.kc-hero-mid{flex:1;min-width:300px;display:flex;flex-direction:column;justify-content:center;gap:13px;
+  background:var(--surface2);border:1px solid var(--border);border-radius:var(--r);padding:15px 18px}
+.kc-sevchips{display:flex;gap:8px;flex-wrap:wrap}
+.kc-sevchip{display:flex;align-items:center;gap:8px;background:var(--surface3);border:1px solid var(--border2);
+  border-left:3px solid var(--c,var(--accent));border-radius:var(--r-sm);padding:5px 12px 5px 9px}
+.kc-sevchip b{font-size:18px;font-weight:800;color:var(--c,var(--accent));font-variant-numeric:tabular-nums;line-height:1}
+.kc-sevchip span{font-family:var(--mono);font-size:10px;letter-spacing:.05em;text-transform:uppercase;color:var(--muted)}
+.kc-sevchip.zero{opacity:.45}
+.kc-verdictline{font-family:var(--mono);font-size:11px;color:var(--muted)}
+.kc-verdictline b{font-weight:700}
+
+/* ── priorities (ranked by exploitability) + quick wins ── */
+.kc-prio-grid{display:grid;grid-template-columns:1.45fr 1fr;gap:22px;align-items:start}
+@media(max-width:1000px){.kc-prio-grid{grid-template-columns:1fr}}
+.kc-prio,.kc-qw{list-style:none}
+.kc-prio li{display:flex;align-items:center;gap:12px;padding:9px 0;border-bottom:1px dashed var(--border)}
+.kc-prio li:last-child,.kc-qw li:last-child{border-bottom:none}
+.kc-prio-rank{font-family:var(--mono);font-size:13px;font-weight:800;color:var(--faint);width:22px;text-align:right;flex-shrink:0}
+.kc-prio-body{flex:1;min-width:0}
+.kc-prio-title{font-weight:700;display:block;line-height:1.3}
+.kc-prio-title a{color:var(--text)}
+.kc-prio-note{color:var(--muted);font-size:12px}
+.kc-prio-meta{display:flex;flex-direction:column;align-items:flex-end;gap:5px;flex-shrink:0;width:132px}
+.kc-prio-tags{display:flex;gap:5px;align-items:center;flex-wrap:wrap;justify-content:flex-end}
+.kc-xbar{width:124px;height:6px;background:var(--track);border-radius:3px;overflow:hidden}
+.kc-xbar i{display:block;height:6px;border-radius:3px}
+.kc-xlabel{font-family:var(--mono);font-size:9px;letter-spacing:.04em;text-transform:uppercase;color:var(--faint)}
+.kc-qw li{display:flex;align-items:baseline;gap:9px;padding:8px 0;border-bottom:1px dashed var(--border)}
+.kc-qw-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;transform:translateY(2px)}
+.kc-qw-t{flex:1;min-width:0} .kc-qw-t a{color:var(--text);font-weight:600}
+.kc-prio-empty{color:var(--muted);font-size:13px}
+
+/* ── remediation-effort badge + framework chips ── */
+.kc-effort{display:inline-block;font-family:var(--mono);font-size:9px;font-weight:700;letter-spacing:.04em;
+  text-transform:uppercase;padding:1px 7px;border-radius:3px;border:1px solid var(--e,var(--border2));color:var(--e,var(--muted))}
+.kc-fw{display:flex;flex-wrap:wrap;gap:5px;margin-top:2px}
+.kc-fwgrp{display:flex;align-items:center;gap:5px;flex-wrap:wrap}
+.kc-fwlbl{font-family:var(--mono);font-size:9px;letter-spacing:.06em;text-transform:uppercase;color:var(--faint)}
+.kc-fwchip{font-family:var(--mono);font-size:10px;background:var(--surface2);border:1px solid var(--border2);
+  color:var(--muted);border-radius:3px;padding:1px 6px}
+.kc-fwchip.attck{color:var(--deck)}
+
+/* ── rich affected-object table + inline CSV export ── */
+.kc-aff-tbl{margin-top:4px}
+.kc-aff-tools{display:flex;justify-content:flex-end;margin-top:7px}
+.kc-csvbtn{font-family:var(--mono);font-size:10px;background:var(--surface3);border:1px solid var(--border2);
+  color:var(--muted);border-radius:3px;padding:3px 10px;cursor:pointer}
+.kc-csvbtn:hover{border-color:var(--accent);color:var(--accent)}
+.kc-aff-more{color:var(--faint);font-size:11.5px;font-style:italic;margin-top:5px}
+
 @media print{
   @page{size:A4;margin:13mm}
   html[data-theme]{--bg:#fff;--surface:#fff;--surface2:#f5f3ea;--surface3:#edebde;--border:#bbb;--border2:#999;
     --track:#e4e2d6;--text:#1a1a12;--muted:#444;--faint:#666;--shadow:none}
   body{background:#fff}
-  .kc-nav,.kc-top,.kc-toolbar,.kc-iconbtn,.kc-copy{display:none!important}
+  .kc-nav,.kc-top,.kc-toolbar,.kc-iconbtn,.kc-copy,.kc-csvbtn{display:none!important}
   .kc-section{break-inside:avoid;box-shadow:none;border:1px solid #ccc}
   .kc-frow,.kc-drow{display:table-row!important}
   .kc-cmd li code{background:#f5f3ea;color:#1a1a12;border:1px solid #ccc}
@@ -6947,6 +7613,26 @@ function kcNode(el){
 function kcCloseDrawer(){var dw=document.getElementById('kc-drawer'),ov=document.getElementById('kc-drawer-ov');
   if(dw)dw.classList.remove('open');if(ov)ov.classList.remove('open');}
 document.addEventListener('keydown',function(e){if(e.key==='Escape')kcCloseDrawer();});
+/* ── inline CSV export of an affected-items table ── */
+function kcCsv(btn){
+  var wrap=btn.closest('.kc-aff-tbl');if(!wrap)return;
+  var tbl=wrap.querySelector('table');if(!tbl)return;
+  var rows=[];
+  tbl.querySelectorAll('tr').forEach(function(tr){
+    var cells=[];
+    tr.querySelectorAll('th,td').forEach(function(c){
+      var t=(c.textContent||'').replace(/\s+/g,' ').trim();
+      if(/^[=+\-@\t\r]/.test(t))t="'"+t;
+      if(/[",\n]/.test(t))t='"'+t.replace(/"/g,'""')+'"';
+      cells.push(t);});
+    if(cells.length)rows.push(cells.join(','));});
+  var blob=new Blob([rows.join('\r\n')],{type:'text/csv'});
+  var url=URL.createObjectURL(blob);var a=document.createElement('a');
+  a.href=url;a.download=(btn.getAttribute('data-fn')||'scout-affected')+'.csv';
+  document.body.appendChild(a);a.click();document.body.removeChild(a);
+  setTimeout(function(){URL.revokeObjectURL(url)},1000);
+  var o=btn.textContent;btn.textContent='exported ✓';setTimeout(function(){btn.textContent=o},1300);
+}
 """
 
 
@@ -6957,7 +7643,7 @@ class HTMLReporter:
     _SEV_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
 
     def __init__(self, domain, dc_ip, findings, scores, data,
-                 auth_mode="", prepared_by="", scope=""):
+                 auth_mode="", prepared_by="", scope="", changes=None):
         self.domain   = domain
         self.dc_ip    = dc_ip
         self.findings = findings
@@ -6971,6 +7657,20 @@ class HTMLReporter:
         self.by_rule = {}
         for f in findings:
             self.by_rule.setdefault(f.rule_id, f)
+        # sAMAccountName(lower) -> object, for resolving a finding's affected
+        # strings back to their user/computer object (rich affected tables).
+        self._obj_index = {}
+        try:
+            for o in list(getattr(data, "users", []) or []) + list(getattr(data, "computers", []) or []):
+                sam = get_str(o["attrs"], "sAMAccountName")
+                if sam:
+                    self._obj_index.setdefault(sam.lower(), o)
+        except Exception:
+            self._obj_index = {}
+        # baseline diff (trends): per-rule first_seen + set of newly-appeared rules
+        self.changes = changes
+        self._first_seen = (changes or {}).get("first_seen", {}) or {}
+        self._new_rules = {n["rule_id"] for n in (changes or {}).get("new", [])}
 
     # ── helpers ───────────────────────────────────────────────────────────────
     def _e(self, s):
@@ -7020,8 +7720,15 @@ class HTMLReporter:
             '</header>')
 
     def _nav(self):
-        items = [("summary","Summary",""),("paths","Attack Paths",""),
-                 ("priv","Privileged",""),("findings","Findings",str(len(self.findings)))]
+        items = [("summary","Summary",""),("priorities","Priorities","")]
+        if self.changes:
+            items.append(("changes","Changes",""))
+        items += [("paths","Attack Paths",""),("priv","Privileged","")]
+        if getattr(self.data, "enrollment_svcs", None) or getattr(self.data, "cert_templates", None):
+            items.append(("pki","PKI",""))
+        if getattr(self.data, "gpos", None):
+            items.append(("gpo","Group Policy",""))
+        items.append(("findings","Findings",str(len(self.findings))))
         links = ""
         for sid, name, badge in items:
             b = f'<span class="kc-navb">{badge}</span>' if badge else ""
@@ -7088,22 +7795,51 @@ class HTMLReporter:
                 f'<small>{self._e(hint)}</small></b><span class="v" style="color:{col}">{value}<small>/100</small></span></div>'
                 f'<div class="kc-meter-t"><div class="kc-meter-f" style="width:{value}%;background:{col}"></div></div></div>')
 
+    def _grade_ring(self, posture, color):
+        """SVG progress ring around the grade letter (posture fraction)."""
+        cx = cy = 59; r = 52
+        frac = max(0.0, min(1.0, posture / 100.0))
+        circ = 2 * math.pi * r
+        return (f'<svg width="118" height="118" viewBox="0 0 118 118" aria-hidden="true">'
+                f'<circle cx="{cx}" cy="{cy}" r="{r}" fill="none" stroke="var(--track)" stroke-width="9"/>'
+                f'<circle cx="{cx}" cy="{cy}" r="{r}" fill="none" stroke="{color}" stroke-width="9" '
+                f'stroke-linecap="round" stroke-dasharray="{circ*frac:.1f} {circ:.1f}" '
+                f'transform="rotate(-90 {cx} {cy})"/></svg>')
+
+    def _sev_chips(self):
+        sc = self._sev_counts()
+        names = {"CRITICAL":"Crit","HIGH":"High","MEDIUM":"Med","LOW":"Low","INFO":"Info"}
+        chips = ""
+        for s in ("CRITICAL","HIGH","MEDIUM","LOW","INFO"):
+            n = sc.get(s, 0)
+            if s == "INFO" and not n:
+                continue
+            chips += (f'<div class="kc-sevchip{"" if n else " zero"}" style="--c:{SEV_COLOR[s]}">'
+                      f'<b>{n}</b><span>{names[s]}</span></div>')
+        return f'<div class="kc-sevchips">{chips}</div>'
+
     def _scoreband(self):
         s = self.scores
         exp = s.get("exposure",0); hyg = s.get("hygiene",0)
+        pos = s.get("posture",0); letter = s.get("grade","?"); gword = s.get("grade_word","")
+        _, _, gcol = RiskScorer.grade(pos)
         word, vcol = RiskScorer.verdict(exp)
-        return ('<div class="kc-scoreband">'
-                f'<div class="kc-verdict" style="border-color:{vcol}">'
-                f'<div class="ev" style="color:{vcol}">{exp}</div>'
-                f'<div class="evl">Exposure</div>'
-                f'<div class="evw" style="color:{vcol}">{self._e(word)}</div></div>'
-                '<div class="kc-meters">'
-                f'{self._meter("Exposure", exp, "easiest path to Tier 0")}'
-                f'{self._meter("Hygiene debt", hyg, "misconfiguration & stale-object load")}'
-                '</div>'
-                '<div class="kc-readout">'
-                f'<div class="col">{self._donut()}{self._sev_legend()}</div>'
-                '</div></div>')
+        grade_card = (f'<div class="kc-grade" style="--g:{gcol}">'
+                      f'<div class="kc-grade-ring">{self._grade_ring(pos, gcol)}'
+                      f'<div class="kc-grade-letter">{self._e(letter)}</div></div>'
+                      f'<div class="kc-grade-score">{pos}<small>/100</small></div>'
+                      f'<div class="kc-grade-word">{self._e(gword)}</div>'
+                      '<div class="kc-grade-cap">Posture score</div></div>')
+        mid = ('<div class="kc-hero-mid">'
+               f'{self._sev_chips()}'
+               f'{self._meter("Exposure", exp, "easiest path to Tier 0")}'
+               f'{self._meter("Hygiene debt", hyg, "misconfiguration & stale-object load")}'
+               f'<div class="kc-verdictline">Exposure verdict: '
+               f'<b style="color:{vcol}">{self._e(word)}</b> · higher posture = stronger AD</div>'
+               '</div>')
+        readout = ('<div class="kc-readout"><div class="col">'
+                   f'{self._donut()}{self._sev_legend()}</div></div>')
+        return f'<div class="kc-hero">{grade_card}{mid}{readout}</div>'
 
     def _narrative(self):
         s = self.scores
@@ -7203,6 +7939,136 @@ class HTMLReporter:
                 f'{self._category_strip()}'
                 f'{self._inventory_block()}'
                 f'{self._collection_notes()}</section>')
+
+    # ── Priorities: top priorities (ranked by exploitability) + quick wins ────
+    _PSEUDO_WEIGHT = {"CRITICAL":80, "HIGH":55, "MEDIUM":30, "LOW":12, "INFO":0}
+
+    def _attacker_note(self, f):
+        """One-line 'here's how this gets you owned' blurb for the priorities list."""
+        note = self._MARQUEE.get(f.rule_id)
+        if note:
+            return note[0].upper() + note[1:]
+        doc = self._doc(f.rule_id)
+        txt = doc.get("why") or doc.get("description") or f.details or ""
+        return txt if len(txt) <= 116 else txt[:113] + "…"
+
+    def _effort_badge(self, rule_id):
+        e = rule_effort(rule_id); col = EFFORT_COLOR.get(e, "var(--muted)")
+        return (f'<span class="kc-effort" style="--e:{col}" '
+                f'title="Estimated remediation effort">{self._e(e)} effort</span>')
+
+    def _priorities_section(self):
+        uniq = list(self.by_rule.values())
+        # Top priorities — ranked by exploitability: EXPOSURE_WEIGHTS is the
+        # attacker's effort-to-Tier-0 (higher = easier). To order by real attacker
+        # impact while never silently dropping a high-severity finding, we include
+        # every exposure-weighted path AND every CRITICAL/HIGH finding, ranking by
+        # the weight where modelled and falling back to a severity proxy otherwise
+        # (the same key Quick Wins uses, so a CRIT/HIGH can't score 0 and vanish).
+        # Rank by the same value we display: the modelled exploitability weight
+        # where we have one, else a severity proxy — so the list stays monotonic
+        # (a shown "exploitability 64" can't sort above a shown "72").
+        def prio_key(f):
+            return EXPOSURE_WEIGHTS.get(f.rule_id, 0) or self._PSEUDO_WEIGHT.get(f.severity, 0)
+        ranked = sorted(
+            [f for f in uniq if EXPOSURE_WEIGHTS.get(f.rule_id, 0) > 0 or f.severity in ("CRITICAL","HIGH")],
+            key=lambda f: (-prio_key(f), self._SEV_ORDER.get(f.severity, 9), -len(f.affected)))[:12]
+        prio_items = ""
+        for i, f in enumerate(ranked, 1):
+            w = EXPOSURE_WEIGHTS.get(f.rule_id, 0)
+            naff = len(f.affected)
+            aff = f' · <span class="kc-mono">{naff} affected</span>' if naff else ""
+            if w:   # a modelled path to Tier-0 — show its exploitability score
+                bar_w, bar_col = w, RiskScorer.risk_label(w)[1]
+                xlabel = f'exploitability {w}/100'
+            else:   # high-severity, but not a modelled one-step Tier-0 primitive
+                bar_w, bar_col = self._PSEUDO_WEIGHT.get(f.severity, 0), f.sev_color
+                xlabel = f'{self._e(f.severity.title())} severity'
+            prio_items += (
+                f'<li><span class="kc-prio-rank">{i}</span>'
+                '<div class="kc-prio-body">'
+                f'<span class="kc-prio-title"><a href="#f-{self._e(f.rule_id)}" '
+                f'onclick="kcJump(\'f-{self._e(f.rule_id)}\');return false">{self._e(f.title)}</a></span>'
+                f'<span class="kc-prio-note">{self._e(self._attacker_note(f))}{aff}</span></div>'
+                '<div class="kc-prio-meta"><div class="kc-prio-tags">'
+                f'<span class="kc-sev-pill" style="background:{f.sev_color}">{self._e(f.severity)}</span>'
+                f'{self._effort_badge(f.rule_id)}</div>'
+                f'<div class="kc-xbar"><i style="width:{bar_w}%;background:{bar_col}"></i></div>'
+                f'<span class="kc-xlabel">{xlabel}</span></div></li>')
+        prio = (f'<ul class="kc-prio">{prio_items}</ul>' if prio_items
+                else '<p class="kc-prio-empty">No critical or high-severity findings surfaced — '
+                     'work the Quick Wins and the full Findings list.</p>')
+        # Quick wins — low remediation effort, meaningful risk reduction first.
+        def impact(f):
+            return max(EXPOSURE_WEIGHTS.get(f.rule_id, 0), self._PSEUDO_WEIGHT.get(f.severity, 0))
+        qw = sorted([f for f in uniq if rule_effort(f.rule_id) == "Low" and f.severity != "INFO"],
+                    key=lambda f: -impact(f))[:8]
+        qw_items = "".join(
+            f'<li><span class="kc-qw-dot" style="background:{f.sev_color}"></span>'
+            f'<span class="kc-qw-t"><a href="#f-{self._e(f.rule_id)}" '
+            f'onclick="kcJump(\'f-{self._e(f.rule_id)}\');return false">{self._e(f.title)}</a></span>'
+            f'<span class="kc-xlabel">{self._e(f.severity.title())}</span></li>' for f in qw)
+        qw_html = (f'<ul class="kc-qw">{qw_items}</ul>' if qw_items
+                   else '<p class="kc-prio-empty">No low-effort quick wins identified.</p>')
+        return ('<section class="kc-section" id="sec-priorities">'
+                '<h2 class="kc-h2">Priorities<span class="tag">what to fix first</span></h2>'
+                '<div class="kc-prio-grid">'
+                '<div><div class="kc-sub-h">Top priorities '
+                '<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--faint)">'
+                '— ranked by exploitability, then severity (easiest path to Tier-0 first)</span></div>'
+                f'{prio}</div>'
+                '<div><div class="kc-sub-h">Quick wins '
+                '<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--faint)">'
+                '— low remediation effort, high payoff</span></div>'
+                f'{qw_html}</div>'
+                '</div></section>')
+
+    # ── changes since last scan (--baseline) ──────────────────────────────────
+    def _changes_section(self):
+        c = self.changes
+        if not c:
+            return ""
+        def lst(items, linked):
+            if not items:
+                return '<li class="kc-prio-empty" style="border:none;padding:6px 0">None.</li>'
+            out = ""
+            for it in items[:20]:
+                rid = it.get("rule_id", ""); col = SEV_COLOR.get(it.get("severity", ""), "#8a8f78")
+                title = self._e(it.get("title", rid))
+                extra = (f' <span class="kc-xlabel">{it["from"]}→{it["to"]} affected</span>'
+                         if "from" in it and "to" in it else "")
+                if linked and rid in self.by_rule:
+                    body = (f'<a href="#f-{self._e(rid)}" '
+                            f'onclick="kcJump(\'f-{self._e(rid)}\');return false">{title}</a>')
+                else:
+                    body = title
+                out += (f'<li><span class="kc-qw-dot" style="background:{col}"></span>'
+                        f'<span class="kc-qw-t">{body}{extra}</span></li>')
+            if len(items) > 20:
+                out += f'<li class="kc-aff-more">… and {len(items)-20} more</li>'
+            return out
+        stats = (
+            '<div class="kc-paths-tag">'
+            f'<div class="kc-pstat"><b style="color:var(--high)">+{len(c["new"])}</b><span>new</span></div>'
+            f'<div class="kc-pstat"><b style="color:var(--ok)">−{len(c["fixed"])}</b><span>fixed</span></div>'
+            f'<div class="kc-pstat"><b style="color:var(--med)">~{len(c["modified"])}</b><span>modified</span></div>'
+            f'<div class="kc-pstat"><b>{len(c["unchanged"])}</b><span>unchanged</span></div>'
+            '</div>')
+        cols = (
+            '<div class="kc-prio-grid">'
+            '<div><div class="kc-sub-h">New since last scan</div>'
+            f'<ul class="kc-qw">{lst(c["new"], True)}</ul></div>'
+            '<div><div class="kc-sub-h">Fixed / remediated</div>'
+            f'<ul class="kc-qw">{lst(c["fixed"], False)}</ul></div>'
+            '</div>')
+        modified = ""
+        if c["modified"]:
+            modified = ('<div class="kc-sub-h">Modified — affected count changed</div>'
+                        f'<ul class="kc-qw">{lst(c["modified"], True)}</ul>')
+        return ('<section class="kc-section" id="sec-changes">'
+                '<h2 class="kc-h2">Changes since last scan'
+                f'<span class="tag">baseline {self._e(c["baseline_date"])}</span></h2>'
+                f'{stats}{cols}{modified}</section>')
 
     # ── Paths to Domain Dominance (control-path chains) ───────────────────────
     def _node(self, label, kind="", icon=""):
@@ -7461,8 +8327,10 @@ class HTMLReporter:
                  f'<div class="kc-pstat"><b>{unconstrained}</b><span>unconstrained hosts</span></div>'
                  f'</div>')
         return ('<section class="kc-section kc-critborder" id="sec-paths">'
-                '<h2 class="kc-h2">Attack paths<span class="tag">low-priv → Tier 0</span></h2>'
-                '<p class="kc-sub">Routes to domain compromise, with the tradecraft to walk each.</p>'
+                '<h2 class="kc-h2">Attack paths<span class="tag">foothold → Tier 0</span></h2>'
+                '<p class="kc-sub">Identified routes from a low-privileged position to Tier-0, '
+                'with the technique and supporting tooling noted for each (for validation — '
+                'SCOUT does not execute anything).</p>'
                 f'{stats}{body}</section>')
 
     # ── action plan ────────────────────────────────────────────────────────────
@@ -7513,26 +8381,118 @@ class HTMLReporter:
                 f'<td class="kc-num">{ll_age if ll_age is not None else "—"}</td>'
                 f'<td>{fhtml}</td></tr>')
 
+    def _hv_member_facts_table(self, facts):
+        """Member table from control-path account facts (used when full objects
+        aren't in priv_group_members)."""
+        rows = ""
+        for m in facts[:80]:
+            kind = m.get("kind"); en = m.get("enabled")
+            if kind in ("group", "foreign"):
+                st = f'<span class="kc-muted">{self._e(kind)}</span>'   # not an account — no enabled/disabled state
+            else:
+                st = ('<span class="kc-bad">disabled</span>' if en is False
+                      else ('<span class="kc-ok">enabled</span>' if en else '—'))
+            fl = []
+            if m.get("spn"): fl.append('<span class="kc-aflag bad">kerberoastable</span>')
+            if m.get("stale"): fl.append('<span class="kc-aflag warn">stale</span>')
+            fhtml = " ".join(fl) or '<span class="kc-aflag ok">clean</span>'
+            pw, ll = m.get("pwd_age"), m.get("logon_age")
+            rows += (f'<tr><td><strong>{self._e(m.get("sam",""))}</strong></td><td>{st}</td>'
+                     f'<td class="kc-num">{pw if pw is not None else "—"}</td>'
+                     f'<td class="kc-num">{ll if ll is not None else "—"}</td><td>{fhtml}</td></tr>')
+        return ('<table class="kc-table"><thead><tr><th>Account</th><th>Status</th>'
+                '<th class="kc-num">Pwd age (d)</th><th class="kc-num">Last logon (d)</th>'
+                f'<th>Flags</th></tr></thead><tbody>{rows}</tbody></table>')
+
+    def _hv_controllers_html(self, g):
+        """Inbound control paths to a high-value target — the principals that can
+        take control of it WITHOUT being a member, each with the resolved path."""
+        ctrls = g["controllers"]
+        if not ctrls:
+            return ('<p class="kc-ap-sub" style="margin-top:12px"><span class="kc-ok">'
+                    'No principal outside the membership can take control of this group.</span></p>')
+        chains = ""
+        for c in ctrls:
+            ne = [self._pnode(c["name"], "attacker")]
+            if c["path"]:
+                for (_src, label, dst) in c["path"]:
+                    ne += [label, self._pnode(dst, "crown" if dst == g["name"] else "")]
+            else:   # defensive: a controller always has a >=1-hop path, but never crash
+                ne += ["controls", self._pnode(g["name"], "crown")]
+            chains += self._chain(ne, "CRITICAL" if c["broad"] else "HIGH", "")
+        extra = g["controller_count"] - len(ctrls)
+        more = f'<p class="kc-ap-sub">… and {extra} more principal(s).</p>' if extra > 0 else ""
+        return ('<div class="kc-sub-h" style="margin-top:14px">Non-members with outbound control over this group '
+                '<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--faint)">'
+                f'— {g["controller_count"]} principal(s) hold an outbound control path that ends at this group; '
+                'click any node</span></div>'
+                f'{chains}{more}')
+
     def _privileged_section(self):
         pgm = self.data.priv_group_members
-        groups = [g for g in self._PRIV_ORDER if pgm.get(g)]
-        groups += [g for g in pgm if g not in self._PRIV_ORDER and pgm.get(g)]
-        blocks = ""
-        gi = 0
-        for g in groups:
-            members = pgm[g]
-            # de-dup by dn
+        cp = self._cp()
+        hv = cp.get("hv_targets") or []
+        # order: domain root first, then most-controllable, then standard precedence
+        def rank(g):
+            if g.get("is_domain"): return -1
+            try: return self._PRIV_ORDER.index(g["name"])
+            except ValueError: return 99
+        hv = sorted(hv, key=lambda g: (0 if (g["controller_count"] or g["is_domain"] or pgm.get(g["name"])) else 1,
+                                       -g["controller_count"], rank(g)))
+        hv_names = {g["name"] for g in hv}
+
+        # 1) high-value targets — members + who can take control of them
+        gi = 0; hv_blocks = ""
+        for g in hv:
+            name = g["name"]
+            objs = pgm.get(name)
+            if objs:
+                seen = set(); uniq = []
+                for m in objs:
+                    if m["dn"] in seen: continue
+                    seen.add(m["dn"]); uniq.append(m)
+                mem_count = len(uniq)
+                rows = "".join(self._priv_member_row(m) for m in sorted(
+                    uniq, key=lambda m: (0 if self._acct_flags(m)[1] else 1,
+                                         get_str(m["attrs"], "sAMAccountName").lower()))[:80])
+                mem_tbl = ('<div class="kc-sub-h">Members</div><table class="kc-table"><thead><tr>'
+                           '<th>Account</th><th>Status</th><th class="kc-num">Admin</th>'
+                           '<th class="kc-num">Pwd age (d)</th><th class="kc-num">Last logon (d)</th>'
+                           f'<th>Flags</th></tr></thead><tbody>{rows}</tbody></table>')
+            elif g["is_domain"]:
+                mem_count = 0; mem_tbl = ""
+            else:
+                mem_count = g["member_count"]
+                mem_tbl = ('<div class="kc-sub-h">Members</div>' + self._hv_member_facts_table(g["members"])
+                           if g["members"] else "")
+            cc = g["controller_count"]
+            warn = (f' · <span class="kc-bad">{cc} non-member(s) with outbound control</span>' if cc
+                    else ' · <span class="kc-ok">no non-member control path</span>')
+            head_n = ("domain head" if g["is_domain"] else f"{mem_count} member(s)") + warn
+            gid = f"hv-{gi}"; gi += 1
+            hv_blocks += (
+                f'<div class="kc-pg"><div class="kc-pg-h" onclick="kcRowTog(\'{gid}\')">'
+                f'<span class="kc-pg-ar" id="ar-{gid}">▸</span> <strong>{self._e(name)}</strong>'
+                f'<span class="kc-pg-n">{head_n}</span></div>'
+                f'<div class="kc-pg-b" id="{gid}" style="display:none">'
+                f'{mem_tbl}{self._hv_controllers_html(g)}</div></div>')
+
+        # 2) other privileged groups (not Tier-0 targets) — membership roster
+        others = [g for g in self._PRIV_ORDER if g in pgm and g not in hv_names and pgm.get(g)]
+        others += [g for g in pgm if g not in self._PRIV_ORDER and g not in hv_names and pgm.get(g)]
+        other_blocks = ""
+        for g in others:
             seen = set(); uniq = []
-            for m in members:
+            for m in pgm[g]:
                 if m["dn"] in seen: continue
                 seen.add(m["dn"]); uniq.append(m)
             notable_n = sum(1 for m in uniq if self._acct_flags(m)[1])
-            rows = "".join(self._priv_member_row(m) for m in
-                           sorted(uniq, key=lambda m: (0 if self._acct_flags(m)[1] else 1,
-                                                       get_str(m["attrs"],"sAMAccountName").lower()))[:80])
+            rows = "".join(self._priv_member_row(m) for m in sorted(
+                uniq, key=lambda m: (0 if self._acct_flags(m)[1] else 1,
+                                     get_str(m["attrs"], "sAMAccountName").lower()))[:80])
             gid = f"pg-{gi}"; gi += 1
             warn = f' · <span class="kc-bad">{notable_n} notable</span>' if notable_n else ""
-            blocks += (
+            other_blocks += (
                 f'<div class="kc-pg"><div class="kc-pg-h" onclick="kcRowTog(\'{gid}\')">'
                 f'<span class="kc-pg-ar" id="ar-{gid}">▸</span> <strong>{self._e(g)}</strong>'
                 f'<span class="kc-pg-n">{len(uniq)} member(s){warn}</span></div>'
@@ -7541,38 +8501,223 @@ class HTMLReporter:
                 '<th class="kc-num">Admin</th><th class="kc-num">Pwd age (d)</th>'
                 '<th class="kc-num">Last logon (d)</th><th>Flags</th></tr></thead>'
                 f'<tbody>{rows}</tbody></table></div></div>')
-        # control-path closure: shortest paths to Domain Admin (PingCastle /
-        # BloodHound-style). Nodes are clickable — click one to open the drawer
-        # with its members / account facts; the graph gives the visual overview.
-        cpaths = self._cp()
-        cp = ""
-        if cpaths.get("paths"):
-            chains = ""
-            for name, path, is_broad in cpaths["paths"]:
-                if not path:
-                    continue
-                ne = [self._pnode(path[0][0], "attacker")]
-                for k, (src, label, dst) in enumerate(path):
-                    last = (k == len(path) - 1)
-                    ne += [label, self._pnode(dst, "crown" if last else "")]
-                chains += self._chain(ne, "CRITICAL" if is_broad else "HIGH",
-                                      "membership + ACL / ownership")
-            extra = cpaths.get("count", 0) - len(cpaths["paths"])
-            more = f'<p class="kc-sub">… and {extra} more principal(s) with a path to Tier-0.</p>' if extra > 0 else ""
-            graph = self._control_graph_svg()
-            graph_hdr = ('<div class="kc-sub-h">Control-path graph '
-                         '<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--faint)">'
-                         '— click any node for members / account detail</span></div>') if graph else ""
-            cp = (graph_hdr + graph +
-                  '<div class="kc-sub-h">Shortest paths to Domain Admin '
-                  f'<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--faint)">'
-                  f'— {cpaths.get("count",0)} non-privileged principal(s) can reach Tier-0; click a node</span></div>'
-                  f'{chains}{more}')
-        if not blocks and not cp:
+
+        # 3) control-path map (visual overview)
+        graph = self._control_graph_svg()
+        graph_blk = (('<div class="kc-sub-h">Control-path map '
+                      '<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--faint)">'
+                      '— principals (left) to Tier-0 (right); click any node for detail</span></div>'
+                      + graph) if graph else "")
+        if not hv_blocks and not other_blocks and not graph_blk:
             return ""
-        return ('<section class="kc-section" id="sec-priv"><h2 class="kc-h2">Privileged accounts'
-                '<span class="tag">click a group — notable = stale / kerberoastable / no-expiry</span></h2>'
-                f'{blocks}{cp}</section>')
+        n_ctrl = cp.get("count", 0)
+        intro = (f'<p class="kc-sub">Who holds privilege, and who can <em>take</em> it. '
+                 f'{n_ctrl} non-privileged principal(s) have a control path to a Tier-0 group. '
+                 'Expand a target to see its members and exactly who can take control of it.</p>'
+                 if hv else '<p class="kc-sub">Privileged group membership.</p>')
+        hv_hdr = ('<div class="kc-sub-h">High-value targets '
+                  '<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--faint)">'
+                  '— click a group: members + who can take control</span></div>') if hv_blocks else ""
+        other_hdr = ('<div class="kc-sub-h" style="margin-top:18px">Other privileged groups</div>'
+                     if other_blocks else "")
+        return ('<section class="kc-section" id="sec-priv"><h2 class="kc-h2">Privileged accounts &amp; control paths'
+                '<span class="tag">who is privileged · who can take control</span></h2>'
+                f'{intro}{graph_blk}{hv_hdr}{hv_blocks}{other_hdr}{other_blocks}</section>')
+
+    # ── PKI / AD CS attack surface ─────────────────────────────────────────────
+    _ESC_RULE_LABEL = {"A-CertTempCustomSubject":"ESC1", "A-CertTempAnyPurpose":"ESC2",
+                       "A-CertTempAgent":"ESC3", "A-CertTemplateESC4":"ESC4",
+                       "A-CertTemplateESC9":"ESC9", "A-CertTemplateESC13":"ESC13",
+                       "A-CertTemplateESC15":"ESC15"}
+    _CA_ESC_RULE_LABEL = {"A-CertEnrollHttp":"ESC8", "A-CertCAManageLowPriv":"ESC7",
+                          "A-CertTemplateESC5":"ESC5"}
+    # Genuine domain-authentication EKUs (Client Auth, Smart Card Logon, PKINIT,
+    # Any Purpose). The Enrollment-Agent OID is deliberately excluded — it is not
+    # an auth EKU (it's surfaced via the ESC3 abuse label instead).
+    _PKI_AUTH_EKUS = {"1.3.6.1.5.5.7.3.2", "1.3.6.1.4.1.311.20.2.2",
+                      "1.3.6.1.5.2.3.4", "2.5.29.37.0"}
+
+    def _esc_label_index(self, label_map):
+        """rule_id label -> map of object-name(lower) -> set(labels) from findings."""
+        idx = defaultdict(set)
+        for rid, label in label_map.items():
+            f = self.by_rule.get(rid)
+            if not f:
+                continue
+            # Only the FIRST affected token names the subject (template or CA);
+            # later tokens (e.g. ESC1's CA names) must not pollute the index.
+            for a in f.affected[:1]:
+                # tokens look like "TemplateName", "Tmpl -> Group",
+                # "Tmpl writable by X", or "CA: principal" — take the leading name.
+                name = str(a).split(" -> ")[0].split(" writable")[0].split(":")[0].strip()
+                if name:
+                    idx[name.lower()].add(label)
+        return idx
+
+    def _pki_section(self):
+        d = self.data
+        cas = getattr(d, "enrollment_svcs", None) or []
+        tmpls = getattr(d, "cert_templates", None) or []
+        if not cas and not tmpls:
+            return ""
+        tmpl_esc = self._esc_label_index(self._ESC_RULE_LABEL)
+        ca_esc = self._esc_label_index(self._CA_ESC_RULE_LABEL)
+        # CA table
+        ca_rows = ""
+        for s in cas:
+            a = s["attrs"]; cn = get_str(a, "cn"); host = get_str(a, "dNSHostName") or "—"
+            # ESC7/ESC5 are indexed by CA cn; ESC8 (A-CertEnrollHttp) by host — union both.
+            labels = sorted(ca_esc.get(cn.lower(), set()) | ca_esc.get(host.lower(), set()))
+            badge = "".join(f'<span class="kc-mini" style="color:var(--crit);border-color:rgba(189,66,52,.5)">{self._e(l)}</span>'
+                            for l in labels) or '<span class="kc-muted">—</span>'
+            ca_rows += (f'<tr><td><strong>{self._e(cn)}</strong></td><td class="kc-mono">{self._e(host)}</td>'
+                        f'<td>{badge}</td></tr>')
+        ca_tbl = (('<div class="kc-sub-h">Certificate authorities</div>'
+                   '<table class="kc-table"><thead><tr><th>CA</th><th>Host</th>'
+                   '<th>Abusable as</th></tr></thead><tbody>' + ca_rows + '</tbody></table>')
+                  if ca_rows else "")
+        # Template table — published templates, vulnerable first
+        published = getattr(d, "_published_templates", set())
+        def is_pub(t):
+            return (not published) or (get_str(t["attrs"], "cn") in published)
+        rows_data = []
+        for t in tmpls:
+            a = t["attrs"]; cn = get_str(a, "cn")
+            if not is_pub(t):
+                continue
+            ekus = set(get_list(a, "pKIExtendedKeyUsage"))
+            name_flag = get_int(a, "msPKI-Certificate-Name-Flag")
+            enroll_flag = get_int(a, "msPKI-Enrollment-Flag")
+            labels = sorted(tmpl_esc.get(cn.lower(), set()),
+                            key=lambda x: int(re.sub(r"\D", "", x) or 0))
+            rows_data.append({
+                "cn": cn, "schema": get_int(a, "msPKI-Template-Schema-Version"),
+                # no EKU restriction == usable for any purpose, incl. auth (ESC2).
+                "auth": (not ekus) or bool(ekus & self._PKI_AUTH_EKUS),
+                "ess": bool(name_flag & 0x1),
+                "approval": bool(enroll_flag & 0x2),
+                "labels": labels})
+        rows_data.sort(key=lambda r: (0 if r["labels"] else 1, r["cn"].lower()))
+        yn = lambda b, good_false=False: (
+            f'<span class="kc-{"bad" if b ^ good_false else "ok"}">{"yes" if b else "no"}</span>')
+        t_rows = ""
+        for r in rows_data[:60]:
+            esc = "".join(f'<span class="kc-mini" style="color:var(--crit);border-color:rgba(189,66,52,.5)">{self._e(l)}</span>'
+                          for l in r["labels"]) or '<span class="kc-muted">—</span>'
+            cls = ' class="kc-notable"' if r["labels"] else ''
+            t_rows += (f'<tr{cls}><td><strong>{self._e(r["cn"])}</strong></td>'
+                       f'<td class="kc-num">{r["schema"]}</td>'
+                       f'<td>{yn(r["auth"])}</td><td>{yn(r["ess"])}</td>'
+                       f'<td>{yn(r["approval"], good_false=True)}</td><td>{esc}</td></tr>')
+        more = (f'<p class="kc-ap-sub">… and {len(rows_data)-60} more published template(s).</p>'
+                if len(rows_data) > 60 else "")
+        t_tbl = (('<div class="kc-sub-h">Certificate templates '
+                  '<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--faint)">'
+                  '— published; vulnerable templates first. ESS = enrollee-supplies-subject</span></div>'
+                  '<table class="kc-table"><thead><tr><th>Template</th><th class="kc-num">Schema</th>'
+                  '<th>Auth EKU</th><th>ESS</th><th>Mgr approval</th><th>Abuse</th></tr></thead>'
+                  f'<tbody>{t_rows}</tbody></table>{more}')
+                 if t_rows else '<p class="kc-sub">No certificate templates are published to a CA.</p>')
+        # ESC14 (account-level) note
+        wm = self.by_rule.get("A-CertWeakMapping")
+        esc14 = ""
+        if wm:
+            accts = {str(a).split(" -> ")[0].strip() for a in wm.affected}
+            esc14 = (f'<p class="kc-ap-sub" style="margin-top:10px">{len(accts)} account(s) carry a '
+                     'weak explicit certificate mapping (ESC14) — see Findings.</p>')
+        n_vuln = sum(1 for r in rows_data if r["labels"])
+        stats = (f'<div class="kc-paths-tag">'
+                 f'<div class="kc-pstat"><b>{len(cas)}</b><span>certificate authorities</span></div>'
+                 f'<div class="kc-pstat"><b>{len(rows_data)}</b><span>published templates</span></div>'
+                 f'<div class="kc-pstat"><b style="color:var(--crit)">{n_vuln}</b><span>vulnerable templates</span></div>'
+                 f'</div>')
+        return ('<section class="kc-section" id="sec-pki"><h2 class="kc-h2">PKI / AD CS'
+                '<span class="tag">certificate attack surface</span></h2>'
+                '<p class="kc-sub">Certificate authorities and the templates they issue — '
+                'the flagged templates are enrollable by a low-privileged principal and lead to '
+                'a Domain Admin certificate.</p>'
+                f'{stats}{ca_tbl}{t_tbl}{esc14}</section>')
+
+    # ── Group Policy attack paths ──────────────────────────────────────────────
+    def _gpo_attack_rows(self):
+        d = self.data
+        parse = ControlPathAnalyzer._parse_gplink
+        linked = defaultdict(set)
+        containers = []
+        if getattr(d, "domain_obj", None):
+            containers.append((getattr(d, "base", ""), get_str(d.domain_obj["attrs"], "gPLink")))
+        for c in list(getattr(d, "ous", [])) + list(getattr(d, "sites", [])):
+            containers.append((c.get("dn", ""), get_str(c["attrs"], "gPLink")))
+        for cdn, gp in containers:
+            for gdn in parse(gp):
+                linked[gdn.lower()].add((cdn or "").lower())
+        t0 = {(getattr(d, "base", "") or "").lower()}
+        for dc in getattr(d, "dcs", []):
+            rest = (dc.get("dn", "") or "").lower()
+            while "," in rest:
+                rest = rest.split(",", 1)[1]; t0.add(rest)
+        for s in getattr(d, "sites", []):
+            if s.get("dn"):
+                t0.add(s["dn"].lower())
+        writers = defaultdict(list)
+        for f in getattr(d, "acl_findings", []):
+            if f.get("type") == "gpo_write" and f.get("dn"):
+                writers[f["dn"].lower()].append(f.get("sid_name", "principal"))
+        rows = []
+        for g in getattr(d, "gpos", []):
+            dn = (g.get("dn", "") or "").lower()
+            conts = linked.get(dn, set())
+            rows.append({
+                "name": get_str(g["attrs"], "displayName") or dn_base(g.get("dn", "")),
+                "links": len(conts), "dc_linked": any(c in t0 for c in conts),
+                "writers": list(dict.fromkeys(writers.get(dn, []))),
+                "orphaned": not conts})
+        return rows
+
+    def _gpo_section(self):
+        d = self.data
+        gpos = getattr(d, "gpos", None) or []
+        if not gpos:
+            return ""
+        rows = self._gpo_attack_rows()
+        weap = [r for r in rows if r["writers"]]
+        dc_linked = [r for r in rows if r["dc_linked"]]
+        orphaned = [r for r in rows if r["orphaned"]]
+        # weaponizable GPOs (writable by a non-Tier-0 principal)
+        wrows = ""
+        for r in sorted(weap, key=lambda r: (0 if r["dc_linked"] else 1, r["name"].lower())):
+            scope = ('<span class="kc-bad">Domain Controllers → Tier 0</span>' if r["dc_linked"]
+                     else (f'{r["links"]} container(s)' if r["links"] else '<span class="kc-muted">unlinked</span>'))
+            who = ", ".join(self._e(w) for w in r["writers"][:4]) + ("…" if len(r["writers"]) > 4 else "")
+            wrows += (f'<tr class="{"kc-notable" if r["dc_linked"] else ""}"><td><strong>{self._e(r["name"])}</strong></td>'
+                      f'<td>{who}</td><td>{scope}</td></tr>')
+        weap_tbl = (('<div class="kc-sub-h">GPOs controllable by non-Tier-0 principals '
+                     '<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--faint)">'
+                     '— a non-admin can edit these; the policy applies (runs) across the GPO scope</span></div>'
+                     '<table class="kc-table"><thead><tr><th>GPO</th><th>Controlled by</th>'
+                     '<th>Applies to</th></tr></thead>'
+                     f'<tbody>{wrows}</tbody></table>')
+                    if wrows else '<p class="kc-sub">No GPO is writable by a broad / non-Tier-0 principal.</p>')
+        # Tier-0 GPOs (linked to DC-affecting containers) — high-value targets
+        t0_names = ", ".join(self._e(r["name"]) for r in dc_linked[:20]) or "—"
+        t0_blk = ('<div class="kc-sub-h">GPOs applied to Domain Controllers / Tier-0 '
+                  '<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--faint)">'
+                  '— a write primitive on any of these is domain takeover</span></div>'
+                  f'<p class="kc-ap-sub">{t0_names}'
+                  f'{(" … and %d more" % (len(dc_linked)-20)) if len(dc_linked) > 20 else ""}</p>')
+        gpp = self._gpp_table()
+        gpp_blk = ('<div class="kc-sub-h">Group Policy Preferences passwords (cpassword)</div>' + gpp) if gpp else ""
+        orph_blk = (f'<p class="kc-ap-sub" style="margin-top:10px">{len(orphaned)} orphaned / unlinked GPO(s) '
+                    'retain their settings and DACLs — review or remove.</p>') if orphaned else ""
+        stats = (f'<div class="kc-paths-tag">'
+                 f'<div class="kc-pstat"><b>{len(gpos)}</b><span>GPOs</span></div>'
+                 f'<div class="kc-pstat"><b style="color:var(--crit)">{len(weap)}</b><span>writable by non-Tier-0</span></div>'
+                 f'<div class="kc-pstat"><b>{len(dc_linked)}</b><span>linked to Tier-0</span></div>'
+                 f'<div class="kc-pstat"><b>{len(orphaned)}</b><span>orphaned</span></div>'
+                 f'</div>')
+        return ('<section class="kc-section" id="sec-gpo"><h2 class="kc-h2">Group Policy'
+                '<span class="tag">GPO control paths</span></h2>'
+                f'{stats}{weap_tbl}{gpp_blk}{t0_blk}{orph_blk}</section>')
 
     # ── findings register ──────────────────────────────────────────────────────
     def _gpp_table(self):
@@ -7588,6 +8733,101 @@ class HTMLReporter:
         return ('<table class="kc-table"><thead><tr><th>Username</th><th>Cracked password</th>'
                 f'<th>GPO</th><th>File</th></tr></thead><tbody>{rows}</tbody></table>')
 
+    # ── rich affected-object tables (Insight-Recon style) ─────────────────────
+    def _resolve_affected(self, f, limit=400):
+        """Split a finding's affected strings into (resolved objects, leftover
+        strings) by matching the leading token against the sAMAccountName index."""
+        resolved = []; unresolved = []
+        for a in f.affected[:limit]:
+            s = str(a).strip()
+            token = s.split()[0] if s else ""
+            obj = self._obj_index.get(token.rstrip(",:;").lower())
+            if obj:
+                resolved.append(obj)
+            else:
+                unresolved.append(s)
+        return resolved, unresolved
+
+    def _fmt_created(self, attrs):
+        v = get_str(attrs, "whenCreated")
+        if not v:
+            return "—"
+        if len(v) >= 10 and v[4] == "-" and v[7] == "-":   # ldap3 datetime str
+            return v[:10]
+        if len(v) >= 8 and v[:8].isdigit():                 # impacket generalized time
+            return f"{v[0:4]}-{v[4:6]}-{v[6:8]}"
+        return v[:10]
+
+    def _aff_flags(self, a):
+        uac = get_int(a, "userAccountControl"); fl = []
+        if uac_has(uac, UAC_DONT_REQUIRE_PREAUTH): fl.append("AS-REP roastable")
+        if get_list(a, "servicePrincipalName") and not (get_str(a,"sAMAccountName") or "").endswith("$"):
+            fl.append("kerberoastable")
+        if uac_has(uac, UAC_DONT_EXPIRE_PASSWORD): fl.append("pwd never expires")
+        if uac_has(uac, UAC_TRUSTED_FOR_DELEGATION): fl.append("unconstrained")
+        if uac_has(uac, UAC_PASSWD_NOTREQD): fl.append("no pwd required")
+        if get_int(a, "adminCount") == 1: fl.append("adminCount=1")
+        return ", ".join(fl) or "—"
+
+    def _affected_table(self, f, resolved, unresolved):
+        shown = resolved[:60]; rows = ""
+        for o in shown:
+            a = o["attrs"]
+            sam = get_str(a, "sAMAccountName")
+            name = get_str(a, "displayName") or get_str(a, "name") or ""
+            disabled = uac_has(get_int(a, "userAccountControl"), UAC_ACCOUNTDISABLE)
+            en = ('<span class="kc-bad">no</span>' if disabled
+                  else '<span class="kc-ok">yes</span>')
+            pw = days_since(filetime_to_dt(get_int(a, "pwdLastSet")))
+            ll = days_since(filetime_to_dt(get_int(a, "lastLogonTimestamp")))
+            rows += (f'<tr><td><strong>{self._e(sam)}</strong></td><td>{self._e(name)}</td>'
+                     f'<td>{en}</td><td class="kc-mono">{self._e(self._fmt_created(a))}</td>'
+                     f'<td class="kc-num">{pw if pw is not None else "—"}</td>'
+                     f'<td class="kc-num">{ll if ll is not None else "—"}</td>'
+                     f'<td class="kc-detail">{self._e(self._aff_flags(a))}</td></tr>')
+        total = len(f.affected); more = ""
+        if total > len(shown):
+            more += (f'<div class="kc-aff-more">Showing first {len(shown)} of {total} affected — '
+                     'full set via <code>--csv</code> / <code>--json</code>.</div>')
+        if unresolved:
+            u = ", ".join(self._e(x.split()[0]) for x in unresolved[:10])
+            more += (f'<div class="kc-aff-more">Also affected: {u}'
+                     f'{" …" if len(unresolved) > 10 else ""}.</div>')
+        fn = "scout-" + f.rule_id.lower()
+        return ('<div class="kc-aff-tbl"><table class="kc-table"><thead><tr>'
+                '<th>Account</th><th>Name</th><th>Enabled</th><th>Created</th>'
+                '<th class="kc-num">Pwd set (d)</th><th class="kc-num">Last logon (d)</th>'
+                '<th>Flags</th></tr></thead>'
+                f'<tbody>{rows}</tbody></table>'
+                f'<div class="kc-aff-tools"><button class="kc-csvbtn" data-fn="{self._e(fn)}" '
+                'onclick="kcCsv(this)">Export CSV ⤓</button></div>'
+                f'{more}</div>')
+
+    def _frameworks_block(self, f):
+        comp = rule_compliance(f.rule_id, self._opcat(f))
+        groups = []
+        if f.mitre:
+            chips = "".join(f'<span class="kc-fwchip attck" title="{self._e(m)}">'
+                            f'{self._e(m.split(":")[0])}</span>' for m in f.mitre)
+            groups.append(f'<div class="kc-fwgrp"><span class="kc-fwlbl">ATT&amp;CK</span>{chips}</div>')
+        if comp["mitigation"]:
+            chips = "".join(f'<span class="kc-fwchip" title="{self._e(MITIGATION_NAME.get(m, m))}">'
+                            f'{self._e(m)}</span>' for m in comp["mitigation"])
+            groups.append(f'<div class="kc-fwgrp"><span class="kc-fwlbl">Mitigations</span>{chips}</div>')
+        if comp["cis"]:
+            chips = "".join(f'<span class="kc-fwchip">{self._e(c)}</span>' for c in comp["cis"])
+            groups.append(f'<div class="kc-fwgrp"><span class="kc-fwlbl">CIS v8</span>{chips}</div>')
+        if comp["nist"]:
+            chips = "".join(f'<span class="kc-fwchip">{self._e(c)}</span>' for c in comp["nist"])
+            groups.append(f'<div class="kc-fwgrp"><span class="kc-fwlbl">NIST CSF</span>{chips}</div>')
+        if comp.get("stig"):
+            chips = "".join(f'<span class="kc-fwchip">{self._e(c)}</span>' for c in comp["stig"])
+            groups.append(f'<div class="kc-fwgrp"><span class="kc-fwlbl">STIG</span>{chips}</div>')
+        if not groups:
+            return ""
+        return ('<div class="kc-block"><div class="kc-bh">Frameworks</div>'
+                f'<div class="kc-fw">{"".join(groups)}</div></div>')
+
     def _finding_panel(self, f):
         doc = self._doc(f.rule_id); desc = doc.get("description") or ""
         parts = []
@@ -7595,21 +8835,29 @@ class HTMLReporter:
         path = self._inline_path(f.rule_id)
         if path:
             parts.append(f'<div class="kc-block"><div class="kc-bh">Attack path</div>{path}</div>')
-        # 2) evidence — terminal-style "what SCOUT observed"
-        term = f'<span class="t-ok">[+]</span> {self._e(f.details)}\n' if f.details else ""
+        # 2) evidence — what SCOUT observed. Resolve affected objects into a rich
+        # account/computer table (enabled / created / pwd-set / last-logon / flags)
+        # when possible; otherwise fall back to the terminal-style list.
+        det = f'<span class="t-ok">[+]</span> {self._e(f.details)}' if f.details else ""
+        rich = ""; flat = ""
         if f.rule_id == "P-GPPPassword":
-            ev_extra = self._gpp_table()
-        else:
-            ev_extra = ""
-        if f.affected:
-            n = len(f.affected); shown = f.affected[:120]
-            term += "\n".join(f'    {self._e(a)}' for a in shown)
-            if n > len(shown):
-                term += f'\n    … and {n-len(shown)} more'
-        if term.strip() or ev_extra:
-            hdr = f'Evidence' + (f' — {len(f.affected)} affected' if f.affected else '')
-            block = f'<pre class="kc-term">{term or self._e(f.details)}</pre>' if term.strip() else ""
-            parts.append(f'<div class="kc-block"><div class="kc-bh">{hdr}</div>{block}{ev_extra}</div>')
+            rich = self._gpp_table()
+        elif f.affected:
+            resolved, unresolved = self._resolve_affected(f)
+            if resolved and len(resolved) >= len(unresolved):
+                rich = self._affected_table(f, resolved, unresolved)
+            else:
+                n = len(f.affected); shown = f.affected[:120]
+                flat = "\n".join(f'    {self._e(a)}' for a in shown)
+                if n > len(shown):
+                    flat += f'\n    … and {n-len(shown)} more'
+        if det or rich or flat:
+            hdr = 'Evidence' + (f' — {len(f.affected)} affected' if f.affected else '')
+            term_block = ""
+            if det or flat:
+                content = det + ("\n" if det and flat else "") + flat
+                term_block = f'<pre class="kc-term">{content}</pre>'
+            parts.append(f'<div class="kc-block"><div class="kc-bh">{hdr}</div>{term_block}{rich}</div>')
         # 3) narrative
         if desc:
             parts.append(f'<div class="kc-block"><div class="kc-bh">What it is</div><div class="kc-bb">{self._e(desc)}</div></div>')
@@ -7624,8 +8872,28 @@ class HTMLReporter:
         if doc.get("remediation"):
             items = "".join(f'<li>{self._e(x)}</li>' for x in doc["remediation"])
             parts.append(f'<div class="kc-block kc-fix"><div class="kc-bh">Remediation</div><ul class="kc-fixlist">{items}</ul></div>')
+        # copy-able PowerShell remediation, substituted for this environment
+        ps = RULE_POWERSHELL.get(f.rule_id)
+        if ps:
+            sub = lambda s: s.replace("{domain}", self.domain or "<domain>").replace("{dc}", self.dc_ip or "<dc>")
+            items = "".join(f'<li><code>{self._e(sub(x))}</code>'
+                            f'<button class="kc-copy" onclick="kcCopy(this)">copy</button></li>' for x in ps)
+            parts.append('<div class="kc-block kc-fix"><div class="kc-bh">Remediation — PowerShell '
+                         '<span style="color:var(--faint);text-transform:none;letter-spacing:0">'
+                         '(test with -WhatIf first)</span></div>'
+                         f'<ul class="kc-cmd">{items}</ul></div>')
+        # 5) framework mappings (ATT&CK / Mitigations / CIS / NIST)
+        fw = self._frameworks_block(f)
+        if fw:
+            parts.append(fw)
+        # 6) footer meta: rule id, operation, remediation effort, references
         refs = doc.get("refs") or []
-        meta = f'<span class="kc-mini">{self._e(f.rule_id)}</span>' + "".join(f'<span class="kc-mini">{self._e(m.split(":")[0])}</span>' for m in f.mitre)
+        meta = (f'<span class="kc-mini">{self._e(f.rule_id)}</span>'
+                f'<span class="kc-mini">{self._e(self._opcat(f))}</span> '
+                f'{self._effort_badge(f.rule_id)}')
+        fs = self._first_seen.get(f.rule_id)
+        if fs:
+            meta += f' <span class="kc-mini">first seen {self._e(str(fs)[:10])}</span>'
         if refs:
             meta += "".join(f' <a href="{self._e(u)}" target="_blank" rel="noopener" style="font-size:11px">ref↗</a>' for u in refs)
         parts.append(f'<div class="kc-block" style="border-top:1px solid var(--border);padding-top:8px">{meta}</div>')
@@ -7643,6 +8911,10 @@ class HTMLReporter:
             oc = self._opcat(f); oc_col = OPCAT_COLOR.get(oc,"#888")
             anchor = f"f-{f.rule_id}" if f.rule_id not in seen_rid else f"f-{f.rule_id}-{i}"
             seen_rid.add(f.rule_id)
+            eff = rule_effort(f.rule_id); ecol = EFFORT_COLOR.get(eff, "var(--muted)")
+            # Precompute (single-quoted attr) — a backslash inside an f-string
+            # expression only parses on Python 3.12+, and SCOUT supports 3.9+.
+            new_badge = " <span class='kc-navb'>new</span>" if f.rule_id in self._new_rules else ""
             rows.append(
                 f'<tr class="kc-frow" id="{self._e(anchor)}" data-i="{i}" data-sev="{f.severity}" '
                 f'data-cat="{self._e(oc)}" onclick="kcTog({i})" tabindex="0" role="button" '
@@ -7650,10 +8922,11 @@ class HTMLReporter:
                 f'<td><span id="ic-{i}" class="kc-toggle">+</span></td>'
                 f'<td><span class="kc-sev-pill" style="background:{f.sev_color}">{self._e(f.severity)}</span></td>'
                 f'<td><span class="kc-cat-pill" style="background:{oc_col}">{self._e(oc)}</span></td>'
-                f'<td><code>{self._e(f.rule_id)}</code></td><td><strong>{self._e(f.title)}</strong></td>'
+                f'<td><code>{self._e(f.rule_id)}</code></td><td><strong>{self._e(f.title)}</strong>{new_badge}</td>'
+                f'<td><span class="kc-effort" style="--e:{ecol}">{self._e(eff)}</span></td>'
                 f'<td class="kc-num">{f.points}</td></tr>'
                 f'<tr class="kc-drow" id="dr-{i}" style="display:none"><td></td>'
-                f'<td colspan="5"><div class="kc-panel">{self._finding_panel(f)}</div></td></tr>')
+                f'<td colspan="6"><div class="kc-panel">{self._finding_panel(f)}</div></td></tr>')
         catpills = "".join(
             f'<button class="kc-fp kc-fp-cat" data-f="cat:{self._e(c)}" onclick="kcFil(this)" '
             f'style="--c:{OPCAT_COLOR[c]}">{self._e(c)}</button>' for c in OPCAT_ORDER)
@@ -7671,8 +8944,9 @@ class HTMLReporter:
                 '<button class="kc-fp" onclick="kcAll(0)">Collapse</button></div></div>'
                 '<div class="kc-showing" id="kc-showing"></div>'
                 '<table class="kc-table kc-ftable"><thead><tr><th style="width:28px"></th><th style="width:84px">Severity</th>'
-                '<th style="width:160px">Operation</th><th style="width:190px">Rule</th>'
-                '<th>Title</th><th style="width:48px" class="kc-num">Pts</th></tr></thead>'
+                '<th style="width:150px">Operation</th><th style="width:180px">Rule</th>'
+                '<th>Title</th><th style="width:84px">Effort</th>'
+                '<th style="width:48px" class="kc-num">Pts</th></tr></thead>'
                 f'<tbody>{"".join(rows)}</tbody></table></section>')
 
     # ── inventory ─────────────────────────────────────────────────────────────
@@ -7745,8 +9019,10 @@ class HTMLReporter:
                   '<button class="kc-dw-x" onclick="kcCloseDrawer()" title="Close">✕</button></div>'
                   '<div class="kc-dw-b" id="kc-dw-body"></div></aside>')
         body = (self._head() + self._nav() + '<main class="kc-container">' +
-                self._summary_section() + self._paths_section() +
-                self._privileged_section() + self._findings_section() + '</main>' + drawer +
+                self._summary_section() + self._priorities_section() + self._changes_section() +
+                self._paths_section() + self._privileged_section() +
+                self._pki_section() + self._gpo_section() + self._findings_section() +
+                '</main>' + drawer +
                 f'<footer class="kc-footer">{TOOL_NAME} v{VERSION} — authorized security assessment use only · '
                 f'generated {self._e(self.ts)}</footer>'
                 '<button class="kc-top" onclick="kcJump(\'top\')" title="Back to top">↑</button>')
@@ -7765,6 +9041,60 @@ class HTMLReporter:
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
+
+def diff_baseline(findings, baseline_path, now_iso):
+    """Diff current findings against a prior SCOUT JSON (--baseline). Returns a
+    changes dict (new / fixed / unchanged / modified + per-rule first_seen),
+    or None if the baseline can't be read. Identity is rule_id; a rule present in
+    both scans with a changed affected-set is 'modified'. first_seen propagates
+    across runs (each --json carries it), so it survives many scans."""
+    try:
+        with open(baseline_path, encoding="utf-8") as bf:
+            base = json.load(bf)
+    except Exception as e:
+        print(f"[!] --baseline: could not read {baseline_path}: {e}")
+        return None
+    if not isinstance(base, dict):
+        print(f"[!] --baseline: {baseline_path} is not a SCOUT JSON report")
+        return None
+    base_ts = base.get("timestamp") or now_iso
+    # Aggregate by rule_id, unioning the affected set across every finding that
+    # shares a rule_id (a rule can emit more than one Finding), so set-equality
+    # and the from→to counts compare the whole rule, not just its first finding.
+    cur = {}
+    for f in findings:
+        e = cur.setdefault(f.rule_id, {"title": f.title, "severity": f.severity, "affected": set()})
+        e["affected"].update(f.affected or [])
+    base_r = {}
+    for b in (base.get("findings") or []):
+        if not (isinstance(b, dict) and b.get("rule_id")):
+            continue
+        rid = b["rule_id"]
+        e = base_r.setdefault(rid, {"title": b.get("title", rid),
+                                    "severity": b.get("severity", ""),
+                                    "affected": set(), "first_seen": b.get("first_seen")})
+        e["affected"].update(b.get("affected") or [])
+        e["first_seen"] = e.get("first_seen") or b.get("first_seen")
+    new, fixed, unchanged, modified, first_seen = [], [], [], [], {}
+    for rid, c in cur.items():
+        b = base_r.get(rid)
+        if b is not None:
+            first_seen[rid] = b.get("first_seen") or base_ts
+            if c["affected"] == b["affected"]:
+                unchanged.append(rid)
+            else:
+                modified.append({"rule_id": rid, "title": c["title"], "severity": c["severity"],
+                                 "from": len(b["affected"]), "to": len(c["affected"])})
+        else:
+            first_seen[rid] = now_iso
+            new.append({"rule_id": rid, "title": c["title"], "severity": c["severity"]})
+    for rid, b in base_r.items():
+        if rid not in cur:
+            fixed.append({"rule_id": rid, "title": b["title"], "severity": b["severity"]})
+    return {"baseline_date": (base_ts or "")[:10],
+            "new": new, "fixed": fixed, "unchanged": unchanged, "modified": modified,
+            "first_seen": first_seen}
+
 
 def main():
     parser = build_parser()
@@ -7877,17 +9207,27 @@ def main():
     scorer = RiskScorer(findings, data)
     scores = scorer.score()
 
+    # ── baseline diff (trends / change tracking) ───────────────────────────────
+    now_iso = datetime.datetime.now().isoformat()
+    changes = diff_baseline(findings, args.baseline, now_iso) if args.baseline else None
+
     # ── print summary ─────────────────────────────────────────────────────────
     sevc = defaultdict(int)
     for f in findings:
         sevc[f.severity] += 1
     print(f"\n{'='*60}")
+    print(f"  POSTURE GRADE : {scores.get('grade','?')}  {scores.get('posture',0):3d}/100  "
+          f"({scores.get('grade_word','')})")
     print(f"  EXPOSURE      : {scores['exposure']:3d}/100  ({scores.get('verdict','')})")
     print(f"  HYGIENE DEBT  : {scores['hygiene']:3d}/100  (misconfig & stale load)")
     print(f"{'='*60}")
     print(f"  Findings : {len(findings)}  "
           f"(CRIT {sevc['CRITICAL']} · HIGH {sevc['HIGH']} · "
           f"MED {sevc['MEDIUM']} · LOW {sevc['LOW']})")
+    if changes:
+        print(f"  Changes  : +{len(changes['new'])} new · -{len(changes['fixed'])} fixed · "
+              f"~{len(changes['modified'])} modified · {len(changes['unchanged'])} unchanged "
+              f"(baseline {changes['baseline_date']})")
     print(f"{'='*60}")
 
     sev_order = {"CRITICAL":0,"HIGH":1,"MEDIUM":2,"LOW":3,"INFO":4}
@@ -7912,7 +9252,7 @@ def main():
 
     reporter = HTMLReporter(args.domain, args.dc_ip, findings, scores, data,
                             auth_mode=auth_mode, prepared_by=args.operator,
-                            scope=args.scope)
+                            scope=args.scope, changes=changes)
     html_out = reporter.render()
     with open(args.output, "w", encoding="utf-8") as fh:
         fh.write(html_out)
@@ -7921,19 +9261,23 @@ def main():
     # ── JSON output ───────────────────────────────────────────────────────────
     if args.json:
         jpath = args.json if args.json != "__AUTO__" else f"scout_{args.domain}.json"
+        fs_map = changes["first_seen"] if changes else {}
         jdata = {
             "tool": TOOL_NAME, "version": VERSION,
             "domain": args.domain, "dc_ip": args.dc_ip, "auth_mode": auth_mode,
-            "timestamp": datetime.datetime.now().isoformat(),
-            "scores": {k: scores[k] for k in ("exposure","hygiene","verdict","cat_counts") if k in scores},
+            "timestamp": now_iso,
+            "scores": {k: scores[k] for k in ("posture","grade","grade_word","exposure","hygiene","verdict","cat_counts") if k in scores},
             "findings": [
                 {"rule_id": f.rule_id, "title": f.title,
                  "category": f.category, "operation": op_category(f.rule_id, f.category),
                  "severity": f.severity, "points": f.points, "mitre": f.mitre,
-                 "details": f.details, "affected": f.affected}
+                 "details": f.details, "affected": f.affected,
+                 "first_seen": fs_map.get(f.rule_id, now_iso)}
                 for f in sorted_findings
             ]
         }
+        if changes:
+            jdata["changes"] = {k: changes[k] for k in ("baseline_date","new","fixed","modified","unchanged")}
         with open(jpath, "w", encoding="utf-8") as jf:
             json.dump(jdata, jf, indent=2)
         print(f"[+] JSON findings saved: {jpath}")
@@ -7944,17 +9288,25 @@ def main():
         cpath = args.csv if args.csv != "__AUTO__" else f"scout_{args.domain}.csv"
         with open(cpath, "w", encoding="utf-8", newline="") as cf:
             w = _csv.writer(cf)
+            # Neutralize spreadsheet formula injection: a leading = + - @ (or
+            # tab/CR) in attacker-controlled AD data could execute when opened in
+            # Excel/LibreOffice, so prefix such cells with a single quote.
+            def _safe(v):
+                s = str(v)
+                return "'" + s if s[:1] in ("=", "+", "-", "@", "\t", "\r") else s
             w.writerow(["rule_id", "title", "operation", "severity",
                         "points", "mitre", "affected_count", "details", "affected"])
             for f in sorted_findings:
-                w.writerow([f.rule_id, f.title, op_category(f.rule_id, f.category), f.severity,
-                            f.points, "; ".join(f.mitre), len(f.affected),
-                            f.details, " | ".join(map(str, f.affected))])
+                w.writerow([_safe(x) for x in
+                            (f.rule_id, f.title, op_category(f.rule_id, f.category), f.severity,
+                             f.points, "; ".join(f.mitre), len(f.affected),
+                             f.details, " | ".join(map(str, f.affected)))])
         print(f"[+] CSV findings saved: {cpath}")
 
     print()
-    # exit non-zero when a Tier-0 path is exposed (useful in CI gating). The
-    # letter grade was removed from scoring, so key off exposure alone.
+    # exit non-zero when a Tier-0 path is exposed (useful in CI gating). We gate
+    # on exposure (the easiest path to Tier-0), not the posture grade, since a
+    # broad-but-not-instantly-exploitable estate can still be a clean pentest pass.
     return 0 if scores.get("exposure", 0) < 35 else 1
 
 

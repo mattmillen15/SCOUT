@@ -50,20 +50,31 @@ recommended hardened-DC path is Kerberos-over-389 rather than LDAPS.
 
 ## Scoring
 
-Two axes, deliberately not a single saturating gauge (which always pinned at
-100):
+Three numbers, deliberately *not* one saturating gauge for everything:
 
-- **Exposure (0–100)** = the highest `EXPOSURE_WEIGHTS` value among triggered
-  rules (your *easiest* path to Tier 0), plus a small breadth bonus. A hardened
-  domain scores low; a one-step takeover (GPP/DCSync/ESC1) scores ~95–100.
-- **Hygiene debt (0–100)** = sum of `HYGIENE_WEIGHTS` contributions; `pct_users`/
-  `pct_comps` entries scale by the fraction of enabled objects affected.
-- **Verdict** = `RiskScorer.verdict(exposure)` — a plain-English band word
-  ("Domain compromisable" … "No direct path"), shown instead of a letter grade.
-- `RULE_SCALE` still graduates per-finding `points` (used for finding sort).
+- **Exposure (0–100, higher = worse)** = the highest `EXPOSURE_WEIGHTS` value
+  among triggered rules (your *easiest* path to Tier 0), plus a small breadth
+  bonus. A hardened domain scores low; a one-step takeover (GPP/DCSync/ESC1)
+  scores ~95–100. This is the axis the "Top Priorities — ranked by
+  exploitability" list sorts on.
+- **Hygiene debt (0–100, higher = worse)** = sum of `HYGIENE_WEIGHTS`
+  contributions; `pct_users`/`pct_comps` entries scale by the fraction of
+  enabled objects affected.
+- **Posture score (0–100, higher = BETTER) + A–F grade** = the headline, à la
+  Insight Recon ("77 · C · Moderate Risk"). `RiskScorer.posture()` = `100 −
+  severity-weighted finding deductions (per-severity caps) − exposure penalty`,
+  so it *differentiates* (a clean domain = A; a few mediums = C; crits / a live
+  Tier-0 path = F) instead of pinning. `RiskScorer.grade()` maps it to A/B/C/D/F
+  + a risk word + color.
+- **Verdict** = `RiskScorer.verdict(exposure)` — the plain-English exposure band
+  ("Domain compromisable" … "No direct path"), still shown alongside.
+- `RULE_SCALE` graduates per-finding `points` (used for finding sort).
 
-There is intentionally no maturity/CMMI score and no letter grade — both tested
-as not useful for an offensive engagement.
+History note: a *single saturating* A–F gauge was removed once because it pinned
+at the extremes. The current grade is a **deduction model with caps**, which
+behaves like Insight Recon's and was re-added deliberately (the maturity/CMMI
+table remains computed but unused). See `ROADMAP.md` for the full Insight-Recon
+parity plan.
 
 ## Adding a rule
 

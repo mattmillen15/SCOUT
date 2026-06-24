@@ -13,6 +13,38 @@ report plus optional JSON and CSV.
 ## BETA WARNING
 **This tool is currently in a BETA phase. This is largely AI generated, and there are errors, logic flaws, severity discrepencies, etc that need to be addressed. The more data the better. If you find something that is missing or run into an edge case / error -- submit an issue or PR.**
 
+## The report
+
+- **Posture score + A–F grade** headline (higher = stronger), backed by two risk
+  axes: **Exposure** (easiest path to Tier-0) and **Hygiene debt**.
+- **Priorities — ranked by exploitability.** A "Top Priorities" list ordered by
+  real attacker impact (effort-to-Tier-0), plus **Quick Wins** (low remediation
+  effort, high payoff). Every finding carries a **remediation-effort** rating.
+- **Control paths.** Per high-value group (Domain Admins, the domain root, …):
+  its members **and** the non-members with an **outbound control path** onto it,
+  shown as `principal →[GenericAll]→ … → Domain Admins` — PingCastle-style, click
+  through to per-node detail.
+- **Findings you can act on.** Each finding expands to attack-path, evidence, an
+  attacker view, exploitation commands (reference — SCOUT never executes),
+  remediation + PowerShell, and **framework mappings** (MITRE ATT&CK + Mitigations,
+  CIS Controls v8, NIST CSF, STIG).
+- **Rich affected-object tables** (enabled / created / password-set / last-logon
+  / flags) with per-table **CSV export**.
+- **PKI / AD CS** and **Group Policy** attack-surface views, inventory, and a
+  **trust map**. `--baseline prev.json` adds a "Changes since last scan" diff.
+
+See `examples/sample_report.html` for a full example and `docs/ROADMAP.md` for
+what's next.
+
+## Install
+
+Python 3.9+ and the packages in `requirements.txt` (`ldap3`, `impacket`,
+`pycryptodome`):
+
+```bash
+pip3 install -r requirements.txt
+```
+
 ## Usage
 
 ```bash
