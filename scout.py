@@ -6895,13 +6895,14 @@ class RiskScorer:
         return int(max(0, min(100, round(min(raw, ceiling)))))
 
     @staticmethod
-    def grade(posture: int) -> Tuple[str, str, str]:
-        """(letter, risk word, color) from a posture score (higher = better)."""
-        if posture >= 90: return "A", "Strong",        "#6f8f3f"
-        if posture >= 80: return "B", "Good",          "#869150"
-        if posture >= 70: return "C", "Moderate risk", "#cda52b"
-        if posture >= 60: return "D", "Weak",          "#cb7a2f"
-        return                     "F", "Critical risk","#bd4234"
+    def risk_band(risk: int) -> Tuple[str, str]:
+        """(word, color) for the overall RISK score (0–100, HIGHER = WORSE) — the
+        same direction as Exposure and Hygiene debt, so all three read alike."""
+        if risk >= 75: return "Critical", "#bd4234"
+        if risk >= 50: return "High",     "#cb7a2f"
+        if risk >= 25: return "Moderate", "#cda52b"
+        if risk > 0:   return "Low",      "#74934a"
+        return               "Minimal",   "#6f8f3f"
 
     def maturity(self) -> int:
         """Achieved CMMI maturity = lowest level still gated by a failing rule
@@ -6922,13 +6923,13 @@ class RiskScorer:
     def score(self) -> Dict[str, Any]:
         exp = self.exposure(); hyg = self.hygiene()
         word, _ = self.verdict(exp)
-        pos = self.posture(); _, gword, _ = self.grade(pos)
+        risk = 100 - self.posture(); rword, _ = self.risk_band(risk)
         cat_counts = defaultdict(int)
         for f in self.findings:
             cat_counts[f.category] += 1
         return {
             "exposure": exp, "hygiene": hyg, "verdict": word,
-            "posture": pos, "grade_word": gword,
+            "risk": risk, "risk_word": rword,
             "cat_counts": {c: cat_counts.get(c, 0) for c in ("Anomaly","Privileged","Stale","Trust")},
         }
 
@@ -7820,20 +7821,20 @@ class HTMLReporter:
     def _scoreband(self):
         s = self.scores
         exp = s.get("exposure",0); hyg = s.get("hygiene",0)
-        pos = s.get("posture",0); gword = s.get("grade_word","")
-        _, _, gcol = RiskScorer.grade(pos)
+        risk = s.get("risk",0); rword = s.get("risk_word","")
+        _, rcol = RiskScorer.risk_band(risk)
         word, vcol = RiskScorer.verdict(exp)
-        grade_card = (f'<div class="kc-grade" style="--g:{gcol}">'
-                      f'<div class="kc-grade-ring">{self._grade_ring(pos, gcol)}'
-                      f'<div class="kc-grade-num">{pos}<span>/100</span></div></div>'
-                      f'<div class="kc-grade-word">{self._e(gword)}</div>'
-                      '<div class="kc-grade-cap">Posture score</div></div>')
+        grade_card = (f'<div class="kc-grade" style="--g:{rcol}">'
+                      f'<div class="kc-grade-ring">{self._grade_ring(risk, rcol)}'
+                      f'<div class="kc-grade-num">{risk}<span>/100</span></div></div>'
+                      f'<div class="kc-grade-word">{self._e(rword)} risk</div>'
+                      '<div class="kc-grade-cap">Overall risk</div></div>')
         mid = ('<div class="kc-hero-mid">'
                f'{self._sev_chips()}'
                f'{self._meter("Exposure", exp, "easiest path to Tier 0")}'
                f'{self._meter("Hygiene debt", hyg, "misconfiguration & stale-object load")}'
                f'<div class="kc-verdictline">Exposure verdict: '
-               f'<b style="color:{vcol}">{self._e(word)}</b> · higher posture = stronger AD</div>'
+               f'<b style="color:{vcol}">{self._e(word)}</b> · all scores: higher = worse</div>'
                '</div>')
         readout = ('<div class="kc-readout"><div class="col">'
                    f'{self._donut()}{self._sev_legend()}</div></div>')
@@ -9214,7 +9215,7 @@ def main():
     for f in findings:
         sevc[f.severity] += 1
     print(f"\n{'='*60}")
-    print(f"  POSTURE       : {scores.get('posture',0):3d}/100  ({scores.get('grade_word','')})")
+    print(f"  RISK          : {scores.get('risk',0):3d}/100  ({scores.get('risk_word','')} risk)")
     print(f"  EXPOSURE      : {scores['exposure']:3d}/100  ({scores.get('verdict','')})")
     print(f"  HYGIENE DEBT  : {scores['hygiene']:3d}/100  (misconfig & stale load)")
     print(f"{'='*60}")
@@ -9263,7 +9264,7 @@ def main():
             "tool": TOOL_NAME, "version": VERSION,
             "domain": args.domain, "dc_ip": args.dc_ip, "auth_mode": auth_mode,
             "timestamp": now_iso,
-            "scores": {k: scores[k] for k in ("posture","grade_word","exposure","hygiene","verdict","cat_counts") if k in scores},
+            "scores": {k: scores[k] for k in ("risk","risk_word","exposure","hygiene","verdict","cat_counts") if k in scores},
             "findings": [
                 {"rule_id": f.rule_id, "title": f.title,
                  "category": f.category, "operation": op_category(f.rule_id, f.category),

@@ -60,14 +60,15 @@ Three numbers, deliberately *not* one saturating gauge for everything:
 - **Hygiene debt (0–100, higher = worse)** = sum of `HYGIENE_WEIGHTS`
   contributions; `pct_users`/`pct_comps` entries scale by the fraction of
   enabled objects affected.
-- **Posture score (0–100, higher = BETTER)** = the headline number. `RiskScorer.
-  posture()` = `100 − severity-weighted finding deductions (per-severity caps) −
-  exposure penalty`, so it *differentiates* (a clean domain ~90+; a few mediums
-  ~70; crits / a live Tier-0 path ~20–40) instead of pinning. The report shows the
-  number out of 100 plus a **risk word** (Strong / Good / Moderate risk / Weak /
-  Critical risk) and a colour — **no letter grade** (a "36 = F" letter tested as
-  confusing; the number speaks for itself). `RiskScorer.grade()` still derives the
-  word+colour from the same bands; its letter return value is unused.
+- **Risk score (0–100, HIGHER = WORSE)** = the headline number — same direction as
+  Exposure and Hygiene debt, so all three read alike. `risk = 100 −
+  RiskScorer.posture()`, where `posture()` = `100 − severity-weighted finding
+  deductions (per-severity caps) − exposure penalty` (the internal higher-is-better
+  model). So a clean domain ≈ 10 risk, a few mediums ≈ 30, crits / a live Tier-0
+  path ≈ 80–100. The report shows the number out of 100 + a **risk word**
+  (`RiskScorer.risk_band`: Minimal / Low / Moderate / High / Critical) and colour —
+  **no letter grade** (a "36 = F" letter, and an inverted higher-is-better number,
+  both tested as confusing).
 - **Verdict** = `RiskScorer.verdict(exposure)` — the plain-English exposure band
   ("Domain compromisable" … "No direct path"), still shown alongside.
 - `RULE_SCALE` graduates per-finding `points` (used for finding sort).
