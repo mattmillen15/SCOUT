@@ -29,7 +29,7 @@ Status legend: **[done]** shipped in this pass · **[partial]** some of it ships
 | Insight Recon                                                            | SCOUT status | Notes |
 |--------------------------------------------------------------------------|--------------|-------|
 | 135+ checks                                                              | **[done]**   | SCOUT ships **212** rules across A/P/S/T. |
-| ESC1–16 (ADCS): vulnerable templates, enrollment rights, EDITF_ATTRIBUTESUBJECTALTNAME, enrollment-agent abuse, weak DC cert mappings, CA access-control gaps | **[partial]** | Have ESC1/2/3/4/**5**/7/8/9/**13**/**15** + key strength. ESC6/10/11 are CA/DC registry settings not exposed over read-only LDAP (out of scope). ESC14/16 remain planned. |
+| ESC1–16 (ADCS): vulnerable templates, enrollment rights, EDITF_ATTRIBUTESUBJECTALTNAME, enrollment-agent abuse, weak DC cert mappings, CA access-control gaps | **[done, read-only subset]** | ESC1/2/3/4/**5**/7/8/9/**13**/**14**/**15** + key strength. ESC6 (EDITF_ATTRIBUTESUBJECTALTNAME2), ESC10/11 (DC/CA registry & RPC), ESC16 (CA-wide SID-extension disable) are **host/registry-only** and not confirmable from a read-only LDAP pass — out of scope by design (the report points the operator at `certipy find` for those). |
 | AAA: Kerberoast, AS-REP, NTLMv1/LM, RC4/DES, reversible pwds, no-password accts, weak cert mappings | **[done]** | All covered. |
 | PAM: DCSync, AdminSDHolder, dangerous ACLs, unconstrained/constrained/RBCD, shadow credentials, SID history, stale admins | **[partial]** | All covered **except shadow credentials (msDS-KeyCredentialLink / Whisker)** — **[planned]**. |
 | DSI: LAPS coverage, gMSA exposure, DC backups, SMB signing, LDAP signing, Spooler on DC, legacy OS on DC, SMBv1 | **[done]** | Covered. ("DC backups" surfaced via metadata; refine [planned].) |
@@ -56,7 +56,7 @@ Status legend: **[done]** shipped in this pass · **[partial]** some of it ships
 | **Priorities** section                                                   | **[done]**   | Added (Top Priorities + Quick Wins). Added to nav. |
 | **Detailed Findings** (filterable)                                       | **[done]**   | Existing filterable/searchable table; added Effort column + framework chips. |
 | **Trends & Changes**                                                     | **[done]**   | `--baseline` diff renders a "Changes since last scan" section (New/Fixed/Modified/Unchanged + NEW badges). Risk-over-time sparkline still **[planned]** (§6.2). |
-| Configuration / Environment / Accounts & Groups / Infrastructure / PKI & Certificates / Group Policy sub-sections | **[partial]** | We have Inventory (env/config), Privileged (accounts & groups), Attack Paths, and cert-template inventory. **Dedicated PKI and GPO views [planned].** |
+| Configuration / Environment / Accounts & Groups / Infrastructure / PKI & Certificates / Group Policy sub-sections | **[done]** | Inventory (env/config), Privileged (accounts & groups), Attack Paths, **dedicated PKI / AD CS** section (CAs + template attack-surface table) and **dedicated Group Policy** section (weaponizable GPOs, Tier-0 link map, orphaned, GPP passwords). |
 | Visual polish (clean cards, ring/badge score, chips)                     | **[done]**   | Re-themed in SCOUT's field/army palette — same look, our colors. |
 | "Web report you can share … hand it to leadership or a client as is"     | **[done]**   | Single-file HTML, print-to-PDF. |
 
@@ -108,13 +108,44 @@ Insight Recon: "Risk Posture Score over time", "New / Remediated / Modified / Un
 - **STIG control-area references** added to the Frameworks chips.
 - **Per-finding PowerShell remediation**, substituted for the assessed environment.
 
+## Shipped — parity v3 (PKI/GPO attack paths + operator findings)
+
+- **Dedicated PKI / AD CS section** — CA table (host + abusable-as ESCx) and a
+  template attack-surface table (schema, auth-EKU, enrollee-supplies-subject,
+  manager-approval, which ESCx it trips), abusable templates first.
+- **Dedicated Group Policy section** — weaponizable GPOs (writable by a non-Tier-0
+  principal → code exec in scope), GPO→Tier-0 link map, orphaned GPOs, GPP passwords.
+- **ESC14** — weak explicit certificate mappings (`altSecurityIdentities`).
+- **A-PasswordInDescription** — credentials stashed in `description`/`info` attributes
+  (classic, high-yield, every authenticated user can read it).
+- **P-LAPSReadable** — LAPS local-admin password actually readable by the scanning
+  principal (delegated-read misconfig → lateral movement; plaintext surfaced).
+
 ## Next up (highest leverage first)
 
 1. **Risk-posture-over-time** sparkline + local scan-history store — §6.2.
-2. **Dedicated PKI & Group Policy report sections** — §4.
-3. **ESC14/16** + version-pinned **STIG V-IDs** against a chosen STIG release — §2/§3.
-4. **Scan-progress UX** + scheduled/baseline mode — §5.
-5. Per-finding **lifecycle** (last_seen / age / remediated-since) — §6.3.
+2. Version-pinned **STIG V-IDs** against a chosen STIG release — §3.
+3. **Scan-progress UX** + scheduled/baseline mode — §5.
+4. Per-finding **lifecycle** (last_seen / age / remediated-since) — §6.3.
+
+## Candidate operator findings (noted, not yet implemented)
+
+Legitimate pentester findings worth adding next — all read-only-LDAP-confirmable
+unless flagged:
+
+- **Foreign Security Principals in privileged groups** — external/cross-forest SIDs
+  with Tier-0 membership (lateral path across a trust). Clean LDAP finding.
+- **Certifried (CVE-2022-26923)** — explicit "MAQ>0 + a machine-enrollable
+  auth template" combination (we flag the pieces separately today).
+- **`userPassword` / `unixUserPassword` populated** — some apps write cleartext here;
+  fold into the credential-in-attributes sweep (needs collecting those attrs).
+- **Expanded coercion vectors** — DFSCoerce (MS-DFSNM) / EFSRPC beyond Spooler+WebClient
+  (we have `A-DC-Coerce`); the RPC ones need a live probe, so flag-as-surface only.
+- **ZeroLogon (CVE-2020-1472) / noPac (CVE-2021-42278/42287)** — high-impact but
+  **active tests**, not confirmable read-only; surface the *candidate* DCs and point
+  the operator at the right tool rather than assert.
+- **Pre-Windows 2000 / inactive computer takeover** — stale computer objects with
+  resettable/known passwords (partially via `A-Pre2kComputer`).
 
 > Declined: a dedicated *shadow-credentials* (`msDS-KeyCredentialLink`) finding —
 > the escalation (write access to the attribute) is already a control-path / dangerous-ACL

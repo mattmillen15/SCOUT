@@ -345,6 +345,7 @@ RULES: Dict[str, Tuple[str, str, int, str]] = {
     "A-CertTemplateESC5":     ("Dangerous ACL on CA / PKI AD object — object takeover (ESC5)","Anomaly",50,"CRITICAL"),
     "A-CertTemplateESC13":    ("Certificate template issuance policy linked to a privileged group (ESC13)","Anomaly",50,"CRITICAL"),
     "A-CertTemplateESC15":    ("Schema V1 template allows enrollee-supplied application policies (ESC15 / CVE-2024-49019)","Anomaly",40,"HIGH"),
+    "A-CertWeakMapping":      ("Weak explicit certificate mapping on account (ESC14)","Anomaly",30,"HIGH"),
     "P-ControlPathDA":        ("Non-privileged principals have a control path to Domain Admin","Privileged",75,"CRITICAL"),
     "A-SCCMContainerACL":     ("System Management (SCCM) container writable by a broad principal","Anomaly",40,"HIGH"),
     "A-SCCM":                 ("SCCM/MECM site infrastructure exposed (relay / NAA / PXE attack surface)","Anomaly",40,"HIGH"),
@@ -356,6 +357,8 @@ RULES: Dict[str, Tuple[str, str, int, str]] = {
     "A-AADConnectSync":       ("Entra/Azure AD Connect sync account present (DCSync-capable)","Anomaly",25,"HIGH"),
     "A-SeamlessSSO":          ("Entra Seamless SSO computer account (AZUREADSSOACC$) key is stale","Anomaly",25,"HIGH"),
     "S-OrphanedGPO":          ("Orphaned / unlinked GPOs present","Stale",5,"LOW"),
+    "A-PasswordInDescription":("Possible credential in an account description/info attribute","Anomaly",50,"HIGH"),
+    "P-LAPSReadable":         ("LAPS local-admin password readable by the current principal","Privileged",75,"CRITICAL"),
 }
 
 # Field/army palette — oxide red, rust, mustard/brass, olive drab, field gray.
@@ -394,6 +397,7 @@ RULE_MATURITY: Dict[str, int] = {
     "A-CertTempAnyone":1, "A-CertTempAnyPurpose":1, "A-CertTempAgent":1,
     "A-CertEnrollHttp":1, "A-CertTemplateESC4":1, "A-CertTemplateESC5":1,
     "A-CertTemplateESC13":1, "A-CertTemplateESC15":1,
+    "A-PasswordInDescription":1, "P-LAPSReadable":1,
     "S-KerberoastableAdmin":1, "S-NoPreAuthAdmin":1, "S-Vuln-MS14-068":1,
     "S-Vuln-MS17_010":1, "A-DC-Coerce":1, "A-MD5RootCert":1, "A-SHA0RootCert":1,
     "A-BadSuccessor":1, "T-SIDHistoryDangerous":1, "T-TGTDelegation":1,
@@ -505,6 +509,9 @@ RULE_MITRE: Dict[str, List[str]] = {
     "A-CertTemplateESC5": ["T1649: Authentication Certificates (ESC5)", "T1222.001: ACL Modification"],
     "A-CertTemplateESC13": ["T1649: Authentication Certificates (ESC13)", "T1098: Account Manipulation"],
     "A-CertTemplateESC15": ["T1649: Authentication Certificates (ESC15)"],
+    "A-CertWeakMapping": ["T1649: Steal/Forge Authentication Certificates (ESC14)", "T1556: Modify Authentication Process"],
+    "A-PasswordInDescription": ["T1552.001: Credentials In Files", "T1078: Valid Accounts"],
+    "P-LAPSReadable": ["T1555: Credentials from Password Stores", "T1078: Valid Accounts"],
     "P-ControlPathDA": ["T1222.001: ACL Modification", "T1098: Account Manipulation"],
     "P-ControlPathIndirectEveryone": ["T1222.001: ACL Modification"],
     "P-ControlPathIndirectMany": ["T1222.001: ACL Modification"],
@@ -570,7 +577,8 @@ OP_CATEGORY = {
     "A-CertEnrollHttp":"Privilege Escalation","A-CertCAManageLowPriv":"Privilege Escalation",
     "A-CertTemplateESC9":"Privilege Escalation","P-ControlPathDA":"Privilege Escalation",
     "A-CertTemplateESC5":"Privilege Escalation","A-CertTemplateESC13":"Privilege Escalation",
-    "A-CertTemplateESC15":"Privilege Escalation",
+    "A-CertTemplateESC15":"Privilege Escalation","A-CertWeakMapping":"Privilege Escalation",
+    "A-PasswordInDescription":"Credential Access","P-LAPSReadable":"Credential Access",
     "P-ControlPathIndirectEveryone":"Privilege Escalation","P-ControlPathIndirectMany":"Privilege Escalation",
     "P-GMSAReadable":"Privilege Escalation",
     # Credential access / harvesting
@@ -1514,6 +1522,51 @@ RULE_DOCS: Dict[str, Dict[str, Any]] = {
         ],
         "refs": ["https://www.tarlogic.com/blog/ad-cs-esc15-vulnerability/",
                  "https://github.com/ly4k/Certipy"],
+    },
+    "A-CertWeakMapping": {
+        "description": "An account has a weak explicit certificate mapping in altSecurityIdentities (issuer+subject, subject-only, or RFC822/email) — ESC14.",
+        "why": "Weak explicit mappings bind a certificate to the account by easily-forged fields (issuer+subject DN, or email) instead of a strong serial / SKI / public-key binding. An attacker who can obtain or issue a certificate matching those fields — from any template/CA the account trusts, or a low-bar/misconfigured CA — authenticates as the mapped account via PKINIT/Schannel. A planted weak mapping is also a stealthy persistence backdoor.",
+        "technical": "altSecurityIdentities contains X509IssuerSubject (<I>..<S>..), X509SubjectOnly (<S>..) or an RFC822/email mapping — none include a strong binding (<SR> serial, <SKI>, or <SHA1-PUKEY>). Post-KB5014754 only the strong forms are safe.",
+        "exploit": [
+            "Obtain/forge a cert whose issuer+subject (or email) match the mapping, then PKINIT as the account.",
+            "certipy req ... then certipy auth -pfx <cert> -username <mapped account>",
+        ],
+        "remediation": [
+            "Replace weak mappings with a strong one (X509IssuerSerialNumber / SKI / SHA1PublicKey).",
+            "Remove unexpected altSecurityIdentities entries (possible backdoor).",
+            "Enforce StrongCertificateBindingEnforcement=2 on DCs (KB5014754).",
+        ],
+        "refs": ["https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/manage/certificate-mapping",
+                 "https://github.com/ly4k/Certipy"],
+    },
+    "A-PasswordInDescription": {
+        "description": "An account's description / info attribute contains text that looks like a stored password or secret.",
+        "why": "Admins routinely stash service-account or initial passwords in the description/info fields — which every authenticated user can read over LDAP. A single valid credential is often a domain foothold or a lateral-movement primitive: one of the highest-yield, lowest-effort wins on an internal assessment.",
+        "technical": "description / info matched a credential heuristic (a 'pwd/pass/pw:' label or a complex high-entropy token). Review the value — it may be stale or a decoy.",
+        "exploit": [
+            "The candidate secret is shown in the evidence below — validate it:",
+            "nxc smb <dc> -u <account> -p '<value>'   # or kerbrute / spray across the domain",
+        ],
+        "remediation": [
+            "Remove the secret from the attribute and rotate the exposed credential.",
+            "Store secrets in a vault / use gMSA / LAPS instead of AD free-text attributes.",
+        ],
+        "refs": [],
+    },
+    "P-LAPSReadable": {
+        "description": "The scanning principal can READ stored LAPS local-administrator passwords (ms-Mcs-AdmPwd / msLAPS-Password).",
+        "why": "If a non-Tier-0 account can read LAPS passwords it can recover the local Administrator password of those hosts and move laterally / escalate immediately — exactly what LAPS exists to prevent. SCOUT read at least one LAPS password with the supplied credentials, so any holder of this account can too.",
+        "technical": "ms-Mcs-AdmPwd (legacy LAPS, cleartext) or msLAPS-Password (Windows LAPS) returned a value to this principal — CONTROL_ACCESS/ReadProperty on the attribute is delegated too broadly. (msLAPS-EncryptedPassword additionally needs decryption rights.)",
+        "exploit": [
+            "Legacy-LAPS plaintext is in the evidence below.",
+            "nxc ldap <dc> -u <user> -p <pass> -M laps",
+            "Then pass-the-password to the host as Administrator (nxc smb / wmiexec).",
+        ],
+        "remediation": [
+            "Restrict ms-Mcs-AdmPwd / msLAPS-Password read rights to defined admin groups only.",
+            "Audit delegated read on the computer OUs; force-rotate exposed passwords.",
+        ],
+        "refs": [],
     },
     "A-SCCMContainerACL": {
         "description": "The System Management container (SCCM/MECM) is writable by a broad / non-Tier-0 principal.",
@@ -2536,7 +2589,8 @@ class ADData:
             "mail","distinguishedName","userPrincipalName","description",
             "whenCreated","accountExpires","badPasswordTime","badPwdCount",
             "msDS-AllowedToDelegateTo","msDS-AllowedToActOnBehalfOfOtherIdentity",
-            "primaryGroupID","objectSid","name","displayName"])
+            "primaryGroupID","objectSid","name","displayName",
+            "altSecurityIdentities","info"])
 
     # ── computers ────────────────────────────────────────────────────────────
 
@@ -2550,7 +2604,8 @@ class ADData:
             "msDS-AllowedToDelegateTo","msDS-AllowedToActOnBehalfOfOtherIdentity",
             "ms-Mcs-AdmPwdExpirationTime","msLAPS-PasswordExpirationTime",
             "distinguishedName","msDS-IsRODC","primaryGroupID","whenCreated",
-            "objectSid","name","logonCount"])
+            "objectSid","name","logonCount","altSecurityIdentities","description",
+            "ms-Mcs-AdmPwd","msLAPS-Password","msLAPS-EncryptedPassword"])
 
     # ── groups ────────────────────────────────────────────────────────────────
 
@@ -2771,7 +2826,117 @@ class CheckEngine:
         self._m_kds_root_key()
         self._m_entra()
         self._m_orphaned_gpos()
+        self._m_weak_cert_mapping()
+        self._m_password_in_description()
+        self._m_laps_readable()
         self._m_control_paths()
+
+    def _priv_sam_set(self) -> Set[str]:
+        """Lowercase sAMAccountNames of every member of a privileged group."""
+        out: Set[str] = set()
+        for members in self.d.priv_group_members.values():
+            for m in members:
+                sam = get_str(m.get("attrs", {}), "sAMAccountName") if isinstance(m, dict) else str(m)
+                if sam:
+                    out.add(sam.lower())
+        return out
+
+    # ── ESC14: weak explicit certificate mappings (altSecurityIdentities) ──────
+    def _m_weak_cert_mapping(self):
+        # A mapping is STRONG only if it carries a serial (<SR>), subject-key-id
+        # (<SKI>) or public-key hash (<SHA1-PUKEY>). Issuer+subject, subject-only
+        # and RFC822/email mappings are weak and forgeable (ESC14 / KB5014754).
+        def is_weak(m: str) -> bool:
+            s = (m or "").strip()
+            if not s.upper().startswith("X509:"):
+                return False
+            up = s.upper()
+            if any(tok in up for tok in ("<SR>", "<SKI>", "<SHA1-PUKEY>")):
+                return False
+            return ("<I>" in up) or ("<S>" in up) or ("<RFC822>" in up)
+        priv_sams = self._priv_sam_set()
+        for o in list(self.d.users) + list(self.d.computers):
+            a = o["attrs"]
+            maps = get_list(a, "altSecurityIdentities")
+            if not maps:
+                continue
+            weak = [m for m in maps if is_weak(m)]
+            if not weak:
+                continue
+            sam = get_str(a, "sAMAccountName") or dn_base(o["dn"])
+            privd = sam.lower() in priv_sams
+            note = " (PRIVILEGED account)" if privd else ""
+            self._add("A-CertWeakMapping",
+                      f"{sam}{note} has a weak explicit certificate mapping: "
+                      f"{'; '.join(weak[:3])}. An attacker who obtains a certificate matching "
+                      "this issuer/subject (or email) can authenticate as this account; the "
+                      "mapping may also be a planted backdoor. Replace with a strong "
+                      "(serial/SKI/public-key) mapping.",
+                      [f"{sam} -> {m}" for m in weak])
+
+    # ── credentials stashed in description / info attributes ───────────────────
+    _PW_LABEL_RE = re.compile(r'(?i)\b(pass(word|wd)?|pwd|pw|secret|creds?)\b\s*[:=]\s*\S')
+    _PW_SYMBOLS = set("!@#$%^&*()+|:;\"'<>?/~`")
+    def _looks_like_secret(self, text: str) -> bool:
+        if not text:
+            return False
+        if self._PW_LABEL_RE.search(text):
+            return True
+        # Otherwise only a lone complex token carrying ALL four classes incl. a real
+        # password symbol, standing nearly alone — this deliberately skips hostnames
+        # (DESKTOP-AB12CD3), SIDs (S-1-5-…), DN fragments (CN=…,OU=…) and tool stamps
+        # (Foo_v2.3), whose only "symbol" is - _ . , = and which lack mixed classes.
+        toks = text.split()
+        if len(toks) > 3:
+            return False
+        for tok in toks:
+            if len(tok) < 8 or len(tok) > 64 or tok.startswith("S-1-") or "=" in tok:
+                continue
+            if (any(c.islower() for c in tok) and any(c.isupper() for c in tok)
+                    and any(c.isdigit() for c in tok)
+                    and any(c in self._PW_SYMBOLS for c in tok)):
+                return True
+        return False
+
+    def _m_password_in_description(self):
+        for o in list(self.d.users) + list(self.d.computers):
+            a = o["attrs"]
+            sam = get_str(a, "sAMAccountName") or dn_base(o["dn"])
+            for attr in ("description", "info"):
+                val = get_str(a, attr)
+                if val and self._looks_like_secret(val):
+                    snippet = val if len(val) <= 120 else val[:117] + "…"
+                    self._add("A-PasswordInDescription",
+                              f"{sam} {attr} contains a possible credential: \"{snippet}\". "
+                              "Any authenticated user can read it over LDAP — validate and spray.",
+                              [f"{sam} [{attr}]: {snippet}"])
+                    break
+
+    # ── LAPS local-admin passwords readable by the current principal ───────────
+    def _m_laps_readable(self):
+        hits = []; enc_only = 0
+        for c in self.d.computers:
+            a = c["attrs"]
+            sam = get_str(a, "sAMAccountName") or dn_base(c["dn"])
+            clear = get_str(a, "ms-Mcs-AdmPwd")
+            new = get_str(a, "msLAPS-Password")
+            if clear:
+                hits.append(f"{sam} : {clear}")
+            elif new:
+                # Windows LAPS cleartext blob is JSON {... "p":"<pwd>" ...}.
+                hits.append(f"{sam} : {new if len(new) <= 200 else new[:197] + '…'}")
+            elif a.get("msLAPS-EncryptedPassword"):
+                # readable, but DPAPI-NG-encrypted to a designated decryptor — NOT
+                # recoverable over LDAP, so it is not a readable-password finding.
+                enc_only += 1
+        if hits:
+            extra = (f" A further {enc_only} host(s) expose only an encrypted LAPS blob "
+                     "(recoverable only with decryption rights).") if enc_only else ""
+            self._add("P-LAPSReadable",
+                      f"The supplied credentials can read cleartext LAPS passwords for {len(hits)} "
+                      "computer(s) — LAPS read rights are delegated too broadly; recover the local "
+                      f"Administrator password and move laterally.{extra}",
+                      hits)
 
     def _m_managed_accounts(self):
         """gMSA / dMSA whose managed password a broad principal may read (roadmap
@@ -6554,6 +6719,7 @@ EXPOSURE_WEIGHTS = {
     "A-SCCM":72, "A-Pre2kComputer":78, "A-WeakLockout":40, "S-OS-NT":78,
     "A-CertCAManageLowPriv":88, "A-CertTemplateESC9":80,
     "A-CertTemplateESC5":88, "A-CertTemplateESC13":84, "A-CertTemplateESC15":84,
+    "A-CertWeakMapping":78, "A-PasswordInDescription":82, "P-LAPSReadable":88,
     "P-ControlPathDA":92, "P-ControlPathIndirectEveryone":95, "P-ControlPathIndirectMany":70,
     "A-SCCMContainerACL":75, "P-GMSAReadable":88, "A-KDSRootKey":90,
     "A-AADConnectSync":70, "A-SeamlessSSO":60,
@@ -6734,7 +6900,7 @@ RULE_EFFORT = {
     "A-RestrictRemoteSAM":"Low","A-NTLMAudit":"Low","A-DSRMLogon":"Low","A-HardenedPaths":"Low",
     "A-CredentialGuard":"Low","A-PowerShellLogging":"Low","P-MachineAccountQuota":"Low",
     "A-DnsZoneUpdate1":"Low","P-RecycleBin":"Low","A-WSUS-HTTP":"Low","P-AdminCountOrphan":"Low",
-    "A-DCLdapsChannelBinding":"Low","S-SIDHistory":"Low",
+    "A-DCLdapsChannelBinding":"Low","S-SIDHistory":"Low","A-PasswordInDescription":"Low",
     "A-LAPS-Not-Installed":"High","A-LocalAdminPassword":"High","P-UnconstrainedDelegation":"High",
     "S-OS-XP":"High","S-OS-Vista":"High","S-OS-NT":"High","S-SMB-v1":"High","P-AdminNum":"High",
     "P-ProtectedUsers":"High","A-Krbtgt":"High","S-FunctionalLevel1":"High","S-FunctionalLevel3":"High",
@@ -6775,6 +6941,8 @@ RULE_MITIGATION = {
     "A-CertEnrollHttp":["M1037","M1035"], "A-CertCAManageLowPriv":["M1026","M1015"],
     "A-CertTemplateESC9":["M1015","M1041"], "A-CertTemplateESC5":["M1015","M1026"],
     "A-CertTemplateESC13":["M1015","M1026"], "A-CertTemplateESC15":["M1015","M1026"],
+    "A-CertWeakMapping":["M1015"], "A-PasswordInDescription":["M1027","M1017"],
+    "P-LAPSReadable":["M1026","M1015"],
     "P-UnconstrainedDelegation":["M1015","M1026"], "P-RBCD-Dangerous":["M1015","M1026"],
     "P-RBCD":["M1015","M1018"], "P-ConstrainedDelegService":["M1015","M1026"],
     "P-DelegationDCt2a4d":["M1015","M1026"], "P-DelegationDCa2d2":["M1015","M1026"],
@@ -6853,6 +7021,7 @@ RULE_STIG = {
     "S-OS-Vista": "Win STIG: unsupported OS removed",
     "S-OS-NT": "Win STIG: unsupported OS removed",
     "P-ProtectedUsers": "AD STIG: privileged accounts in Protected Users",
+    "P-LAPSReadable": "Win STIG: local admin password read access restricted (LAPS)",
 }
 
 # Copy-able PowerShell / ADUC remediation, one entry per rule. {domain} / {dc}
@@ -6883,6 +7052,10 @@ RULE_POWERSHELL = {
     "A-ProtectedUsers": ["Add-ADGroupMember -Identity 'Protected Users' -Members (Get-ADGroupMember 'Domain Admins' -Server {domain})"],
     "A-Krbtgt": ["# Microsoft New-KrbtgtKeys.ps1 — reset twice, ~24h apart, to invalidate cached tickets"],
     "P-AdminPwdTooOld": ["Get-ADUser <admin> -Server {domain} | Set-ADAccountPassword -Reset"],
+    "A-PasswordInDescription": ["Set-ADUser <user> -Server {domain} -Clear description,info   # after rotating the exposed secret"],
+    "P-LAPSReadable": ["# Re-scope LAPS read rights to admins only, then force rotation:",
+                       "Find-LapsADExtendedRights -Identity 'OU=Computers,DC=...'",
+                       "Reset-LapsPassword -Identity <computer>"],
 }
 
 def rule_compliance(rule_id: str, opcat: str) -> Dict[str, List[str]]:
@@ -7480,8 +7653,12 @@ class HTMLReporter:
         items = [("summary","Summary",""),("priorities","Priorities","")]
         if self.changes:
             items.append(("changes","Changes",""))
-        items += [("paths","Attack Paths",""),("priv","Privileged",""),
-                  ("findings","Findings",str(len(self.findings)))]
+        items += [("paths","Attack Paths",""),("priv","Privileged","")]
+        if getattr(self.data, "enrollment_svcs", None) or getattr(self.data, "cert_templates", None):
+            items.append(("pki","PKI",""))
+        if getattr(self.data, "gpos", None):
+            items.append(("gpo","Group Policy",""))
+        items.append(("findings","Findings",str(len(self.findings))))
         links = ""
         for sid, name, badge in items:
             b = f'<span class="kc-navb">{badge}</span>' if badge else ""
@@ -8193,6 +8370,201 @@ class HTMLReporter:
                 '<span class="tag">click a group — notable = stale / kerberoastable / no-expiry</span></h2>'
                 f'{blocks}{cp}</section>')
 
+    # ── PKI / AD CS attack surface ─────────────────────────────────────────────
+    _ESC_RULE_LABEL = {"A-CertTempCustomSubject":"ESC1", "A-CertTempAnyPurpose":"ESC2",
+                       "A-CertTempAgent":"ESC3", "A-CertTemplateESC4":"ESC4",
+                       "A-CertTemplateESC9":"ESC9", "A-CertTemplateESC13":"ESC13",
+                       "A-CertTemplateESC15":"ESC15"}
+    _CA_ESC_RULE_LABEL = {"A-CertEnrollHttp":"ESC8", "A-CertCAManageLowPriv":"ESC7",
+                          "A-CertTemplateESC5":"ESC5"}
+    # Genuine domain-authentication EKUs (Client Auth, Smart Card Logon, PKINIT,
+    # Any Purpose). The Enrollment-Agent OID is deliberately excluded — it is not
+    # an auth EKU (it's surfaced via the ESC3 abuse label instead).
+    _PKI_AUTH_EKUS = {"1.3.6.1.5.5.7.3.2", "1.3.6.1.4.1.311.20.2.2",
+                      "1.3.6.1.5.2.3.4", "2.5.29.37.0"}
+
+    def _esc_label_index(self, label_map):
+        """rule_id label -> map of object-name(lower) -> set(labels) from findings."""
+        idx = defaultdict(set)
+        for rid, label in label_map.items():
+            f = self.by_rule.get(rid)
+            if not f:
+                continue
+            # Only the FIRST affected token names the subject (template or CA);
+            # later tokens (e.g. ESC1's CA names) must not pollute the index.
+            for a in f.affected[:1]:
+                # tokens look like "TemplateName", "Tmpl -> Group",
+                # "Tmpl writable by X", or "CA: principal" — take the leading name.
+                name = str(a).split(" -> ")[0].split(" writable")[0].split(":")[0].strip()
+                if name:
+                    idx[name.lower()].add(label)
+        return idx
+
+    def _pki_section(self):
+        d = self.data
+        cas = getattr(d, "enrollment_svcs", None) or []
+        tmpls = getattr(d, "cert_templates", None) or []
+        if not cas and not tmpls:
+            return ""
+        tmpl_esc = self._esc_label_index(self._ESC_RULE_LABEL)
+        ca_esc = self._esc_label_index(self._CA_ESC_RULE_LABEL)
+        # CA table
+        ca_rows = ""
+        for s in cas:
+            a = s["attrs"]; cn = get_str(a, "cn"); host = get_str(a, "dNSHostName") or "—"
+            # ESC7/ESC5 are indexed by CA cn; ESC8 (A-CertEnrollHttp) by host — union both.
+            labels = sorted(ca_esc.get(cn.lower(), set()) | ca_esc.get(host.lower(), set()))
+            badge = "".join(f'<span class="kc-mini" style="color:var(--crit);border-color:rgba(189,66,52,.5)">{self._e(l)}</span>'
+                            for l in labels) or '<span class="kc-muted">—</span>'
+            ca_rows += (f'<tr><td><strong>{self._e(cn)}</strong></td><td class="kc-mono">{self._e(host)}</td>'
+                        f'<td>{badge}</td></tr>')
+        ca_tbl = (('<div class="kc-sub-h">Certificate authorities</div>'
+                   '<table class="kc-table"><thead><tr><th>CA</th><th>Host</th>'
+                   '<th>Abusable as</th></tr></thead><tbody>' + ca_rows + '</tbody></table>')
+                  if ca_rows else "")
+        # Template table — published templates, vulnerable first
+        published = getattr(d, "_published_templates", set())
+        def is_pub(t):
+            return (not published) or (get_str(t["attrs"], "cn") in published)
+        rows_data = []
+        for t in tmpls:
+            a = t["attrs"]; cn = get_str(a, "cn")
+            if not is_pub(t):
+                continue
+            ekus = set(get_list(a, "pKIExtendedKeyUsage"))
+            name_flag = get_int(a, "msPKI-Certificate-Name-Flag")
+            enroll_flag = get_int(a, "msPKI-Enrollment-Flag")
+            labels = sorted(tmpl_esc.get(cn.lower(), set()),
+                            key=lambda x: int(re.sub(r"\D", "", x) or 0))
+            rows_data.append({
+                "cn": cn, "schema": get_int(a, "msPKI-Template-Schema-Version"),
+                # no EKU restriction == usable for any purpose, incl. auth (ESC2).
+                "auth": (not ekus) or bool(ekus & self._PKI_AUTH_EKUS),
+                "ess": bool(name_flag & 0x1),
+                "approval": bool(enroll_flag & 0x2),
+                "labels": labels})
+        rows_data.sort(key=lambda r: (0 if r["labels"] else 1, r["cn"].lower()))
+        yn = lambda b, good_false=False: (
+            f'<span class="kc-{"bad" if b ^ good_false else "ok"}">{"yes" if b else "no"}</span>')
+        t_rows = ""
+        for r in rows_data[:60]:
+            esc = "".join(f'<span class="kc-mini" style="color:var(--crit);border-color:rgba(189,66,52,.5)">{self._e(l)}</span>'
+                          for l in r["labels"]) or '<span class="kc-muted">—</span>'
+            cls = ' class="kc-notable"' if r["labels"] else ''
+            t_rows += (f'<tr{cls}><td><strong>{self._e(r["cn"])}</strong></td>'
+                       f'<td class="kc-num">{r["schema"]}</td>'
+                       f'<td>{yn(r["auth"])}</td><td>{yn(r["ess"])}</td>'
+                       f'<td>{yn(r["approval"], good_false=True)}</td><td>{esc}</td></tr>')
+        more = (f'<p class="kc-ap-sub">… and {len(rows_data)-60} more published template(s).</p>'
+                if len(rows_data) > 60 else "")
+        t_tbl = (('<div class="kc-sub-h">Certificate templates '
+                  '<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--faint)">'
+                  '— published; abusable templates first. ESS = enrollee-supplies-subject</span></div>'
+                  '<table class="kc-table"><thead><tr><th>Template</th><th class="kc-num">Schema</th>'
+                  '<th>Auth EKU</th><th>ESS</th><th>Mgr approval</th><th>Abuse</th></tr></thead>'
+                  f'<tbody>{t_rows}</tbody></table>{more}')
+                 if t_rows else '<p class="kc-sub">No certificate templates are published to a CA.</p>')
+        # ESC14 (account-level) note
+        wm = self.by_rule.get("A-CertWeakMapping")
+        esc14 = ""
+        if wm:
+            accts = {str(a).split(" -> ")[0].strip() for a in wm.affected}
+            esc14 = (f'<p class="kc-ap-sub" style="margin-top:10px">{len(accts)} account(s) carry a '
+                     'weak explicit certificate mapping (ESC14) — see Findings.</p>')
+        n_vuln = sum(1 for r in rows_data if r["labels"])
+        stats = (f'<div class="kc-paths-tag">'
+                 f'<div class="kc-pstat"><b>{len(cas)}</b><span>certificate authorities</span></div>'
+                 f'<div class="kc-pstat"><b>{len(rows_data)}</b><span>published templates</span></div>'
+                 f'<div class="kc-pstat"><b style="color:var(--crit)">{n_vuln}</b><span>abusable templates</span></div>'
+                 f'</div>')
+        return ('<section class="kc-section" id="sec-pki"><h2 class="kc-h2">PKI / AD CS'
+                '<span class="tag">certificate attack surface</span></h2>'
+                '<p class="kc-sub">Certificate authorities and the templates they issue — '
+                'the ones flagged here are enrollable by a low-privileged principal and abusable to '
+                'a Domain Admin certificate.</p>'
+                f'{stats}{ca_tbl}{t_tbl}{esc14}</section>')
+
+    # ── Group Policy attack paths ──────────────────────────────────────────────
+    def _gpo_attack_rows(self):
+        d = self.data
+        parse = ControlPathAnalyzer._parse_gplink
+        linked = defaultdict(set)
+        containers = []
+        if getattr(d, "domain_obj", None):
+            containers.append((getattr(d, "base", ""), get_str(d.domain_obj["attrs"], "gPLink")))
+        for c in list(getattr(d, "ous", [])) + list(getattr(d, "sites", [])):
+            containers.append((c.get("dn", ""), get_str(c["attrs"], "gPLink")))
+        for cdn, gp in containers:
+            for gdn in parse(gp):
+                linked[gdn.lower()].add((cdn or "").lower())
+        t0 = {(getattr(d, "base", "") or "").lower()}
+        for dc in getattr(d, "dcs", []):
+            rest = (dc.get("dn", "") or "").lower()
+            while "," in rest:
+                rest = rest.split(",", 1)[1]; t0.add(rest)
+        for s in getattr(d, "sites", []):
+            if s.get("dn"):
+                t0.add(s["dn"].lower())
+        writers = defaultdict(list)
+        for f in getattr(d, "acl_findings", []):
+            if f.get("type") == "gpo_write" and f.get("dn"):
+                writers[f["dn"].lower()].append(f.get("sid_name", "principal"))
+        rows = []
+        for g in getattr(d, "gpos", []):
+            dn = (g.get("dn", "") or "").lower()
+            conts = linked.get(dn, set())
+            rows.append({
+                "name": get_str(g["attrs"], "displayName") or dn_base(g.get("dn", "")),
+                "links": len(conts), "dc_linked": any(c in t0 for c in conts),
+                "writers": list(dict.fromkeys(writers.get(dn, []))),
+                "orphaned": not conts})
+        return rows
+
+    def _gpo_section(self):
+        d = self.data
+        gpos = getattr(d, "gpos", None) or []
+        if not gpos:
+            return ""
+        rows = self._gpo_attack_rows()
+        weap = [r for r in rows if r["writers"]]
+        dc_linked = [r for r in rows if r["dc_linked"]]
+        orphaned = [r for r in rows if r["orphaned"]]
+        # weaponizable GPOs (writable by a non-Tier-0 principal)
+        wrows = ""
+        for r in sorted(weap, key=lambda r: (0 if r["dc_linked"] else 1, r["name"].lower())):
+            scope = ('<span class="kc-bad">Domain Controllers → Tier 0</span>' if r["dc_linked"]
+                     else (f'{r["links"]} container(s)' if r["links"] else '<span class="kc-muted">unlinked</span>'))
+            who = ", ".join(self._e(w) for w in r["writers"][:4]) + ("…" if len(r["writers"]) > 4 else "")
+            wrows += (f'<tr class="{"kc-notable" if r["dc_linked"] else ""}"><td><strong>{self._e(r["name"])}</strong></td>'
+                      f'<td>{who}</td><td>{scope}</td></tr>')
+        weap_tbl = (('<div class="kc-sub-h">Weaponizable GPOs '
+                     '<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--faint)">'
+                     '— writable by a non-Tier-0 principal → code execution in the GPO scope</span></div>'
+                     '<table class="kc-table"><thead><tr><th>GPO</th><th>Writable by</th>'
+                     '<th>Applies to</th></tr></thead>'
+                     f'<tbody>{wrows}</tbody></table>')
+                    if wrows else '<p class="kc-sub">No GPO is writable by a broad / non-Tier-0 principal.</p>')
+        # Tier-0 GPOs (linked to DC-affecting containers) — high-value targets
+        t0_names = ", ".join(self._e(r["name"]) for r in dc_linked[:20]) or "—"
+        t0_blk = ('<div class="kc-sub-h">GPOs applied to Domain Controllers / Tier-0 '
+                  '<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--faint)">'
+                  '— a write primitive on any of these is domain takeover</span></div>'
+                  f'<p class="kc-ap-sub">{t0_names}'
+                  f'{(" … and %d more" % (len(dc_linked)-20)) if len(dc_linked) > 20 else ""}</p>')
+        gpp = self._gpp_table()
+        gpp_blk = ('<div class="kc-sub-h">Group Policy Preferences passwords (cpassword)</div>' + gpp) if gpp else ""
+        orph_blk = (f'<p class="kc-ap-sub" style="margin-top:10px">{len(orphaned)} orphaned / unlinked GPO(s) '
+                    'retain their settings and DACLs — review or remove.</p>') if orphaned else ""
+        stats = (f'<div class="kc-paths-tag">'
+                 f'<div class="kc-pstat"><b>{len(gpos)}</b><span>GPOs</span></div>'
+                 f'<div class="kc-pstat"><b style="color:var(--crit)">{len(weap)}</b><span>writable by non-Tier-0</span></div>'
+                 f'<div class="kc-pstat"><b>{len(dc_linked)}</b><span>linked to Tier-0</span></div>'
+                 f'<div class="kc-pstat"><b>{len(orphaned)}</b><span>orphaned</span></div>'
+                 f'</div>')
+        return ('<section class="kc-section" id="sec-gpo"><h2 class="kc-h2">Group Policy'
+                '<span class="tag">GPO takeover paths</span></h2>'
+                f'{stats}{weap_tbl}{gpp_blk}{t0_blk}{orph_blk}</section>')
+
     # ── findings register ──────────────────────────────────────────────────────
     def _gpp_table(self):
         pw = self.data.sysvol_data.get("gpp_passwords", [])
@@ -8494,7 +8866,8 @@ class HTMLReporter:
                   '<div class="kc-dw-b" id="kc-dw-body"></div></aside>')
         body = (self._head() + self._nav() + '<main class="kc-container">' +
                 self._summary_section() + self._priorities_section() + self._changes_section() +
-                self._paths_section() + self._privileged_section() + self._findings_section() +
+                self._paths_section() + self._privileged_section() +
+                self._pki_section() + self._gpo_section() + self._findings_section() +
                 '</main>' + drawer +
                 f'<footer class="kc-footer">{TOOL_NAME} v{VERSION} — authorized security assessment use only · '
                 f'generated {self._e(self.ts)}</footer>'
