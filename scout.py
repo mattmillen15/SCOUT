@@ -6492,12 +6492,8 @@ class ControlPathAnalyzer:
         control of it WITHOUT being a member (the shadow-admin set), each with the
         resolved path. Computed from the in-memory control graph (adj/radj)."""
         from collections import deque
-        # Tier-0 groups + the domain root, plus broad "Domain Computers" (515) —
-        # not Tier-0, but control over it is a notable exposure worth surfacing.
-        sensitive = [f"{self.dsid}-{r}" for r in (515,) if self.dsid]
         targets = list(dict.fromkeys(
-            [s for s in self.tier0_groups if s in self.sid2name]
-            + [s for s in sensitive if s in self.sid2name] + [self.domain_root]))
+            [s for s in self.tier0_groups if s in self.sid2name] + [self.domain_root]))
         out = []
         for t in targets:
             # 1) membership closure of t (reverse over membership-only edges)
