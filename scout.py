@@ -6464,7 +6464,7 @@ class ControlPathAnalyzer:
                 if me:
                     members.append(self._acct_info(me[0], me[1]))
                 else:
-                    members.append({"sam": dn_base(mdn), "kind": "external",
+                    members.append({"sam": dn_base(mdn), "kind": "foreign",
                                     "enabled": None, "pwd_age": None,
                                     "logon_age": None, "spn": False, "stale": False})
             meta["members"] = members
@@ -8387,7 +8387,7 @@ class HTMLReporter:
         rows = ""
         for m in facts[:80]:
             kind = m.get("kind"); en = m.get("enabled")
-            if kind in ("group", "external"):
+            if kind in ("group", "foreign"):
                 st = f'<span class="kc-muted">{self._e(kind)}</span>'   # not an account — no enabled/disabled state
             else:
                 st = ('<span class="kc-bad">disabled</span>' if en is False
@@ -8422,9 +8422,10 @@ class HTMLReporter:
             chains += self._chain(ne, "CRITICAL" if c["broad"] else "HIGH", "")
         extra = g["controller_count"] - len(ctrls)
         more = f'<p class="kc-ap-sub">… and {extra} more principal(s).</p>' if extra > 0 else ""
-        return ('<div class="kc-sub-h" style="margin-top:14px">Can take control — not a member '
+        return ('<div class="kc-sub-h" style="margin-top:14px">Non-members with outbound control over this group '
                 '<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--faint)">'
-                f'— {g["controller_count"]} principal(s) have a control path to this group; click any node</span></div>'
+                f'— {g["controller_count"]} principal(s) hold an outbound control path that ends at this group; '
+                'click any node</span></div>'
                 f'{chains}{more}')
 
     def _privileged_section(self):
@@ -8465,8 +8466,8 @@ class HTMLReporter:
                 mem_tbl = ('<div class="kc-sub-h">Members</div>' + self._hv_member_facts_table(g["members"])
                            if g["members"] else "")
             cc = g["controller_count"]
-            warn = (f' · <span class="kc-bad">{cc} can take control</span>' if cc
-                    else ' · <span class="kc-ok">no external control path</span>')
+            warn = (f' · <span class="kc-bad">{cc} non-member(s) with outbound control</span>' if cc
+                    else ' · <span class="kc-ok">no non-member control path</span>')
             head_n = ("domain head" if g["is_domain"] else f"{mem_count} member(s)") + warn
             gid = f"hv-{gi}"; gi += 1
             hv_blocks += (
