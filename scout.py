@@ -342,6 +342,9 @@ RULES: Dict[str, Tuple[str, str, int, str]] = {
     "A-CertTemplateESC4":     ("Certificate template ACL writable by low-privileged principal (ESC4)","Anomaly",50,"CRITICAL"),
     "A-CertCAManageLowPriv":  ("Low-privileged principal holds CA management rights (ESC7)","Anomaly",50,"CRITICAL"),
     "A-CertTemplateESC9":     ("Certificate template has no security extension — weak cert mapping (ESC9)","Anomaly",40,"HIGH"),
+    "A-CertTemplateESC5":     ("Dangerous ACL on CA / PKI AD object — object takeover (ESC5)","Anomaly",50,"CRITICAL"),
+    "A-CertTemplateESC13":    ("Certificate template issuance policy linked to a privileged group (ESC13)","Anomaly",50,"CRITICAL"),
+    "A-CertTemplateESC15":    ("Schema V1 template allows enrollee-supplied application policies (ESC15 / CVE-2024-49019)","Anomaly",40,"HIGH"),
     "P-ControlPathDA":        ("Non-privileged principals have a control path to Domain Admin","Privileged",75,"CRITICAL"),
     "A-SCCMContainerACL":     ("System Management (SCCM) container writable by a broad principal","Anomaly",40,"HIGH"),
     "A-SCCM":                 ("SCCM/MECM site infrastructure exposed (relay / NAA / PXE attack surface)","Anomaly",40,"HIGH"),
@@ -389,7 +392,8 @@ RULE_MATURITY: Dict[str, int] = {
     "P-ModifiableGPO":1, "P-DangerousACLGPO":1, "P-ServiceDomainAdmin":1,
     "P-UnconstrainedDelegation":1, "A-CertTempCustomSubject":1, "A-CertTempNoSecurity":1,
     "A-CertTempAnyone":1, "A-CertTempAnyPurpose":1, "A-CertTempAgent":1,
-    "A-CertEnrollHttp":1, "A-CertTemplateESC4":1,
+    "A-CertEnrollHttp":1, "A-CertTemplateESC4":1, "A-CertTemplateESC5":1,
+    "A-CertTemplateESC13":1, "A-CertTemplateESC15":1,
     "S-KerberoastableAdmin":1, "S-NoPreAuthAdmin":1, "S-Vuln-MS14-068":1,
     "S-Vuln-MS17_010":1, "A-DC-Coerce":1, "A-MD5RootCert":1, "A-SHA0RootCert":1,
     "A-BadSuccessor":1, "T-SIDHistoryDangerous":1, "T-TGTDelegation":1,
@@ -498,6 +502,9 @@ RULE_MITRE: Dict[str, List[str]] = {
     "A-SCCMContainerACL": ["T1222.001: ACL Modification", "T1557.001: SMB Relay"],
     "A-CertCAManageLowPriv": ["T1649: Authentication Certificates (ESC7)"],
     "A-CertTemplateESC9": ["T1649: Authentication Certificates (ESC9)"],
+    "A-CertTemplateESC5": ["T1649: Authentication Certificates (ESC5)", "T1222.001: ACL Modification"],
+    "A-CertTemplateESC13": ["T1649: Authentication Certificates (ESC13)", "T1098: Account Manipulation"],
+    "A-CertTemplateESC15": ["T1649: Authentication Certificates (ESC15)"],
     "P-ControlPathDA": ["T1222.001: ACL Modification", "T1098: Account Manipulation"],
     "P-ControlPathIndirectEveryone": ["T1222.001: ACL Modification"],
     "P-ControlPathIndirectMany": ["T1222.001: ACL Modification"],
@@ -562,6 +569,8 @@ OP_CATEGORY = {
     "A-CertTempAgent":"Privilege Escalation","A-CertTemplateESC4":"Privilege Escalation",
     "A-CertEnrollHttp":"Privilege Escalation","A-CertCAManageLowPriv":"Privilege Escalation",
     "A-CertTemplateESC9":"Privilege Escalation","P-ControlPathDA":"Privilege Escalation",
+    "A-CertTemplateESC5":"Privilege Escalation","A-CertTemplateESC13":"Privilege Escalation",
+    "A-CertTemplateESC15":"Privilege Escalation",
     "P-ControlPathIndirectEveryone":"Privilege Escalation","P-ControlPathIndirectMany":"Privilege Escalation",
     "P-GMSAReadable":"Privilege Escalation",
     # Credential access / harvesting
@@ -1463,6 +1472,49 @@ RULE_DOCS: Dict[str, Dict[str, Any]] = {
         ],
         "refs": ["https://github.com/ly4k/Certipy"],
     },
+    "A-CertTemplateESC5": {
+        "description": "A broad / low-privileged principal has object-takeover rights (GenericAll/GenericWrite/WriteDacl/WriteOwner) over a CA / PKI AD object — ESC5.",
+        "why": "ESC5 is escalation via the PKI's AD objects rather than a template. Control of the enterprise CA object (or the PKI containers) lets an attacker publish a vulnerable template, enable a template, add themselves as a CA officer, or flip dangerous CA flags — any of which leads to minting an authentication certificate for a Domain Admin.",
+        "technical": "pKIEnrollmentService (CA) object nTSecurityDescriptor grants GenericAll/GenericWrite/WriteDacl/WriteOwner to Everyone / Authenticated Users / Domain Users / Domain Computers / BUILTIN\\Users.",
+        "exploit": [
+            "certipy find -vulnerable    # flags ESC5 on the CA object",
+            "After taking ownership, publish/enable a vulnerable template and enroll as a privileged user.",
+        ],
+        "remediation": [
+            "Restrict the CA object (and the Public Key Services containers) ACL to PKI administrators / Tier-0 only.",
+            "Remove GenericAll/Write/WriteDacl/WriteOwner ACEs granted to broad principals.",
+        ],
+        "refs": ["https://posts.specterops.io/certified-pre-owned-d95910965cd2",
+                 "https://github.com/ly4k/Certipy"],
+    },
+    "A-CertTemplateESC13": {
+        "description": "A published, low-priv-enrollable certificate template carries an issuance policy whose OID is linked (msDS-OIDToGroupLink) to a privileged group — ESC13.",
+        "why": "When an issuance-policy OID is linked to a group, a certificate issued from a template bearing that policy grants the holder that group's membership at authentication time. If a low-privileged principal can enroll in the template and the linked group is privileged, enrolling yields privileged access with no other prerequisite.",
+        "technical": "Template msPKI-Certificate-Policy references an msPKI-Enterprise-Oid object (CN=OID,CN=Public Key Services,CN=Services,CN=Configuration) whose msDS-OIDToGroupLink points to a privileged group, and a broad principal holds Enroll on the template.",
+        "exploit": [
+            "certipy find -vulnerable    # flags ESC13",
+            "certipy req -template <tmpl> -ca <ca>    # the issued cert confers the linked group",
+        ],
+        "remediation": [
+            "Remove the msDS-OIDToGroupLink, or restrict enrollment on templates that carry the policy to trusted principals.",
+            "Avoid linking issuance policies to privileged groups.",
+        ],
+        "refs": ["https://posts.specterops.io/adcs-esc13-abuse-technique-fda4272fbd53"],
+    },
+    "A-CertTemplateESC15": {
+        "description": "A published, low-priv-enrollable schema V1 template allows the requester to supply Subject and inject arbitrary application policies — ESC15 / CVE-2024-49019 (\"EKUwu\").",
+        "why": "Schema-version-1 templates do not constrain the EKUs/application policies of the issued certificate, so a requester who can supply the subject can also inject application policies such as Client Authentication or Certificate Request Agent — authenticating as, or enrolling on behalf of, any user (including Domain Admins). The default 'WebServer' template is the canonical target.",
+        "technical": "msPKI-Template-Schema-Version = 1, CT_FLAG_ENROLLEE_SUPPLIES_SUBJECT set, no manager approval, and a broad principal holds Enroll.",
+        "exploit": [
+            "certipy req -template <v1tmpl> -ca <ca> -application-policies 'Client Authentication' -upn administrator@domain",
+        ],
+        "remediation": [
+            "Patch DCs/CA (CVE-2024-49019); republish affected templates at schema version 2+.",
+            "Require manager approval or remove enrollee-supplied-subject on V1 templates; restrict enrollment.",
+        ],
+        "refs": ["https://www.tarlogic.com/blog/ad-cs-esc15-vulnerability/",
+                 "https://github.com/ly4k/Certipy"],
+    },
     "A-SCCMContainerACL": {
         "description": "The System Management container (SCCM/MECM) is writable by a broad / non-Tier-0 principal.",
         "why": "Write access to the System Management container lets an attacker publish a rogue management point and coerce clients/site servers to authenticate to it (relay), or tamper with SCCM site data — a common path to SCCM, and from there domain-wide, compromise.",
@@ -1785,6 +1837,10 @@ Examples:
                      help="Also write JSON findings (optional path; default scout_<domain>.json)")
     out.add_argument("--csv",    metavar="FILE", nargs="?", const="__AUTO__",
                      help="Also write a CSV of findings (optional path; default scout_<domain>.csv)")
+    out.add_argument("--baseline", metavar="FILE",
+                     help="A prior SCOUT JSON to diff against — report New / Fixed / "
+                          "Unchanged / Modified findings and per-finding 'first seen'. "
+                          "Pair with --json to keep history across scans.")
     out.add_argument("--operator", metavar="NAME", default="",
                      help="Operator/author name printed on the report cover")
     out.add_argument("--scope",    metavar="TEXT", default="",
@@ -2632,7 +2688,7 @@ class ADData:
             "msPKI-Enrollment-Flag","msPKI-RA-Signature",
             "pKIExtendedKeyUsage","nTSecurityDescriptor",
             "msPKI-Private-Key-Flag","msPKI-Template-Schema-Version",
-            "msPKI-Cert-Template-OID","flags"])
+            "msPKI-Cert-Template-OID","msPKI-Certificate-Policy","flags"])
         self.enrollment_svcs = self.conn.paged_search(
             f"CN=Enrollment Services,{pks_base}",
             "(objectClass=pKIEnrollmentService)", [
@@ -3541,6 +3597,8 @@ class CheckEngine:
                           [host])
 
         published = getattr(self.d, "_published_templates", set())
+        # ESC13: map issuance-policy OID -> linked group DN (msDS-OIDToGroupLink)
+        oid_group = self._oid_to_group_map()
 
         for tmpl in self.d.cert_templates:
             cn         = get_str(tmpl["attrs"], "cn")
@@ -3548,6 +3606,8 @@ class CheckEngine:
             enroll_flag= get_int(tmpl["attrs"], "msPKI-Enrollment-Flag")
             ra_sig     = get_int(tmpl["attrs"], "msPKI-RA-Signature")
             ekus       = get_list(tmpl["attrs"], "pKIExtendedKeyUsage")
+            schema_ver = get_int(tmpl["attrs"], "msPKI-Template-Schema-Version")
+            policies   = get_list(tmpl["attrs"], "msPKI-Certificate-Policy")
 
             # Only check templates published to at least one CA
             if published and cn not in published:
@@ -3629,6 +3689,36 @@ class CheckEngine:
                           f"to a victim's userPrincipalName this allows authenticating as them.{enroll_note}",
                           [cn])
 
+            # ESC15 (CVE-2024-49019): schema V1 + enrollee-supplied subject, no
+            # approval — a low-priv requester can inject arbitrary application
+            # policies (e.g. Client Authentication) that the V1 template doesn't
+            # constrain, and authenticate as any user.
+            if (schema_ver == 1 and (name_flag & self._CT_ENROLLEE_SUPPLIES_SUBJECT)
+                    and not manager_approval and enroll_reachable):
+                self._add("A-CertTemplateESC15",
+                          f"ESC15: schema V1 template '{cn}' allows enrollee-supplied subject "
+                          f"with no manager approval, so the requester can inject application "
+                          f"policies (e.g. Client Authentication) the V1 template does not "
+                          f"enforce — authenticate as any user.{enroll_note} "
+                          "certipy req -template "
+                          f"{cn} -application-policies 'Client Authentication' -upn administrator@domain",
+                          [cn])
+
+            # ESC13: an issuance policy on this template is linked to a privileged
+            # group (msDS-OIDToGroupLink). Enrolling grants that group membership.
+            for pol in policies:
+                glink = oid_group.get(pol)
+                if not (glink and enroll_reachable):
+                    continue
+                gname = dn_base(glink)
+                if self._group_is_privileged(glink):
+                    self._add("A-CertTemplateESC13",
+                              f"ESC13: template '{cn}' carries issuance policy {pol} linked to "
+                              f"privileged group '{gname}' (msDS-OIDToGroupLink). A low-priv "
+                              f"enroller obtains a certificate that grants '{gname}' membership "
+                              f"at authentication.{enroll_note} certipy req -template {cn}.",
+                              [f"{cn} -> {gname}"])
+
         # ESC7: low-privileged principal holds CA management rights
         for svc in self.d.enrollment_svcs:
             writers = self._esc7_ca_managers(svc)
@@ -3639,6 +3729,17 @@ class CheckEngine:
                           "flip EDITF_ATTRIBUTESUBJECTALTNAME2 (→ESC6) or approve their own "
                           "request to mint a DA certificate. certipy ca -add-officer / -enable-template.",
                           [f"{get_str(svc['attrs'],'cn')}: {p}" for p in writers])
+
+            # ESC5: object-takeover ACL on the CA AD object by a broad principal
+            esc5 = self._esc5_ca_object_writers(svc)
+            if esc5:
+                ca = get_str(svc['attrs'], 'cn')
+                self._add("A-CertTemplateESC5",
+                          f"ESC5: CA object '{ca}' is writable (GenericAll/GenericWrite/WriteDacl/"
+                          f"WriteOwner — object takeover) by: {', '.join(esc5)}. They can publish "
+                          "or enable a vulnerable template, add a CA officer, or flip dangerous CA "
+                          "flags, then mint a Domain Admin certificate. certipy find -vulnerable.",
+                          [f"{ca}: {p}" for p in esc5])
 
     # Access-mask bits that let a principal rewrite a template into ESC1.
     _ADS_GENERIC_ALL   = 0x10000000
@@ -3788,6 +3889,64 @@ class CheckEngine:
                 if guid in self._ENROLL_GUIDS:
                     out.append(broad[sidstr])
         return _dedup_keep_order(out), True
+
+    def _oid_to_group_map(self) -> Dict[str, str]:
+        """ESC13 support: issuance-policy OID -> linked group DN (msDS-OIDToGroupLink)."""
+        out: Dict[str, str] = {}
+        cfg = getattr(self.d, "cfg", "") or ""
+        if not cfg:
+            return out
+        try:
+            oids = self.d.conn.paged_search(
+                f"CN=OID,CN=Public Key Services,CN=Services,{cfg}",
+                "(objectClass=msPKI-Enterprise-Oid)",
+                ["msPKI-Cert-Template-OID", "msDS-OIDToGroupLink", "displayName"])
+        except Exception:
+            return out
+        for o in oids or []:
+            link = get_str(o["attrs"], "msDS-OIDToGroupLink")
+            toid = get_str(o["attrs"], "msPKI-Cert-Template-OID")
+            if link and toid:
+                out[toid] = link
+        return out
+
+    def _group_is_privileged(self, group_dn: str) -> bool:
+        """True only if a DN names a Tier-0-relevant privileged group (for ESC13
+        triage). Restricted to PRIV_GROUPS_SENSITIVE — the broader
+        priv_group_members set includes protection/operator groups that would
+        produce CRITICAL false positives for an issuance-policy link."""
+        return dn_base(group_dn).lower() in {g.lower() for g in self.PRIV_GROUPS_SENSITIVE}
+
+    def _esc5_ca_object_writers(self, svc: Dict) -> List[str]:
+        """ESC5: broad principals with object-takeover rights on the CA AD object."""
+        if not HAS_IMPACKET_LDAP:
+            return []
+        raw = svc["attrs"].get("nTSecurityDescriptor")
+        if isinstance(raw, list):
+            raw = raw[0] if raw else None
+        if not isinstance(raw, (bytes, bytearray)):
+            return []
+        try:
+            sd = _ldaptypes.SR_SECURITY_DESCRIPTOR(data=raw)
+        except Exception:
+            return []
+        broad = self._broad_low_priv_sids()
+        takeover = (self._ADS_GENERIC_ALL | self._ADS_GENERIC_WRITE
+                    | self._ADS_WRITE_DACL | self._ADS_WRITE_OWNER)
+        out: List[str] = []
+        dacl = sd["Dacl"]
+        if not dacl:
+            return []
+        for ace in dacl["Data"]:
+            try:
+                if ace["AceType"] not in (0x00, 0x05):
+                    continue
+                mask = int(ace["Ace"]["Mask"]["Mask"]); sidstr = ace["Ace"]["Sid"].formatCanonical()
+            except Exception:
+                continue
+            if sidstr in broad and (mask & takeover):
+                out.append(broad[sidstr])
+        return _dedup_keep_order(out)
 
     def _a_member_everyone(self):
         everyone_patterns = ["everyone","s-1-1-0","authenticated users",
@@ -6394,6 +6553,7 @@ EXPOSURE_WEIGHTS = {
     "S-DesEnabled":45, "A-NullSession":40, "P-AdminCountOrphan":35,
     "A-SCCM":72, "A-Pre2kComputer":78, "A-WeakLockout":40, "S-OS-NT":78,
     "A-CertCAManageLowPriv":88, "A-CertTemplateESC9":80,
+    "A-CertTemplateESC5":88, "A-CertTemplateESC13":84, "A-CertTemplateESC15":84,
     "P-ControlPathDA":92, "P-ControlPathIndirectEveryone":95, "P-ControlPathIndirectMany":70,
     "A-SCCMContainerACL":75, "P-GMSAReadable":88, "A-KDSRootKey":90,
     "A-AADConnectSync":70, "A-SeamlessSSO":60,
@@ -6578,7 +6738,7 @@ RULE_EFFORT = {
     "A-LAPS-Not-Installed":"High","A-LocalAdminPassword":"High","P-UnconstrainedDelegation":"High",
     "S-OS-XP":"High","S-OS-Vista":"High","S-OS-NT":"High","S-SMB-v1":"High","P-AdminNum":"High",
     "P-ProtectedUsers":"High","A-Krbtgt":"High","S-FunctionalLevel1":"High","S-FunctionalLevel3":"High",
-    "P-ComputerInPrivGroup":"High","P-ServiceDomainAdmin":"High",
+    "P-ComputerInPrivGroup":"High","P-ServiceDomainAdmin":"High","A-CertTemplateESC5":"High",
 }
 EFFORT_ORDER = {"Low":0, "Moderate":1, "High":2}
 EFFORT_COLOR = {"Low":"#74934a", "Moderate":"#cda52b", "High":"#cb7a2f"}
@@ -6613,7 +6773,8 @@ RULE_MITIGATION = {
     "A-CertTempCustomSubject":["M1015","M1026"], "A-CertTemplateESC4":["M1015","M1026"],
     "A-CertTempAgent":["M1015","M1026"], "A-CertTempAnyPurpose":["M1015","M1026"],
     "A-CertEnrollHttp":["M1037","M1035"], "A-CertCAManageLowPriv":["M1026","M1015"],
-    "A-CertTemplateESC9":["M1015","M1041"],
+    "A-CertTemplateESC9":["M1015","M1041"], "A-CertTemplateESC5":["M1015","M1026"],
+    "A-CertTemplateESC13":["M1015","M1026"], "A-CertTemplateESC15":["M1015","M1026"],
     "P-UnconstrainedDelegation":["M1015","M1026"], "P-RBCD-Dangerous":["M1015","M1026"],
     "P-RBCD":["M1015","M1018"], "P-ConstrainedDelegService":["M1015","M1026"],
     "P-DelegationDCt2a4d":["M1015","M1026"], "P-DelegationDCa2d2":["M1015","M1026"],
@@ -6656,12 +6817,82 @@ MITIGATION_NAME = {
     "M1047":"Audit", "M1051":"Update Software",
 }
 
+# DISA STIG control-area references (per rule). These are *control areas* in the
+# relevant STIG (Windows Server / AD Domain / Defender), not version-pinned V-IDs
+# — exact V-numbers shift every quarterly STIG release, so we point at the control
+# rather than fabricate an ID. Curated for the high-signal rules.
+RULE_STIG = {
+    "A-LMCompatibilityLevel": "Win STIG: NTLMv2 only (refuse LM & NTLM)",
+    "A-LMHashAuthorized": "Win STIG: do not store LM hash",
+    "A-WDigest": "Win STIG: WDigest UseLogonCredential disabled",
+    "A-LLMNR": "Win STIG: multicast name resolution (LLMNR) disabled",
+    "A-NBTNSDisabled": "Win STIG: NetBIOS-over-TCP disabled",
+    "A-Guest": "Win STIG: built-in Guest account disabled",
+    "A-SMB2SignatureNotRequired": "Win STIG: SMB server packet signing required",
+    "A-SMB2SignatureNotEnabled": "Win STIG: SMB server packet signing enabled",
+    "A-DCLdapSign": "Win STIG: LDAP server signing required",
+    "A-DCLdapsChannelBinding": "Win STIG: LDAP channel binding required",
+    "A-MinPwdLen": "Win STIG: minimum password length >= 14",
+    "A-PwdComplexity": "Win STIG: password complexity enabled",
+    "A-PwdHistory": "Win STIG: password history >= 24",
+    "A-WeakLockout": "Win STIG: account lockout threshold configured",
+    "A-ReversiblePwd": "Win STIG: reversible encryption disabled",
+    "S-Reversible": "Win STIG: reversible encryption disabled",
+    "A-RestrictRemoteSAM": "Win STIG: RestrictRemoteSAM (anonymous SAM) enforced",
+    "A-NullSession": "AD Domain STIG: anonymous LDAP access restricted",
+    "A-Krbtgt": "AD Domain STIG: KRBTGT password rotation",
+    "A-LAPS-Not-Installed": "Win STIG: local admin password managed (LAPS)",
+    "A-LocalAdminPassword": "Win STIG: local admin password managed (LAPS)",
+    "S-NoPreAuth": "AD STIG: Kerberos pre-authentication required",
+    "S-NoPreAuthAdmin": "AD STIG: Kerberos pre-authentication required",
+    "S-PwdNeverExpires": "Win STIG: passwords must expire",
+    "S-PwdNotRequired": "Win STIG: password required on all accounts",
+    "P-MachineAccountQuota": "AD Domain STIG: ms-DS-MachineAccountQuota = 0",
+    "S-SMB-v1": "Win STIG: SMBv1 removed/disabled",
+    "S-OS-XP": "Win STIG: unsupported OS removed",
+    "S-OS-Vista": "Win STIG: unsupported OS removed",
+    "S-OS-NT": "Win STIG: unsupported OS removed",
+    "P-ProtectedUsers": "AD STIG: privileged accounts in Protected Users",
+}
+
+# Copy-able PowerShell / ADUC remediation, one entry per rule. {domain} / {dc}
+# are substituted with the assessed environment at render time. Kept accurate and
+# minimal — destructive/bulk operations are scoped with -WhatIf guidance in docs.
+RULE_POWERSHELL = {
+    "A-LMCompatibilityLevel": ["Set-ItemProperty 'HKLM:\\System\\CurrentControlSet\\Control\\Lsa' -Name LmCompatibilityLevel -Value 5"],
+    "A-WDigest": ["Set-ItemProperty 'HKLM:\\System\\CurrentControlSet\\Control\\SecurityProviders\\WDigest' -Name UseLogonCredential -Value 0"],
+    "A-LLMNR": ["New-ItemProperty 'HKLM:\\Software\\Policies\\Microsoft\\Windows NT\\DNSClient' -Name EnableMulticast -Value 0 -PropertyType DWord -Force"],
+    "A-Guest": ["Disable-ADAccount -Identity Guest -Server {domain}"],
+    "A-SMB2SignatureNotRequired": ["Set-SmbServerConfiguration -RequireSecuritySignature $true -Force   # apply via DC GPO"],
+    "S-NoPreAuth": ["Get-ADUser -Filter 'useraccountcontrol -band 4194304' -Server {domain} | Set-ADAccountControl -DoesNotRequirePreAuth $false"],
+    "S-NoPreAuthAdmin": ["Get-ADUser -Filter 'useraccountcontrol -band 4194304' -Server {domain} | Set-ADAccountControl -DoesNotRequirePreAuth $false"],
+    "S-Kerberoastable": ["Set-ADUser <svcaccount> -KerberosEncryptionType AES128,AES256 -Server {domain}   # kill RC4; prefer migrating to a gMSA"],
+    "S-KerberoastableAdmin": ["# Remove the SPN or migrate to a gMSA; never run services as a Domain Admin",
+                              "Get-ADUser <svcaccount> -Server {domain} -Properties servicePrincipalName"],
+    "S-PwdNeverExpires": ["Get-ADUser -Filter 'PasswordNeverExpires -eq $true -and Enabled -eq $true' -Server {domain} | Set-ADUser -PasswordNeverExpires $false"],
+    "S-PwdNotRequired": ["Get-ADUser -Filter 'useraccountcontrol -band 32' -Server {domain} | Set-ADAccountControl -PasswordNotRequired $false"],
+    "A-ReversiblePwd": ["Get-ADUser -Filter 'useraccountcontrol -band 128' -Server {domain} | Set-ADAccountControl -AllowReversiblePasswordEncryption $false"],
+    "S-Reversible": ["Get-ADUser -Filter 'useraccountcontrol -band 128' -Server {domain} | Set-ADAccountControl -AllowReversiblePasswordEncryption $false"],
+    "P-MachineAccountQuota": ["Set-ADDomain -Identity {domain} -Replace @{'ms-DS-MachineAccountQuota'='0'}"],
+    "A-WeakLockout": ["Set-ADDefaultDomainPasswordPolicy -Identity {domain} -LockoutThreshold 10 -LockoutDuration 00:15:00 -LockoutObservationWindow 00:15:00"],
+    "A-MinPwdLen": ["Set-ADDefaultDomainPasswordPolicy -Identity {domain} -MinPasswordLength 14"],
+    "A-PwdComplexity": ["Set-ADDefaultDomainPasswordPolicy -Identity {domain} -ComplexityEnabled $true"],
+    "A-LAPS-Not-Installed": ["Update-LapsADSchema -Confirm:$false",
+                             "Set-LapsADComputerSelfPermission -Identity 'OU=Computers,DC=...'"],
+    "P-ProtectedUsers": ["Add-ADGroupMember -Identity 'Protected Users' -Members (Get-ADGroupMember 'Domain Admins' -Server {domain})"],
+    "A-ProtectedUsers": ["Add-ADGroupMember -Identity 'Protected Users' -Members (Get-ADGroupMember 'Domain Admins' -Server {domain})"],
+    "A-Krbtgt": ["# Microsoft New-KrbtgtKeys.ps1 — reset twice, ~24h apart, to invalidate cached tickets"],
+    "P-AdminPwdTooOld": ["Get-ADUser <admin> -Server {domain} | Set-ADAccountPassword -Reset"],
+}
+
 def rule_compliance(rule_id: str, opcat: str) -> Dict[str, List[str]]:
     """Framework mappings for a rule: CIS Controls v8 + NIST CSF (by operational
-    category) and MITRE ATT&CK Mitigations (per rule)."""
+    category), MITRE ATT&CK Mitigations and DISA STIG control areas (per rule)."""
     base = OPCAT_COMPLIANCE.get(opcat, {})
+    stig = RULE_STIG.get(rule_id)
     return {"cis": list(base.get("cis", [])), "nist": list(base.get("nist", [])),
-            "mitigation": list(RULE_MITIGATION.get(rule_id, []))}
+            "mitigation": list(RULE_MITIGATION.get(rule_id, [])),
+            "stig": [stig] if stig else []}
 
 # Plain, non-condensed system fonts — a condensed display face made headings look
 # vertically stretched. Used both in CSS and (literally) inside SVG <text>.
@@ -7169,7 +7400,7 @@ class HTMLReporter:
     _SEV_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
 
     def __init__(self, domain, dc_ip, findings, scores, data,
-                 auth_mode="", prepared_by="", scope=""):
+                 auth_mode="", prepared_by="", scope="", changes=None):
         self.domain   = domain
         self.dc_ip    = dc_ip
         self.findings = findings
@@ -7193,6 +7424,10 @@ class HTMLReporter:
                     self._obj_index.setdefault(sam.lower(), o)
         except Exception:
             self._obj_index = {}
+        # baseline diff (trends): per-rule first_seen + set of newly-appeared rules
+        self.changes = changes
+        self._first_seen = (changes or {}).get("first_seen", {}) or {}
+        self._new_rules = {n["rule_id"] for n in (changes or {}).get("new", [])}
 
     # ── helpers ───────────────────────────────────────────────────────────────
     def _e(self, s):
@@ -7242,9 +7477,11 @@ class HTMLReporter:
             '</header>')
 
     def _nav(self):
-        items = [("summary","Summary",""),("priorities","Priorities",""),
-                 ("paths","Attack Paths",""),("priv","Privileged",""),
-                 ("findings","Findings",str(len(self.findings)))]
+        items = [("summary","Summary",""),("priorities","Priorities","")]
+        if self.changes:
+            items.append(("changes","Changes",""))
+        items += [("paths","Attack Paths",""),("priv","Privileged",""),
+                  ("findings","Findings",str(len(self.findings)))]
         links = ""
         for sid, name, badge in items:
             b = f'<span class="kc-navb">{badge}</span>' if badge else ""
@@ -7538,6 +7775,53 @@ class HTMLReporter:
                 '— low remediation effort, high payoff</span></div>'
                 f'{qw_html}</div>'
                 '</div></section>')
+
+    # ── changes since last scan (--baseline) ──────────────────────────────────
+    def _changes_section(self):
+        c = self.changes
+        if not c:
+            return ""
+        def lst(items, linked):
+            if not items:
+                return '<li class="kc-prio-empty" style="border:none;padding:6px 0">None.</li>'
+            out = ""
+            for it in items[:20]:
+                rid = it.get("rule_id", ""); col = SEV_COLOR.get(it.get("severity", ""), "#8a8f78")
+                title = self._e(it.get("title", rid))
+                extra = (f' <span class="kc-xlabel">{it["from"]}→{it["to"]} affected</span>'
+                         if "from" in it and "to" in it else "")
+                if linked and rid in self.by_rule:
+                    body = (f'<a href="#f-{self._e(rid)}" '
+                            f'onclick="kcJump(\'f-{self._e(rid)}\');return false">{title}</a>')
+                else:
+                    body = title
+                out += (f'<li><span class="kc-qw-dot" style="background:{col}"></span>'
+                        f'<span class="kc-qw-t">{body}{extra}</span></li>')
+            if len(items) > 20:
+                out += f'<li class="kc-aff-more">… and {len(items)-20} more</li>'
+            return out
+        stats = (
+            '<div class="kc-paths-tag">'
+            f'<div class="kc-pstat"><b style="color:var(--high)">+{len(c["new"])}</b><span>new</span></div>'
+            f'<div class="kc-pstat"><b style="color:var(--ok)">−{len(c["fixed"])}</b><span>fixed</span></div>'
+            f'<div class="kc-pstat"><b style="color:var(--med)">~{len(c["modified"])}</b><span>modified</span></div>'
+            f'<div class="kc-pstat"><b>{len(c["unchanged"])}</b><span>unchanged</span></div>'
+            '</div>')
+        cols = (
+            '<div class="kc-prio-grid">'
+            '<div><div class="kc-sub-h">New since last scan</div>'
+            f'<ul class="kc-qw">{lst(c["new"], True)}</ul></div>'
+            '<div><div class="kc-sub-h">Fixed / remediated</div>'
+            f'<ul class="kc-qw">{lst(c["fixed"], False)}</ul></div>'
+            '</div>')
+        modified = ""
+        if c["modified"]:
+            modified = ('<div class="kc-sub-h">Modified — affected count changed</div>'
+                        f'<ul class="kc-qw">{lst(c["modified"], True)}</ul>')
+        return ('<section class="kc-section" id="sec-changes">'
+                '<h2 class="kc-h2">Changes since last scan'
+                f'<span class="tag">baseline {self._e(c["baseline_date"])}</span></h2>'
+                f'{stats}{cols}{modified}</section>')
 
     # ── Paths to Domain Dominance (control-path chains) ───────────────────────
     def _node(self, label, kind="", icon=""):
@@ -8010,6 +8294,9 @@ class HTMLReporter:
         if comp["nist"]:
             chips = "".join(f'<span class="kc-fwchip">{self._e(c)}</span>' for c in comp["nist"])
             groups.append(f'<div class="kc-fwgrp"><span class="kc-fwlbl">NIST CSF</span>{chips}</div>')
+        if comp.get("stig"):
+            chips = "".join(f'<span class="kc-fwchip">{self._e(c)}</span>' for c in comp["stig"])
+            groups.append(f'<div class="kc-fwgrp"><span class="kc-fwlbl">STIG</span>{chips}</div>')
         if not groups:
             return ""
         return ('<div class="kc-block"><div class="kc-bh">Frameworks</div>'
@@ -8059,6 +8346,16 @@ class HTMLReporter:
         if doc.get("remediation"):
             items = "".join(f'<li>{self._e(x)}</li>' for x in doc["remediation"])
             parts.append(f'<div class="kc-block kc-fix"><div class="kc-bh">Remediation</div><ul class="kc-fixlist">{items}</ul></div>')
+        # copy-able PowerShell remediation, substituted for this environment
+        ps = RULE_POWERSHELL.get(f.rule_id)
+        if ps:
+            sub = lambda s: s.replace("{domain}", self.domain or "<domain>").replace("{dc}", self.dc_ip or "<dc>")
+            items = "".join(f'<li><code>{self._e(sub(x))}</code>'
+                            f'<button class="kc-copy" onclick="kcCopy(this)">copy</button></li>' for x in ps)
+            parts.append('<div class="kc-block kc-fix"><div class="kc-bh">Remediation — PowerShell '
+                         '<span style="color:var(--faint);text-transform:none;letter-spacing:0">'
+                         '(test with -WhatIf first)</span></div>'
+                         f'<ul class="kc-cmd">{items}</ul></div>')
         # 5) framework mappings (ATT&CK / Mitigations / CIS / NIST)
         fw = self._frameworks_block(f)
         if fw:
@@ -8068,6 +8365,9 @@ class HTMLReporter:
         meta = (f'<span class="kc-mini">{self._e(f.rule_id)}</span>'
                 f'<span class="kc-mini">{self._e(self._opcat(f))}</span> '
                 f'{self._effort_badge(f.rule_id)}')
+        fs = self._first_seen.get(f.rule_id)
+        if fs:
+            meta += f' <span class="kc-mini">first seen {self._e(str(fs)[:10])}</span>'
         if refs:
             meta += "".join(f' <a href="{self._e(u)}" target="_blank" rel="noopener" style="font-size:11px">ref↗</a>' for u in refs)
         parts.append(f'<div class="kc-block" style="border-top:1px solid var(--border);padding-top:8px">{meta}</div>')
@@ -8086,6 +8386,9 @@ class HTMLReporter:
             anchor = f"f-{f.rule_id}" if f.rule_id not in seen_rid else f"f-{f.rule_id}-{i}"
             seen_rid.add(f.rule_id)
             eff = rule_effort(f.rule_id); ecol = EFFORT_COLOR.get(eff, "var(--muted)")
+            # Precompute (single-quoted attr) — a backslash inside an f-string
+            # expression only parses on Python 3.12+, and SCOUT supports 3.9+.
+            new_badge = " <span class='kc-navb'>new</span>" if f.rule_id in self._new_rules else ""
             rows.append(
                 f'<tr class="kc-frow" id="{self._e(anchor)}" data-i="{i}" data-sev="{f.severity}" '
                 f'data-cat="{self._e(oc)}" onclick="kcTog({i})" tabindex="0" role="button" '
@@ -8093,7 +8396,7 @@ class HTMLReporter:
                 f'<td><span id="ic-{i}" class="kc-toggle">+</span></td>'
                 f'<td><span class="kc-sev-pill" style="background:{f.sev_color}">{self._e(f.severity)}</span></td>'
                 f'<td><span class="kc-cat-pill" style="background:{oc_col}">{self._e(oc)}</span></td>'
-                f'<td><code>{self._e(f.rule_id)}</code></td><td><strong>{self._e(f.title)}</strong></td>'
+                f'<td><code>{self._e(f.rule_id)}</code></td><td><strong>{self._e(f.title)}</strong>{new_badge}</td>'
                 f'<td><span class="kc-effort" style="--e:{ecol}">{self._e(eff)}</span></td>'
                 f'<td class="kc-num">{f.points}</td></tr>'
                 f'<tr class="kc-drow" id="dr-{i}" style="display:none"><td></td>'
@@ -8190,8 +8493,9 @@ class HTMLReporter:
                   '<button class="kc-dw-x" onclick="kcCloseDrawer()" title="Close">✕</button></div>'
                   '<div class="kc-dw-b" id="kc-dw-body"></div></aside>')
         body = (self._head() + self._nav() + '<main class="kc-container">' +
-                self._summary_section() + self._priorities_section() + self._paths_section() +
-                self._privileged_section() + self._findings_section() + '</main>' + drawer +
+                self._summary_section() + self._priorities_section() + self._changes_section() +
+                self._paths_section() + self._privileged_section() + self._findings_section() +
+                '</main>' + drawer +
                 f'<footer class="kc-footer">{TOOL_NAME} v{VERSION} — authorized security assessment use only · '
                 f'generated {self._e(self.ts)}</footer>'
                 '<button class="kc-top" onclick="kcJump(\'top\')" title="Back to top">↑</button>')
@@ -8210,6 +8514,60 @@ class HTMLReporter:
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
+
+def diff_baseline(findings, baseline_path, now_iso):
+    """Diff current findings against a prior SCOUT JSON (--baseline). Returns a
+    changes dict (new / fixed / unchanged / modified + per-rule first_seen),
+    or None if the baseline can't be read. Identity is rule_id; a rule present in
+    both scans with a changed affected-set is 'modified'. first_seen propagates
+    across runs (each --json carries it), so it survives many scans."""
+    try:
+        with open(baseline_path, encoding="utf-8") as bf:
+            base = json.load(bf)
+    except Exception as e:
+        print(f"[!] --baseline: could not read {baseline_path}: {e}")
+        return None
+    if not isinstance(base, dict):
+        print(f"[!] --baseline: {baseline_path} is not a SCOUT JSON report")
+        return None
+    base_ts = base.get("timestamp") or now_iso
+    # Aggregate by rule_id, unioning the affected set across every finding that
+    # shares a rule_id (a rule can emit more than one Finding), so set-equality
+    # and the from→to counts compare the whole rule, not just its first finding.
+    cur = {}
+    for f in findings:
+        e = cur.setdefault(f.rule_id, {"title": f.title, "severity": f.severity, "affected": set()})
+        e["affected"].update(f.affected or [])
+    base_r = {}
+    for b in (base.get("findings") or []):
+        if not (isinstance(b, dict) and b.get("rule_id")):
+            continue
+        rid = b["rule_id"]
+        e = base_r.setdefault(rid, {"title": b.get("title", rid),
+                                    "severity": b.get("severity", ""),
+                                    "affected": set(), "first_seen": b.get("first_seen")})
+        e["affected"].update(b.get("affected") or [])
+        e["first_seen"] = e.get("first_seen") or b.get("first_seen")
+    new, fixed, unchanged, modified, first_seen = [], [], [], [], {}
+    for rid, c in cur.items():
+        b = base_r.get(rid)
+        if b is not None:
+            first_seen[rid] = b.get("first_seen") or base_ts
+            if c["affected"] == b["affected"]:
+                unchanged.append(rid)
+            else:
+                modified.append({"rule_id": rid, "title": c["title"], "severity": c["severity"],
+                                 "from": len(b["affected"]), "to": len(c["affected"])})
+        else:
+            first_seen[rid] = now_iso
+            new.append({"rule_id": rid, "title": c["title"], "severity": c["severity"]})
+    for rid, b in base_r.items():
+        if rid not in cur:
+            fixed.append({"rule_id": rid, "title": b["title"], "severity": b["severity"]})
+    return {"baseline_date": (base_ts or "")[:10],
+            "new": new, "fixed": fixed, "unchanged": unchanged, "modified": modified,
+            "first_seen": first_seen}
+
 
 def main():
     parser = build_parser()
@@ -8322,6 +8680,10 @@ def main():
     scorer = RiskScorer(findings, data)
     scores = scorer.score()
 
+    # ── baseline diff (trends / change tracking) ───────────────────────────────
+    now_iso = datetime.datetime.now().isoformat()
+    changes = diff_baseline(findings, args.baseline, now_iso) if args.baseline else None
+
     # ── print summary ─────────────────────────────────────────────────────────
     sevc = defaultdict(int)
     for f in findings:
@@ -8335,6 +8697,10 @@ def main():
     print(f"  Findings : {len(findings)}  "
           f"(CRIT {sevc['CRITICAL']} · HIGH {sevc['HIGH']} · "
           f"MED {sevc['MEDIUM']} · LOW {sevc['LOW']})")
+    if changes:
+        print(f"  Changes  : +{len(changes['new'])} new · -{len(changes['fixed'])} fixed · "
+              f"~{len(changes['modified'])} modified · {len(changes['unchanged'])} unchanged "
+              f"(baseline {changes['baseline_date']})")
     print(f"{'='*60}")
 
     sev_order = {"CRITICAL":0,"HIGH":1,"MEDIUM":2,"LOW":3,"INFO":4}
@@ -8359,7 +8725,7 @@ def main():
 
     reporter = HTMLReporter(args.domain, args.dc_ip, findings, scores, data,
                             auth_mode=auth_mode, prepared_by=args.operator,
-                            scope=args.scope)
+                            scope=args.scope, changes=changes)
     html_out = reporter.render()
     with open(args.output, "w", encoding="utf-8") as fh:
         fh.write(html_out)
@@ -8368,19 +8734,23 @@ def main():
     # ── JSON output ───────────────────────────────────────────────────────────
     if args.json:
         jpath = args.json if args.json != "__AUTO__" else f"scout_{args.domain}.json"
+        fs_map = changes["first_seen"] if changes else {}
         jdata = {
             "tool": TOOL_NAME, "version": VERSION,
             "domain": args.domain, "dc_ip": args.dc_ip, "auth_mode": auth_mode,
-            "timestamp": datetime.datetime.now().isoformat(),
+            "timestamp": now_iso,
             "scores": {k: scores[k] for k in ("posture","grade","grade_word","exposure","hygiene","verdict","cat_counts") if k in scores},
             "findings": [
                 {"rule_id": f.rule_id, "title": f.title,
                  "category": f.category, "operation": op_category(f.rule_id, f.category),
                  "severity": f.severity, "points": f.points, "mitre": f.mitre,
-                 "details": f.details, "affected": f.affected}
+                 "details": f.details, "affected": f.affected,
+                 "first_seen": fs_map.get(f.rule_id, now_iso)}
                 for f in sorted_findings
             ]
         }
+        if changes:
+            jdata["changes"] = {k: changes[k] for k in ("baseline_date","new","fixed","modified","unchanged")}
         with open(jpath, "w", encoding="utf-8") as jf:
             json.dump(jdata, jf, indent=2)
         print(f"[+] JSON findings saved: {jpath}")

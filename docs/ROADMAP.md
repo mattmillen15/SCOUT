@@ -29,7 +29,7 @@ Status legend: **[done]** shipped in this pass · **[partial]** some of it ships
 | Insight Recon                                                            | SCOUT status | Notes |
 |--------------------------------------------------------------------------|--------------|-------|
 | 135+ checks                                                              | **[done]**   | SCOUT ships **212** rules across A/P/S/T. |
-| ESC1–16 (ADCS): vulnerable templates, enrollment rights, EDITF_ATTRIBUTESUBJECTALTNAME, enrollment-agent abuse, weak DC cert mappings, CA access-control gaps | **[partial]** | Have ESC1/2/3/4/7/8/9 + key strength. **ESC5/6/10/11/13–16 planned** — several (ESC6/10/11) are CA/DC registry settings not exposed over read-only LDAP; we will add the LDAP-confirmable ones (ESC5 object-ACL, ESC13 issuance-policy→group, ESC15 schema-v1 EKU). |
+| ESC1–16 (ADCS): vulnerable templates, enrollment rights, EDITF_ATTRIBUTESUBJECTALTNAME, enrollment-agent abuse, weak DC cert mappings, CA access-control gaps | **[partial]** | Have ESC1/2/3/4/**5**/7/8/9/**13**/**15** + key strength. ESC6/10/11 are CA/DC registry settings not exposed over read-only LDAP (out of scope). ESC14/16 remain planned. |
 | AAA: Kerberoast, AS-REP, NTLMv1/LM, RC4/DES, reversible pwds, no-password accts, weak cert mappings | **[done]** | All covered. |
 | PAM: DCSync, AdminSDHolder, dangerous ACLs, unconstrained/constrained/RBCD, shadow credentials, SID history, stale admins | **[partial]** | All covered **except shadow credentials (msDS-KeyCredentialLink / Whisker)** — **[planned]**. |
 | DSI: LAPS coverage, gMSA exposure, DC backups, SMB signing, LDAP signing, Spooler on DC, legacy OS on DC, SMBv1 | **[done]** | Covered. ("DC backups" surfaced via metadata; refine [planned].) |
@@ -43,9 +43,9 @@ Status legend: **[done]** shipped in this pass · **[partial]** some of it ships
 | "**Recommendation**" + remediation guide link                            | **[done]**   | Existing `remediation` block + `refs`. |
 | Affected-items **table**: Account / Display Name / Enabled / Created / Last Logon / Password Set | **[done]** | New rich affected-object table (resolves sAMAccountName → object) replacing the flat evidence list for account/computer findings. |
 | "**Export CSV**" on the affected-items table                             | **[done]**   | Inline per-table CSV export button (client-side). Global `--csv`/`--json` already existed. |
-| "**First Seen**: Jun 15, 2026" per finding                               | **[planned]**| Needs baseline/history (see §6). |
-| Compliance mapping: **MITRE ATT&CK**, **MITRE Mitigations**, **CIS Controls**, **STIG** | **[partial]** | ATT&CK techniques already mapped; added **MITRE Mitigations + CIS Controls v8 + NIST CSF** chips. **STIG V-ID** mapping **[planned]** (deferred rather than fabricate IDs offline). |
-| "PowerShell and ADUC fix steps written for your environment"             | **[partial]**| Remediation steps exist; enriching with copy-able, environment-substituted PowerShell/`ADUC` snippets **[planned]**. |
+| "**First Seen**: Jun 15, 2026" per finding                               | **[done]**   | `--baseline` propagates per-finding `first_seen` across scans; shown in the finding panel. |
+| Compliance mapping: **MITRE ATT&CK**, **MITRE Mitigations**, **CIS Controls**, **STIG** | **[done]** | ATT&CK + **MITRE Mitigations + CIS Controls v8 + NIST CSF + STIG** chips. STIG entries are *control-area references* (the relevant DISA STIG control), not version-pinned V-IDs, which shift every quarterly release. |
+| "PowerShell and ADUC fix steps written for your environment"             | **[done]**   | Copy-able **PowerShell remediation** block per finding, with `{domain}`/`{dc}` substituted to the assessed environment. |
 
 ## 4. Report structure & GUI — "their GUI looks better"
 
@@ -55,7 +55,7 @@ Status legend: **[done]** shipped in this pass · **[partial]** some of it ships
 | Executive **Overview** with score badge + severity breakdown             | **[done]**   | New hero band (grade + score + chips + meters + donut). |
 | **Priorities** section                                                   | **[done]**   | Added (Top Priorities + Quick Wins). Added to nav. |
 | **Detailed Findings** (filterable)                                       | **[done]**   | Existing filterable/searchable table; added Effort column + framework chips. |
-| **Trends & Changes**                                                     | **[planned]**| See §6. |
+| **Trends & Changes**                                                     | **[done]**   | `--baseline` diff renders a "Changes since last scan" section (New/Fixed/Modified/Unchanged + NEW badges). Risk-over-time sparkline still **[planned]** (§6.2). |
 | Configuration / Environment / Accounts & Groups / Infrastructure / PKI & Certificates / Group Policy sub-sections | **[partial]** | We have Inventory (env/config), Privileged (accounts & groups), Attack Paths, and cert-template inventory. **Dedicated PKI and GPO views [planned].** |
 | Visual polish (clean cards, ring/badge score, chips)                     | **[done]**   | Re-themed in SCOUT's field/army palette — same look, our colors. |
 | "Web report you can share … hand it to leadership or a client as is"     | **[done]**   | Single-file HTML, print-to-PDF. |
@@ -70,17 +70,19 @@ Status legend: **[done]** shipped in this pass · **[partial]** some of it ships
 | "On demand or on a schedule"                                             | **[planned]**| Scheduling is a host/cron concern; a `--baseline`-aware scheduled mode pairs with §6. |
 | Live **scan progress** indicator (per-stage % + counts)                  | **[planned]**| Improve terminal progress (per-stage status lines + object counts). |
 
-## 6. Trends & change tracking — "Prove you're actually getting better." **[planned this pass]**
+## 6. Trends & change tracking — "Prove you're actually getting better."
 
-Insight Recon: "Risk Posture Score over time", "New / Remediated / Modified / Unchanged", "Fixed since last scan". Plan:
+Insight Recon: "Risk Posture Score over time", "New / Remediated / Modified / Unchanged", "Fixed since last scan".
 
-1. **`--baseline prev.json`** — diff current findings against a prior SCOUT JSON;
-   compute **New / Fixed / Unchanged / Modified** (by rule_id + affected-set) and
-   render a "Changes since last scan" panel + **First Seen** per finding.
-2. **Scan history store** — append each run's `{ts, posture, exposure, hygiene,
-   sev_counts}` to a local `scout_history.json`; render a **risk-posture-over-time**
-   sparkline in the hero.
-3. **Per-finding lifecycle** — first_seen / last_seen / age, "remediated since".
+1. **[done] `--baseline prev.json`** — diffs current findings against a prior SCOUT
+   JSON; computes **New / Fixed / Unchanged / Modified** (by rule_id + affected-set),
+   renders a "Changes since last scan" section + nav entry + NEW badges, and
+   propagates **First Seen** per finding (carried in `--json`, survives many scans).
+2. **[planned] Scan history store** — append each run's `{ts, posture, exposure,
+   hygiene, sev_counts}` to a local `scout_history.json`; render a
+   **risk-posture-over-time** sparkline in the hero.
+3. **[partial] Per-finding lifecycle** — `first_seen` shipped; last_seen / age /
+   "remediated since" still to do.
 
 ## 7. Cloud / Entra — "A Microsoft 365 and Entra ID version is in the works"
 
@@ -90,7 +92,7 @@ Insight Recon: "Risk Posture Score over time", "New / Remediated / Modified / Un
 
 ---
 
-## Shipped in this pass (Insight-Recon parity v1)
+## Shipped — Insight-Recon parity v1
 
 - Posture **score (0–100) + A–F grade** hero, severity chips, contributing meters.
 - **Priorities** section: Top Priorities *ranked by exploitability* + **Quick Wins**.
@@ -99,13 +101,24 @@ Insight Recon: "Risk Posture Score over time", "New / Remediated / Modified / Un
 - **Framework mappings**: CIS Controls v8 + NIST CSF + MITRE Mitigations chips (alongside existing ATT&CK).
 - GUI re-polish in SCOUT's field/army theme to match Insight Recon's cleaner card/badge layout.
 
+## Shipped — parity v2 (roadmap follow-ups)
+
+- **Trends / `--baseline` diff**: "Changes since last scan" section (New/Fixed/Modified/Unchanged), NEW badges, per-finding **First Seen**.
+- **ADCS ESC5 / ESC13 / ESC15** detection (CA-object ACL, issuance-policy→privileged-group link, schema-V1 application-policy injection / CVE-2024-49019).
+- **STIG control-area references** added to the Frameworks chips.
+- **Per-finding PowerShell remediation**, substituted for the assessed environment.
+
 ## Next up (highest leverage first)
 
-1. **Trends & changes** (`--baseline` diff + First Seen) — §6.1.
-2. **Shadow credentials** (`msDS-KeyCredentialLink`) detection — §2 PAM gap.
-3. **ADCS ESC5/13/15** (LDAP-confirmable) — §2 ADCS gap.
-4. **STIG V-ID** mapping + environment-substituted **PowerShell** remediation — §3.
-5. **Dedicated PKI & Group Policy report sections** — §4.
-6. **Scan-progress UX** + scheduled/baseline mode — §5.
+1. **Risk-posture-over-time** sparkline + local scan-history store — §6.2.
+2. **Dedicated PKI & Group Policy report sections** — §4.
+3. **ESC14/16** + version-pinned **STIG V-IDs** against a chosen STIG release — §2/§3.
+4. **Scan-progress UX** + scheduled/baseline mode — §5.
+5. Per-finding **lifecycle** (last_seen / age / remediated-since) — §6.3.
+
+> Declined: a dedicated *shadow-credentials* (`msDS-KeyCredentialLink`) finding —
+> the escalation (write access to the attribute) is already a control-path / dangerous-ACL
+> edge; merely listing accounts that have a key credential set is informational (mostly
+> Windows Hello), so it isn't worth a standalone critical finding.
 </content>
 </invoke>
