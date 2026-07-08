@@ -82,6 +82,14 @@ except ImportError:
     except ImportError:
         HAS_PYCRYPTO = False
 
+try:
+    from cryptography.x509 import load_der_x509_certificate
+    from cryptography.hazmat.primitives.asymmetric import rsa as _rsa, dsa as _dsa
+    from cryptography.hazmat.primitives import hashes as _hashes
+    HAS_X509 = True
+except ImportError:
+    HAS_X509 = False
+
 VERSION = "2.0.0"
 TOOL_NAME = "SCOUT"
 TOOL_LONG = "Security Configuration Observation & Understanding Tool"
@@ -213,7 +221,7 @@ RULES: Dict[str, Tuple[str, str, int, str]] = {
     "P-UnconstrainedDelegation":("Unconstrained delegation on non-DC account","Privileged",100,"CRITICAL"),
     "P-UnkownDelegation":     ("Misconfigured or unknown delegation type","Privileged",25,"HIGH"),
     "P-DelegationDCt2a4d":    ("DC account trusted for protocol transition (T2A4D)","Privileged",50,"CRITICAL"),
-    "P-DelegationDCa2d2":     ("DC account A2D2 delegation","Privileged",50,"CRITICAL"),
+    "P-DelegationDCa2d2":     ("Constrained delegation to a Domain Controller service (→ DCSync)","Privileged",50,"CRITICAL"),
     "P-DelegationDCsourcedeleg":("DC source delegation misconfigured","Privileged",25,"HIGH"),
     "P-DelegationEveryone":   ("Everyone principal has delegation rights","Privileged",50,"CRITICAL"),
     "P-DelegationKeyAdmin":   ("Key Admin delegation misconfigured","Privileged",50,"CRITICAL"),
@@ -350,7 +358,7 @@ RULES: Dict[str, Tuple[str, str, int, str]] = {
     "A-SCCMContainerACL":     ("System Management (SCCM) container writable by a broad principal","Anomaly",40,"HIGH"),
     "A-SCCM":                 ("SCCM/MECM site infrastructure exposed (relay / NAA / PXE attack surface)","Anomaly",40,"HIGH"),
     "A-Pre2kComputer":        ("Pre-created (pre-Windows 2000) computer accounts with a predictable password","Anomaly",50,"HIGH"),
-    "A-WeakLockout":          ("No / weak account-lockout policy (password spraying viable)","Anomaly",25,"HIGH"),
+    "A-WeakLockout":          ("No / weak account-lockout policy (password spraying viable)","Anomaly",10,"MEDIUM"),
     # ── Added — managed-account / KDS / Entra / GPO-link coverage (roadmap) ────
     "P-GMSAReadable":         ("gMSA/dMSA managed password readable by a broad principal","Privileged",50,"CRITICAL"),
     "A-KDSRootKey":           ("KDS root key readable — offline gMSA password compromise (GoldenGMSA)","Anomaly",50,"CRITICAL"),
@@ -404,8 +412,12 @@ RULE_MATURITY: Dict[str, int] = {
     "P-DelegationEveryone":1, "P-DelegationKeyAdmin":1, "P-DelegationDCt2a4d":1,
     "P-DelegationDCa2d2":1, "P-DangerousExtendedRight":1, "P-ControlPathIndirectEveryone":1,
     "P-PrivilegeEveryone":1, "P-RBCD-Dangerous":1, "P-ComputerInPrivGroup":1,
-    "S-SIDHistoryPrivileged":1, "A-Krbtgt":1, "P-ExchangePrivEsc":1,
+    "S-SIDHistoryPrivileged":1, "P-ExchangePrivEsc":1,
     # Level 2 — serious
+    # A-Krbtgt (stale krbtgt) is golden-ticket persistence, not an initial-access
+    # path — level 2 so a routine stale krbtgt no longer forces the "Initial —
+    # attacker reaches DA today" headline via the min-maturity rule.
+    "A-Krbtgt":2,
     "P-Kerberoasting":2, "S-Kerberoastable":2, "P-MachineAccountQuota":2,
     "A-NullSession":2, "A-PreWin2000Anonymous":2, "A-DCLdapSign":2,
     "A-DCLdapsChannelBinding":2, "A-SMB2SignatureNotEnabled":2, "A-SMB2SignatureNotRequired":2,
@@ -1434,10 +1446,13 @@ RULE_DOCS: Dict[str, Dict[str, Any]] = {
     "P-ControlPathDA": {
         "description": "Non-privileged principals can reach Domain Admin through a chain of control edges (group membership + dangerous ACLs / ownership).",
         "why": "These are the multi-hop escalation routes BloodHound surfaces — a low-privileged user who can write to a group, reset an admin's password, edit a linked GPO, or take ownership of a Tier-0 object ultimately becomes Domain Admin. They are the most common real-world DA path and are invisible to membership-only review.",
-        "technical": "Transitive closure over edges: MemberOf, GenericAll/GenericWrite/WriteDacl/WriteOwner/Owner/AllExtendedRights/ForceChangePassword/Self(member) on groups, admin users, GPOs and the domain root, seeded from the Tier-0 groups.",
+        "technical": "Transitive closure over edges: MemberOf, GenericAll/GenericWrite/WriteDacl/WriteOwner/Owner/DCSync on groups, accounts (incl. DC computers), GPOs and the domain root; plus targeted-WriteProperty edges — AddKeyCredentialLink (Shadow Credentials), WriteRBCD, AddMember, WriteSPN — seeded from the Tier-0 groups (DA/EA/Admins/DCs/RODCs/Key Admins/…).",
         "exploit": [
             "bloodhound-python -c All -u user -p pass -d domain.local -ns <dc>  # then 'Shortest paths to Domain Admins'",
-            "Walk the path: e.g. dacledit (WriteDacl) → net group add (AddMember) → DCSync",
+            "GenericAll/WriteDacl → impacket-dacledit; AddMember → bloodyAD add groupMember <grp> <you>",
+            "AddKeyCredentialLink → certipy shadow auto -u you -account <target> (Shadow Credentials → NT hash/TGT)",
+            "WriteRBCD → impacket-rbcd -delegate-to <target> -action write; WriteSPN → targetedKerberoast → crack",
+            "Then walk to DCSync: mimikatz/secretsdump on the compromised Tier-0 account.",
         ],
         "remediation": [
             "Remove the dangerous ACE / ownership at the first hop of each path (see the chain).",
@@ -1780,7 +1795,17 @@ def classify_trust(attrs: Dict) -> Dict:
     # honor the explicit NON_TRANSITIVE bit.
     intra_or_forest = bool(ta & (TRUST_ATTR_WITHIN_FOREST | TRUST_ATTR_FOREST))
     transitive = (not (ta & TRUST_ATTR_NON_TRANSITIVE)) if intra_or_forest else False
-    sid_filtering = bool(ta & TRUST_ATTR_QUARANTINED) or bool(ta & TRUST_ATTR_WITHIN_FOREST)
+    # SID filtering is expressed differently per trust type: intra-forest trusts
+    # are inherently trusted; forest trusts enable it BY DEFAULT (disabled only by
+    # TREAT_AS_EXTERNAL) and do NOT use the QUARANTINED bit; only external trusts
+    # carry SID filtering in the QUARANTINED bit. Testing QUARANTINED alone flagged
+    # every default forest trust as unfiltered (false positive).
+    if ta & TRUST_ATTR_WITHIN_FOREST:
+        sid_filtering = True
+    elif ta & TRUST_ATTR_FOREST:
+        sid_filtering = not bool(ta & TRUST_ATTR_TREAT_EXTERNAL)
+    else:
+        sid_filtering = bool(ta & TRUST_ATTR_QUARANTINED)
     selective_auth = bool(ta & TRUST_ATTR_CROSS_ORG)
     tgt_delegation = bool(ta & TRUST_ATTR_TGT_DELEGATION)
     risks = []
@@ -1810,6 +1835,47 @@ def check_port(host: str, port: int, timeout: float = 3.0) -> bool:
         return True
     except (socket.timeout, ConnectionRefusedError, OSError):
         return False
+
+# ADCS web-enrollment endpoints. The Web Enrollment role (certsrv) and the
+# Certificate Enrollment Web Service / NDES are the relay targets for ESC8.
+_ADCS_HTTP_ENDPOINTS = ("/certsrv/certfnsh.asp", "/certsrv/", "/certsrv/mscep/")
+
+def probe_web_enrollment(host: str, timeout: float = 4.0) -> Optional[Dict[str, Any]]:
+    """Probe a CA host for an actually-reachable HTTP web-enrollment endpoint that
+    challenges for NTLM/Negotiate — the real ESC8 precondition. A CA host merely
+    having TCP/80 open (WSUS, SCCM, a default IIS site, the CA's own CRL vdir) is
+    NOT ESC8; the /certsrv relay endpoint must exist and accept Windows auth.
+    Returns {path, code, ntlm} on a hit, or None. HTTP only (no channel binding on
+    plain HTTP is the whole point of ESC8)."""
+    import http.client
+    if not check_port(host, 80, timeout=timeout):
+        return None
+    for path in _ADCS_HTTP_ENDPOINTS:
+        conn = None
+        try:
+            conn = http.client.HTTPConnection(host, 80, timeout=timeout)
+            conn.request("GET", path, headers={"User-Agent": "Mozilla/5.0"})
+            resp = conn.getresponse()
+            code = resp.status
+            www_auth = (resp.getheader("WWW-Authenticate") or "").lower()
+            resp.read(1)
+        except Exception:
+            continue
+        finally:
+            try:
+                if conn:
+                    conn.close()
+            except Exception:
+                pass
+        ntlm = ("ntlm" in www_auth or "negotiate" in www_auth)
+        # A 401 challenging for NTLM/Negotiate is the definitive ESC8 relay target.
+        # A 200 on certfnsh.asp (anonymous web enrollment) is also web enrollment
+        # present. 404 / other codes mean the vdir isn't there — not ESC8.
+        if code == 401 and ntlm:
+            return {"path": path, "code": code, "ntlm": True}
+        if code == 200 and path == "/certsrv/certfnsh.asp":
+            return {"path": path, "code": code, "ntlm": ntlm}
+    return None
 
 def uac_has(uac_int: int, flag: int) -> bool:
     return bool(int(uac_int) & flag)
@@ -1946,6 +2012,10 @@ class ADConnection:
         self.sch_nc    = ""
         self._impacket = None  # set when impacket backend is active
         self.gc_root = ""
+        # True once we observe an unsigned authenticated NTLM bind succeed over
+        # plain LDAP/389 — i.e. the DC does NOT require LDAP signing (relay-able).
+        # None = not tested (Kerberos/LDAPS/null-session path).
+        self.ldap_signing_not_required: Optional[bool] = None
         # functional levels — populated for BOTH backends so collection never
         # depends on ldap3's server.info (which is absent on the Kerberos path).
         self.domain_func = -1
@@ -2069,6 +2139,17 @@ class ADConnection:
         if not self.conn or not self.conn.bound:
             print(f"[-] LDAP bind failed: {self.conn.result if self.conn else ''}")
             return False
+
+        # We reached a successful bind WITHOUT the strongerAuthRequired upgrade. If
+        # that was an authenticated NTLM bind over plain LDAP/389 (not LDAPS, not
+        # Kerberos, not an anonymous/null session), the DC accepted an unsigned
+        # authenticated bind — LDAP signing is NOT required (A-DCLdapSign). ldap3's
+        # NTLM does not integrity-protect LDAP PDUs, so a signing-required DC would
+        # have returned strongerAuthRequired and taken the branch above instead.
+        if (self.conn.bound and not self.args.ldaps and not self.args.kerberos
+                and not getattr(self.args, "null_session", False)
+                and self.args.username):
+            self.ldap_signing_not_required = True
 
         self._extract_root_info()
         return True
@@ -2275,13 +2356,29 @@ class ADConnection:
         return True
 
     def _impacket_search(self, base: str, flt: str, attrs: List[str],
-                         page_size: int = 500) -> List[Dict]:
+                         page_size: int = 500, sd_flags: Optional[int] = None) -> List[Dict]:
         from impacket.ldap.ldapasn1 import SimplePagedResultsControl
         from impacket.ldap.ldap import LDAPSearchError
-        ctrl = SimplePagedResultsControl(size=page_size)
+        controls = [SimplePagedResultsControl(size=page_size)]
+        # When a security descriptor is requested, attach LDAP_SERVER_SD_FLAGS so
+        # the DACL (Owner+Group+DACL, no SACL) is returned. Without this a
+        # non-privileged bind gets the attribute OMITTED entirely — because the
+        # default request implies the SACL, which needs SeSecurityPrivilege — and
+        # every SD-based check silently sees an empty descriptor.
+        if sd_flags is not None:
+            try:
+                from impacket.ldap.ldapasn1 import Control
+                from pyasn1.codec.ber import encoder
+                from pyasn1.type import univ
+                sdc = Control(); sdc["controlType"] = "1.2.840.113556.1.4.801"
+                seq = univ.Sequence(); seq.setComponentByPosition(0, univ.Integer(sd_flags))
+                sdc["controlValue"] = encoder.encode(seq)
+                controls.append(sdc)
+            except Exception:
+                pass
         try:
             raw = self._impacket.search(searchBase=base, searchFilter=flt,
-                                        attributes=attrs, searchControls=[ctrl])
+                                        attributes=attrs, searchControls=controls)
         except LDAPSearchError as e:
             raw = e.getAnswers()
         except Exception as e:
@@ -2334,17 +2431,25 @@ class ADConnection:
 
     def paged_search(self, base: str, flt: str, attrs: List[str],
                      scope=ldap3.SUBTREE, page_size: int = 500) -> List[Dict]:
+        # If a security descriptor is among the requested attributes, request only
+        # Owner+Group+DACL (0x07) via LDAP_SERVER_SD_FLAGS. A non-privileged bind
+        # cannot read the SACL, so without the control the DC omits
+        # nTSecurityDescriptor entirely and every downstream SD check (ADCS ESC1-9,
+        # etc.) sees an empty descriptor — the root cause of ESC false positives.
+        sd_flags = 0x07 if any(a.lower() == "ntsecuritydescriptor" for a in attrs) else None
         if getattr(self, "_impacket", None):
-            return self._impacket_search(base, flt, attrs, page_size)
+            return self._impacket_search(base, flt, attrs, page_size, sd_flags)
         results = []
         try:
+            ctrls = security_descriptor_control(sdflags=sd_flags) if sd_flags is not None else None
             gen = self.conn.extend.standard.paged_search(
                 search_base=base,
                 search_filter=flt,
                 search_scope=scope,
                 attributes=attrs,
                 paged_size=page_size,
-                generator=True)
+                generator=True,
+                controls=ctrls)
             for entry in gen:
                 if entry.get("type") == "searchResEntry":
                     # Use raw_attributes (always bytes), NOT attributes: with
@@ -2590,7 +2695,7 @@ class ADData:
             "whenCreated","accountExpires","badPasswordTime","badPwdCount",
             "msDS-AllowedToDelegateTo","msDS-AllowedToActOnBehalfOfOtherIdentity",
             "primaryGroupID","objectSid","name","displayName",
-            "altSecurityIdentities","info"])
+            "altSecurityIdentities","info","userPassword","unixUserPassword"])
 
     # ── computers ────────────────────────────────────────────────────────────
 
@@ -2902,6 +3007,18 @@ class CheckEngine:
         for o in list(self.d.users) + list(self.d.computers):
             a = o["attrs"]
             sam = get_str(a, "sAMAccountName") or dn_base(o["dn"])
+            # userPassword / unixUserPassword should never be readable cleartext.
+            # Any returned value is a direct credential leak (empty/absent on a
+            # healthy domain, so FP-safe). Report the whole value — it IS the creds.
+            for attr in ("userPassword", "unixUserPassword"):
+                val = get_str(a, attr)
+                if val and val.strip():
+                    snippet = val if len(val) <= 120 else val[:117] + "…"
+                    self._add("A-PasswordInDescription",
+                              f"{sam} exposes a cleartext credential in '{attr}': \"{snippet}\". "
+                              "This attribute is world-readable over LDAP — authenticate directly as this account.",
+                              [f"{sam} [{attr}]: {snippet}"])
+                    break
             for attr in ("description", "info"):
                 val = get_str(a, attr)
                 if val and self._looks_like_secret(val):
@@ -3342,7 +3459,17 @@ class CheckEngine:
 
     def _m_constrained_delegation(self):
         dc_dns = {d["dn"] for d in self.d.dcs}
-        affected = []
+        # DC host identifiers to test delegation targets against. Delegation to a DC
+        # service (cifs/ldap/host on a DC) is a direct S4U2Proxy -> DCSync/Tier-0 path.
+        dc_hosts = set()
+        for d in self.d.dcs:
+            h = get_str(d["attrs"], "dNSHostName")
+            if h:
+                dc_hosts.add(h.lower())
+            s = get_str(d["attrs"], "sAMAccountName")
+            if s:
+                dc_hosts.add(s.rstrip("$").lower())
+        normal, to_dc = [], []
         for obj in self.d.users + self.d.computers:
             a = obj["attrs"]
             targets = get_list(a, "msDS-AllowedToDelegateTo")
@@ -3353,14 +3480,32 @@ class CheckEngine:
             # protocol transition (T2A4D) is the more dangerous variant
             transition = uac_has(uac, UAC_TRUSTED_TO_AUTH)
             tag = "+T2A4D" if transition else ""
-            affected.append(f"{sam}{tag} -> {', '.join(sorted(set(targets))[:4])}")
-        if affected:
+            targets_dedup = sorted(set(targets))
+            hits_dc = False
+            for spn in targets_dedup:
+                if "/" in spn:
+                    host = spn.split("/", 1)[1].split("/")[0].split(":")[0].lower()
+                    if host in dc_hosts:
+                        hits_dc = True
+                        break
+            entry = f"{sam}{tag} -> {', '.join(targets_dedup[:4])}"
+            (to_dc if hits_dc else normal).append(entry)
+        if to_dc:
+            self._add("P-DelegationDCa2d2",
+                      "Constrained delegation to a DOMAIN CONTROLLER service "
+                      "(msDS-AllowedToDelegateTo names a DC SPN). Compromising the "
+                      "account lets S4U2Proxy impersonate any user to the DC (cifs/"
+                      "ldap/host) — a direct path to DCSync / full domain compromise. "
+                      "Remove the delegation or scope it off DC services. "
+                      "impacket-getST -spn cifs/<dc> -impersonate Administrator ...",
+                      to_dc)
+        if normal:
             self._add("P-ConstrainedDelegService",
                       "Service accounts with constrained delegation (msDS-Allowed"
                       "ToDelegateTo). Compromise of the account allows S4U2Proxy "
                       "impersonation to the listed SPNs; '+T2A4D' marks protocol-"
                       "transition (any user can be impersonated).",
-                      affected)
+                      normal)
 
     def _m_computer_in_priv_group(self):
         affected = []
@@ -3458,6 +3603,61 @@ class CheckEngine:
         self._a_admin_sd_holder()
         self._a_pwd_gpo()
         self._a_audit_powershell()
+        self._a_dc_ldap_signing()
+        self._a_ldap_signing_gpo()
+
+    def _a_dc_ldap_signing(self):
+        """A-DCLdapSign — the DC accepted an unsigned authenticated LDAP bind over
+        389 (observed live during connect()). PingCastle-parity flagship: Windows
+        DCs default to 'negotiate' (not 'require') LDAP signing, so an NTLM bind
+        can be relayed (ntlmrelayx -t ldap://dc). Only emitted from a definitive
+        live observation — never inferred — so it can't false-positive."""
+        conn = getattr(self.d, "conn", None)
+        if getattr(conn, "ldap_signing_not_required", None) is not True:
+            return
+        dc = (self.args.dc_host or self.args.dc_ip or "the domain controller")
+        self._add("A-DCLdapSign",
+                  f"{dc} accepted an unsigned authenticated LDAP bind over port 389 — "
+                  "LDAP server signing is not required. An attacker who coerces or "
+                  "captures a DC/host NTLM authentication can relay it to LDAP "
+                  "(impacket-ntlmrelayx -t ldap://<dc> --escalate-user / RBCD) for "
+                  "privilege escalation. Set 'Domain controller: LDAP server signing "
+                  "requirements' = 'Require signing' via the Default Domain Controllers GPO.",
+                  [str(dc)])
+
+    def _a_ldap_signing_gpo(self):
+        """A-LDAPSigningDisabled — GPO-configured LDAPServerIntegrity != 2 (require).
+        Complements the live A-DCLdapSign; only fires on an explicit weak value so
+        it never triggers on mere absence."""
+        val = self._get_inf_value(
+            "Registry Values",
+            "MACHINE\\System\\CurrentControlSet\\Services\\NTDS\\Parameters\\LDAPServerIntegrity")
+        num = None
+        if val is not None:
+            # INF format is "<regtype>,<value>"; take the trailing integer.
+            try:
+                num = int(str(val).split(",")[-1].strip())
+            except (ValueError, IndexError):
+                num = None
+        if num is None:
+            dw = self._get_reg_dword("Services\\NTDS\\Parameters", "LDAPServerIntegrity")
+            num = dw
+        if num is not None and num != 2:
+            self._add("A-LDAPSigningDisabled",
+                      f"Group Policy sets LDAPServerIntegrity={num} on domain controllers "
+                      "(2 = require signing). LDAP signing is not enforced, enabling NTLM "
+                      "relay to LDAP. Set it to 2 via the Default Domain Controllers GPO.",
+                      ["LDAPServerIntegrity=%s" % num])
+        # LDAPS channel binding (EPA). Only fire on an explicit weak value — the
+        # setting is usually a per-DC/registry/KB default, so treating absence as a
+        # finding would false-positive domain-wide (same trap as A-CredentialGuard).
+        cb = self._get_reg_dword("NTDS\\Parameters", "LdapEnforceChannelBinding")
+        if cb is not None and cb == 0:
+            self._add("A-DCLdapsChannelBinding",
+                      "Group Policy sets LdapEnforceChannelBinding=0 on domain controllers — "
+                      "LDAPS channel binding (EPA) is disabled, so an NTLM authentication can be "
+                      "relayed to LDAPS. Set it to 2 (or apply KB5021130 hardening).",
+                      ["LdapEnforceChannelBinding=0"])
 
     def _a_krbtgt(self):
         k = self.d.krbtgt
@@ -3731,6 +3931,64 @@ class CheckEngine:
                       "deprecated FRS instead of DFSR. This is a security and stability risk.",
                       names)
 
+    def _a_adcs_cert_weakness(self):
+        """Weak CA certificate crypto (PingCastle-parity): MD5/SHA-1 signatures,
+        sub-2048-bit RSA, DSA keys. Reads the enterprise CA's own cACertificate.
+        Requires the `cryptography` package; skipped cleanly otherwise. (ROCA is
+        intentionally not fingerprinted here — a wrong constant would produce false
+        criticals, and the class is vanishingly rare on modern CAs.)"""
+        if not HAS_X509:
+            return
+        md5, sha1, weak_rsa, dsa = [], [], [], []
+        for svc in self.d.enrollment_svcs:
+            cn = get_str(svc["attrs"], "cn") or "CA"
+            raw = svc["attrs"].get("cACertificate")
+            for cbytes in (raw if isinstance(raw, list) else [raw]):
+                if not isinstance(cbytes, (bytes, bytearray)):
+                    continue
+                try:
+                    cert = load_der_x509_certificate(bytes(cbytes))
+                except Exception:
+                    continue
+                try:
+                    hname = (cert.signature_hash_algorithm.name or "").lower()
+                except Exception:
+                    hname = ""
+                if "md5" in hname:
+                    md5.append(cn)
+                elif "sha1" in hname:
+                    sha1.append(cn)
+                try:
+                    pub = cert.public_key()
+                except Exception:
+                    pub = None
+                if isinstance(pub, _rsa.RSAPublicKey):
+                    if pub.key_size < 2048:
+                        weak_rsa.append(f"{cn} ({pub.key_size}-bit RSA)")
+                elif isinstance(pub, _dsa.DSAPublicKey):
+                    dsa.append(cn)
+        if md5:
+            self._add("A-MD5RootCert",
+                      f"Enterprise CA certificate signed with MD5 ({', '.join(_dedup_keep_order(md5))}). "
+                      "MD5 is collision-broken — a forged CA-signed certificate is feasible. "
+                      "Reissue the CA with a SHA-256 signature.", _dedup_keep_order(md5))
+        if sha1:
+            self._add("A-SHA1RootCert",
+                      f"Enterprise CA certificate signed with SHA-1 ({', '.join(_dedup_keep_order(sha1))}). "
+                      "SHA-1 is deprecated and collision-weakened. Reissue with SHA-256.",
+                      _dedup_keep_order(sha1))
+        if weak_rsa:
+            self._add("A-WeakRSARootCert",
+                      f"Enterprise CA certificate uses a sub-2048-bit RSA key "
+                      f"({', '.join(_dedup_keep_order(weak_rsa))}) — factorable / below policy. "
+                      "Reissue the CA with a 2048-bit (or larger) key.",
+                      _dedup_keep_order(weak_rsa))
+        if dsa:
+            self._add("A-CertWeakDSA",
+                      f"Enterprise CA certificate uses a DSA key ({', '.join(_dedup_keep_order(dsa))}). "
+                      "DSA is deprecated for CAs; reissue with RSA-2048+ or ECDSA.",
+                      _dedup_keep_order(dsa))
+
     # EKUs that make a certificate useful for domain authentication (ESC1 prereq)
     _AUTH_EKUS = {
         "1.3.6.1.5.5.7.3.2",          # Client Authentication
@@ -3749,22 +4007,33 @@ class CheckEngine:
     def _a_adcs_checks(self):
         if self.args.no_adcs:
             return
+        self._a_adcs_cert_weakness()
 
-        # ESC8: HTTP enrollment (relay-able)
-        for svc in self.d.enrollment_svcs:
-            host = get_str(svc["attrs"], "dNSHostName")
-            if host and check_port(host, 80, timeout=3):
+        # ESC8: reachable HTTP web-enrollment endpoint (relay-able). A bare open
+        # port 80 is NOT ESC8 — the /certsrv relay vdir must actually exist and
+        # accept Windows auth, so probe it rather than trusting the port.
+        if not self.args.no_adcs:
+            for svc in self.d.enrollment_svcs:
+                host = get_str(svc["attrs"], "dNSHostName")
+                if not host:
+                    continue
+                hit = probe_web_enrollment(host)
+                if not hit:
+                    continue
+                how = ("challenges for NTLM/Negotiate over plain HTTP"
+                       if hit["ntlm"] else "serves web enrollment over plain HTTP")
                 self._add("A-CertEnrollHttp",
                           f"ADCS enrollment service '{get_str(svc['attrs'],'cn')}' on {host} "
-                          "appears to accept HTTP (port 80 open). ESC8 NTLM relay to ADCS is "
-                          "possible — use PetitPotam/PrinterBug to coerce DC auth and relay "
-                          "to /certsrv/certfnsh.asp to obtain a DC certificate.",
+                          f"exposes {hit['path']} (HTTP {hit['code']}) and {how} — ESC8. "
+                          "Coerce DC/host auth (PetitPotam/PrinterBug) and relay to "
+                          "/certsrv/certfnsh.asp to obtain a DC certificate.",
                           [host])
 
         published = getattr(self.d, "_published_templates", set())
         # ESC13: map issuance-policy OID -> linked group DN (msDS-OIDToGroupLink)
         oid_group = self._oid_to_group_map()
 
+        unverified_templates: List[str] = []
         for tmpl in self.d.cert_templates:
             cn         = get_str(tmpl["attrs"], "cn")
             name_flag  = get_int(tmpl["attrs"], "msPKI-Certificate-Name-Flag")
@@ -3786,20 +4055,27 @@ class CheckEngine:
             # Enrollment-based escalations (ESC1/2/3/9) are only attacker-reachable
             # if a broad / low-priv principal can actually enroll. When only Tier-0
             # (EA/DA) hold the Enroll right, reporting is a false positive (issue
-            # #2). If the SD can't be parsed we still report, with a caveat.
+            # #2). The template SD is now requested with the SD_FLAGS control, so an
+            # unparsed descriptor is a genuine can't-read — NOT the old low-priv
+            # omission — and we fail CLOSED rather than firing ESC1/2/3/9 on every
+            # template (the primary ADCS false-positive source). Unverifiable
+            # templates are recorded once as a collection breadcrumb.
             enrollers, enroll_parsed = self._template_low_priv_enrollers(tmpl)
-            enroll_reachable = bool(enrollers) or not enroll_parsed
-            if enrollers:
-                enroll_note = " Low-priv enrollers: " + ", ".join(enrollers) + "."
-            elif not enroll_parsed:
-                enroll_note = " (Enrollment rights could not be verified — confirm who can enroll.)"
-            else:
-                enroll_note = ""
+            enroll_reachable = bool(enrollers)
+            if not enroll_parsed:
+                unverified_templates.append(cn)
+            enroll_note = (" Low-priv enrollers: " + ", ".join(enrollers) + "."
+                           if enrollers else "")
 
-            # ESC1: enrollee supplies subject + auth EKU + no manager approval
+            # ESC1: enrollee supplies subject + auth EKU + no manager approval.
+            # ra_sig == 0: a template that requires an RA (enrollment-agent)
+            # signature is not directly requestable by the enrollee — that's the
+            # ESC3 chain, not a direct ESC1 — so gating on it avoids reporting
+            # enrollment-agent templates as directly exploitable.
             if (name_flag & self._CT_ENROLLEE_SUPPLIES_SUBJECT
                     and has_auth_eku
                     and not manager_approval
+                    and ra_sig == 0
                     and enroll_reachable):
                 ca_names = [get_str(s["attrs"],"cn") for s in self.d.enrollment_svcs
                             if cn in get_list(s["attrs"],"certificateTemplates")]
@@ -3812,8 +4088,10 @@ class CheckEngine:
                           "certipy find -vulnerable / req -template <tmpl> -upn administrator@domain",
                           [cn] + ca_names)
 
-            # ESC2: any purpose EKU (no EKU restriction) + no manager approval
-            if (has_any_eku or no_eku) and not manager_approval and enroll_reachable:
+            # ESC2: any purpose EKU (no EKU restriction) + no manager approval.
+            # ra_sig == 0 for the same reason as ESC1 above.
+            if ((has_any_eku or no_eku) and not manager_approval
+                    and ra_sig == 0 and enroll_reachable):
                 ca_names = [get_str(s["attrs"],"cn") for s in self.d.enrollment_svcs
                             if cn in get_list(s["attrs"],"certificateTemplates")]
                 self._add("A-CertTempAnyPurpose",
@@ -3883,6 +4161,16 @@ class CheckEngine:
                               f"enroller obtains a certificate that grants '{gname}' membership "
                               f"at authentication.{enroll_note} certipy req -template {cn}.",
                               [f"{cn} -> {gname}"])
+
+        if unverified_templates:
+            try:
+                self.d.collect_errors.append(
+                    f"ADCS: enrollment rights for {len(unverified_templates)} published "
+                    f"template(s) could not be read ({', '.join(unverified_templates[:10])}"
+                    f"{'…' if len(unverified_templates) > 10 else ''}) — ESC1/2/3/9 not "
+                    "evaluated for them; re-run with credentials that can read the template DACL.")
+            except Exception:
+                pass
 
         # ESC7: low-privileged principal holds CA management rights
         for svc in self.d.enrollment_svcs:
@@ -4183,10 +4471,13 @@ class CheckEngine:
             except Exception:
                 continue
         if coercible:
-            self._add("A-DC-Coerce",
+            self._add("A-DC-Spooler",
                       "Print System Remote Protocol (MS-RPRN / spoolsv) is reachable on the "
-                      "domain controller(s). Combined with NTLM relay this enables PrinterBug / "
-                      "PetitPotam-style coercion to mint a DC certificate or relay to LDAPS.",
+                      "domain controller(s) — a PrinterBug/PetitPotam authentication-coercion "
+                      "primitive. On its own the Print Spooler is enabled by default on DCs; it "
+                      "becomes a Tier-0 path only when paired with an unsigned relay sink "
+                      "(SMB/LDAP signing not enforced, or ADCS HTTP enrollment). SCOUT raises "
+                      "A-DC-Coerce (critical) when such a sink is also present.",
                       coercible)
 
     def _a_smart_card_rotation(self):
@@ -4202,30 +4493,14 @@ class CheckEngine:
                           [])
 
     def _a_admin_sd_holder(self):
-        # Check AdminSDHolder ACL for dangerous principals
-        # Full ACL parse is complex; we flag that it exists for review
-        if self.d.admin_sd_holder:
-            # Check if there are non-admin users with high priv group membership
-            # that differ from AdminSDHolder ACL - partial check via adminCount
-            ac1_users = [u for u in self.d.users
-                         if get_int(u["attrs"], "adminCount") == 1]
-            # Users with adminCount=1 but not in any known priv group = orphaned
-            known_priv_dns = set()
-            for grp_members in self.d.priv_group_members.values():
-                for m in grp_members:
-                    known_priv_dns.add(m.get("dn", "").lower())
-            orphaned = []
-            for u in ac1_users:
-                if u["dn"].lower() not in known_priv_dns:
-                    sam = get_str(u["attrs"], "sAMAccountName")
-                    uac = get_int(u["attrs"], "userAccountControl")
-                    if not uac_has(uac, UAC_ACCOUNTDISABLE):
-                        orphaned.append(sam)
-            if orphaned:
-                self._add("A-AdminSDHolder",
-                          f"{len(orphaned)} account(s) have adminCount=1 but are not members "
-                          "of any known privileged group — possible orphaned AdminSDHolder entries.",
-                          orphaned[:20])
+        # Orphaned adminCount=1 objects are reported (correctly labelled, and
+        # including computers/disabled) by _m_admincount_orphan -> P-AdminCountOrphan.
+        # This method used to re-emit the same population as A-AdminSDHolder at
+        # HIGH with a misleading "ACL inconsistency detected" title (it never
+        # parsed the AdminSDHolder DACL), duplicating that finding on nearly every
+        # domain. Removed to keep a single source of truth. A real AdminSDHolder
+        # DACL-diff check would go here.
+        return
 
     def _a_pwd_gpo(self):
         if not self.d.domain_obj:
@@ -4587,25 +4862,25 @@ class CheckEngine:
                       [get_str(m["attrs"],"sAMAccountName") for m in ewp[:10]])
 
     def _p_delegations(self):
-        # Constrained delegation with protocol transition (T2A4D)
-        for user in self.d.users:
-            uac = get_int(user["attrs"], "userAccountControl")
-            if uac_has(uac, UAC_ACCOUNTDISABLE):
-                continue
-            if uac_has(uac, UAC_TRUSTED_TO_AUTH):
-                sam = get_str(user["attrs"], "sAMAccountName")
-                self._add("P-DelegationDCt2a4d",
-                          f"User '{sam}' has TRUSTED_TO_AUTH_FOR_DELEGATION (protocol transition). "
-                          "This allows the account to impersonate any user to constrained services.",
-                          [sam])
+        # P-DelegationDCt2a4d is DC-specific (its title/severity assume a DC). A DC
+        # carrying TRUSTED_TO_AUTH_FOR_DELEGATION is a genuine anomaly. Non-DC
+        # accounts with T2A4D are constrained-delegation service accounts and are
+        # reported — correctly labelled and de-duplicated — by
+        # _m_constrained_delegation (P-ConstrainedDelegService, tagged +T2A4D).
+        # Firing this rule for every T2A4D account mislabeled service accounts as
+        # DCs at CRITICAL.
+        dc_dns = {d["dn"] for d in self.d.dcs}
         for comp in self.d.computers:
+            if comp["dn"] not in dc_dns:
+                continue
             uac = get_int(comp["attrs"], "userAccountControl")
             if uac_has(uac, UAC_ACCOUNTDISABLE):
                 continue
             if uac_has(uac, UAC_TRUSTED_TO_AUTH):
                 sam = get_str(comp["attrs"], "sAMAccountName")
                 self._add("P-DelegationDCt2a4d",
-                          f"Computer '{sam}' has TRUSTED_TO_AUTH_FOR_DELEGATION.",
+                          f"Domain controller account '{sam}' has TRUSTED_TO_AUTH_FOR_DELEGATION "
+                          "(protocol transition). A DC should not carry T2A4D — review and remove.",
                           [sam])
 
     def _p_unprotected_ous(self):
@@ -4845,17 +5120,36 @@ class CheckEngine:
                       "DONT_REQUIRE_PREAUTH — AS-REP roastable.",
                       normal_no_preauth[:30])
 
+    # RIDs / SIDs whose presence in sIDHistory is a privilege-escalation finding,
+    # reported (high severity) by S-SIDHistoryPrivileged / T-SIDHistoryDangerous.
+    _PRIV_SIDHIST_RIDS = {"500", "502", "512", "516", "518", "519", "520", "521",
+                          "526", "527", "498"}
+    _PRIV_SIDHIST_WK = {"S-1-5-32-544", "S-1-5-32-548", "S-1-5-32-549",
+                        "S-1-5-32-550", "S-1-5-32-551"}
+
+    def _sidhist_is_privileged(self, sidstr: str) -> bool:
+        s = str(sidstr)
+        return s in self._PRIV_SIDHIST_WK or s.rsplit("-", 1)[-1] in self._PRIV_SIDHIST_RIDS
+
     def _s_sid_history(self):
+        # Only the BENIGN residue — objects whose sIDHistory references a privileged
+        # or built-in SID are the real escalation findings and are already reported
+        # by S-SIDHistoryPrivileged / T-SIDHistoryDangerous, so exclude them here to
+        # avoid double-counting the same objects in a low-severity bucket.
         affected = []
         for u in self.d.users + self.d.computers:
             sids = get_list(u["attrs"], "sIDHistory")
-            if sids:
-                sam = get_str(u["attrs"], "sAMAccountName")
-                affected.append(f"{sam}: {', '.join(str(s) for s in sids[:3])}")
+            if not sids:
+                continue
+            if any(self._sidhist_is_privileged(s) for s in sids):
+                continue
+            sam = get_str(u["attrs"], "sAMAccountName")
+            affected.append(f"{sam}: {', '.join(str(s) for s in sids[:3])}")
         if affected:
             self._add("S-SIDHistory",
-                      f"{len(affected)} object(s) have sIDHistory set — "
-                      "these can be used to escalate privileges if SID filtering is not active.",
+                      f"{len(affected)} object(s) have (non-privileged) sIDHistory set — "
+                      "these can be used to escalate privileges if SID filtering is not active. "
+                      "Privileged-SID history, if any, is reported separately.",
                       affected[:20])
 
     def _s_pwd_last_set(self):
@@ -5146,17 +5440,23 @@ class CheckEngine:
                       "These lack modern Kerberos security features.",
                       [name])
 
-        # SID filtering
-        # TRUST_ATTR_QUARANTINED_DOMAIN (0x4) = SID filtering enabled.
-        # Inbound/bidirectional trusts let the partner's principals authenticate
-        # INTO this domain; without SID filtering that enables SID-history injection.
+        # SID filtering — only meaningful for inbound/bidirectional trusts, and
+        # expressed differently per trust type (see classify_trust). Forest trusts
+        # filter by default and are unsafe only when TREAT_AS_EXTERNAL is set;
+        # external trusts carry the state in the QUARANTINED bit; intra-forest is
+        # inherently trusted. The old check fired on every default forest trust.
         if tdir in (TRUST_DIR_INBOUND, TRUST_DIR_BIDIRECT):
-            if not (attrs & TRUST_ATTR_QUARANTINED):
-                if not (attrs & TRUST_ATTR_WITHIN_FOREST):
-                    self._add("T-SIDFiltering",
-                              f"SID filtering (quarantine) is NOT enabled on trust with "
-                              f"'{name}'. SID history abuse may allow cross-trust escalation.",
-                              [name])
+            if attrs & TRUST_ATTR_WITHIN_FOREST:
+                sf_off = False
+            elif attrs & TRUST_ATTR_FOREST:
+                sf_off = bool(attrs & TRUST_ATTR_TREAT_EXTERNAL)
+            else:
+                sf_off = not (attrs & TRUST_ATTR_QUARANTINED)
+            if sf_off:
+                self._add("T-SIDFiltering",
+                          f"SID filtering (quarantine) is NOT enabled on trust with "
+                          f"'{name}'. SID history abuse may allow cross-trust escalation.",
+                          [name])
 
         # TGT delegation
         if attrs & TRUST_ATTR_TGT_DELEGATION:
@@ -5270,9 +5570,64 @@ class CheckEngine:
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
+    def _effective_gpo_guids(self) -> Dict[str, int]:
+        """{GPO-GUID (upper, braced) -> flags int} for GPOs actually LINKED (with
+        the link enabled) to the domain root, an OU, or a site. Presence-based
+        SYSVOL checks consult this so a policy value living in an orphaned/unlinked
+        or computer-config-disabled GPO isn't reported as enforced domain-wide
+        (the dominant GPO false-positive source). flags bit 2 = computer config
+        disabled -> that GPO's Machine\\Registry.pol is inert."""
+        cached = getattr(self, "_eff_gpo_guids_cache", None)
+        if cached is not None:
+            return cached
+        guid_re = re.compile(r"\{[0-9a-fA-F-]+\}")
+        linked_guids = set()
+        gplinks = []
+        if self.d.domain_obj:
+            gplinks.append(get_str(self.d.domain_obj["attrs"], "gPLink"))
+        for cont in list(getattr(self.d, "ous", [])) + list(getattr(self.d, "sites", [])):
+            gplinks.append(get_str(cont["attrs"], "gPLink"))
+        for gp in gplinks:
+            for gdn in ControlPathAnalyzer._parse_gplink(gp):
+                m = guid_re.search(gdn)
+                if m:
+                    linked_guids.add(m.group(0).upper())
+        eff: Dict[str, int] = {}
+        for g in getattr(self.d, "gpos", []):
+            m = guid_re.search(g.get("dn", ""))
+            if not m:
+                continue
+            guid = m.group(0).upper()
+            if guid not in linked_guids:
+                continue
+            try:
+                flags = int(get_str(g["attrs"], "flags") or 0)
+            except (ValueError, TypeError):
+                flags = 0
+            eff[guid] = flags
+        self._eff_gpo_guids_cache = eff
+        return eff
+
+    def _sysvol_entry_effective(self, entry: Dict) -> bool:
+        """True if a registry_pol/inf entry belongs to an effective GPO. Falls back
+        to True when linkage can't be resolved (empty map) to avoid false negatives."""
+        eff = self._effective_gpo_guids()
+        if not eff:
+            return True
+        guid = (entry.get("gpo_guid", "") or "").upper()
+        if guid not in eff:
+            return False
+        # Machine\Registry.pol from a computer-config-disabled GPO applies to nothing.
+        if (eff[guid] & 2) and "MACHINE\\" in (entry.get("path", "") or "").upper():
+            return False
+        return True
+
     def _get_reg_value(self, key_fragment: str, val_name: str) -> Optional[bytes]:
-        """Search registry_pol entries for the first matching key/value."""
+        """Search registry_pol entries (from effective/linked GPOs) for the first
+        matching key/value."""
         for entry in self.d.sysvol_data.get("registry_pol", []):
+            if not self._sysvol_entry_effective(entry):
+                continue
             if (key_fragment.lower() in entry["key"].lower()
                     and entry["name"].lower() == val_name.lower()):
                 return entry["raw"]
@@ -5285,8 +5640,11 @@ class CheckEngine:
         return None
 
     def _get_inf_value(self, section: str, key: str) -> Optional[str]:
-        """Search GptTmpl.inf settings."""
+        """Search GptTmpl.inf settings from effective/linked GPOs (inf entries lack
+        a Machine/User path, so only the link filter applies here)."""
         for entry in self.d.sysvol_data.get("inf_settings", []):
+            if not self._sysvol_entry_effective(entry):
+                continue
             if (entry["section"].lower() == section.lower()
                     and entry["key"].lower() == key.lower()):
                 return entry["value"]
@@ -5364,12 +5722,14 @@ class CheckEngine:
     def _a_nbtns(self):
         val = self._get_reg_dword(
             "NetBT\\Parameters", "NodeType")
-        if val is None or val not in (2, 4):
+        # Fire only on an explicitly-bad value. NodeType is rarely delivered by GPO
+        # (it's a DHCP/per-NIC setting), so treating "not configured" as a finding
+        # lit up on essentially every domain — matching the present-and-bad
+        # convention used by _a_wdigest / _a_dsrm_logon kills that noise.
+        if val is not None and val not in (2, 4):
             # NodeType=2 = P-node (no broadcast), 4=M-node but broadcast last
-            # Recommended: NodeType=2 or disable NetBIOS via DHCP
-            val_str = str(val) if val is not None else "not configured"
             self._add("A-NBTNSDisabled",
-                      f"NetBT NodeType={val_str} (NetBIOS Name Service may be active). "
+                      f"NetBT NodeType={val} (NetBIOS Name Service may be active). "
                       "NBT-NS poisoning via Responder allows credential theft. "
                       "Set NodeType=2 (P-node/no broadcast) or disable via NIC settings.")
 
@@ -5378,10 +5738,12 @@ class CheckEngine:
     def _a_credential_guard_gpo(self):
         val = self._get_reg_dword(
             "DeviceGuard", "LsaCfgFlags")
-        if val is None or val == 0:
-            val_str = str(val) if val is not None else "not configured"
+        # Present-and-disabled only: LsaCfgFlags is almost never pushed via
+        # Registry.pol (it comes from Intune/VBS/hardware), so the None case fired
+        # on nearly every domain.
+        if val == 0:
             self._add("A-CredentialGuard",
-                      f"Credential Guard LsaCfgFlags={val_str} (not enforced). "
+                      f"Credential Guard LsaCfgFlags={val} (not enforced). "
                       "Credential Guard prevents LSASS credential dumping on supported hardware. "
                       "Set HKLM\\SOFTWARE\\Policies\\Microsoft\\Windows\\DeviceGuard\\"
                       "LsaCfgFlags=1 via GPO for all DCs and servers.")
@@ -5446,20 +5808,40 @@ class CheckEngine:
         self._p_machine_account_quota()
 
     def _p_dcsync_rights(self):
-        dcsync = [f for f in self.d.acl_findings if f.get("type") == "dcsync"]
-        if dcsync:
-            for f in dcsync:
-                self._add("P-DCSync",
-                          f"{f['sid_name']} ({f['sid']}) has {f['right']} on {f['object']}. "
-                          "This extended right allows replication of all AD secrets including "
-                          "NTLM hashes and Kerberos keys — equivalent to domain compromise. "
-                          "Remove immediately; only Domain Controllers should hold this right.",
-                          [f['sid_name'], f['object']])
+        # DCSync requires BOTH DS-Replication-Get-Changes AND -Get-Changes-All on
+        # the same principal/object. The ACL analyzer emits one finding per right,
+        # so aggregate by (sid, object) and fire only when both are present —
+        # holding a single replication right is not a DCSync path and firing on it
+        # was a false CRITICAL. (GenericAll/AllExtendedRights on the domain root
+        # imply both and are surfaced separately by P-DangerousACLDomain.)
+        by_principal: Dict[Tuple[str, str], Dict] = {}
+        for f in self.d.acl_findings:
+            if f.get("type") != "dcsync":
+                continue
+            key = (f.get("sid", ""), f.get("object", ""))
+            entry = by_principal.setdefault(key, {"rights": set(), "f": f})
+            entry["rights"].add(f.get("right", ""))
+        for (sid, obj), entry in by_principal.items():
+            if not {"DS-Replication-Get-Changes",
+                    "DS-Replication-Get-Changes-All"} <= entry["rights"]:
+                continue
+            f = entry["f"]
+            self._add("P-DCSync",
+                      f"{f['sid_name']} ({f['sid']}) has DCSync rights "
+                      f"(Get-Changes + Get-Changes-All) on {f['object']}. "
+                      "These extended rights allow replication of all AD secrets including "
+                      "NTLM hashes and Kerberos keys — equivalent to domain compromise. "
+                      "Remove immediately; only Domain Controllers should hold this right.",
+                      [f['sid_name'], f['object']])
 
     def _p_dangerous_acl_domain(self):
+        # Match the domain-root object exactly. The old substring test
+        # ("domain" in object) also matched "Domain Admins", "Domain Computers",
+        # etc., double-reporting group ACLs (already covered by P-WriteToPrivGroup)
+        # as domain-root compromise. The ACL analyzer labels base_dn "Domain Root".
         dangerous = [f for f in self.d.acl_findings
                      if f.get("type") in ("dangerous_acl", "owner", "write_property")
-                     and "domain" in f.get("object","").lower()]
+                     and f.get("object","") == "Domain Root"]
         if dangerous:
             for f in dangerous:
                 self._add("P-DangerousACLDomain",
@@ -5523,8 +5905,14 @@ class CheckEngine:
                 if sam:
                     admin_sams.add(sam.lower())
 
-        kerberoastable = []
-        admin_kerberoastable = []
+        # weak = RC4/DES-only (crackable in hours); track the total SPN surface for
+        # context. Admin and non-admin lists are DISJOINT so an account is reported
+        # once, and the two findings fire INDEPENDENTLY (the old `elif` silently
+        # dropped the entire non-admin roast surface whenever any admin was
+        # roastable — a false negative).
+        weak = []              # non-admin, RC4/DES-only
+        admin_weak = []        # admin, RC4/DES-only
+        total_spn = 0          # all enabled SPN person accounts (incl. AES)
         for u in self.d.users:
             attrs = u.get("attrs", {})
             uac = get_int(attrs, "userAccountControl")
@@ -5533,29 +5921,37 @@ class CheckEngine:
             spns = get_list(attrs, "servicePrincipalName")
             if not spns:
                 continue
+            total_spn += 1
             sam = get_str(attrs, "sAMAccountName")
             enc_types = get_int(attrs, "msDS-SupportedEncryptionTypes")
-            # Flag RC4-only or unset (defaults to RC4) as weak
             has_aes = enc_types & 0x18  # bits 3-4 = AES128, AES256
-            if not has_aes:
-                kerberoastable.append(sam)
-                if sam.lower() in admin_sams:
-                    admin_kerberoastable.append(sam)
+            if has_aes:
+                continue  # still roastable, but not RC4-crackable — not flagged as weak
+            if sam.lower() in admin_sams:
+                admin_weak.append(sam)
+            else:
+                weak.append(sam)
 
-        if admin_kerberoastable:
+        aes_note = ""
+        if total_spn > len(weak) + len(admin_weak):
+            aes_note = (f" ({total_spn} SPN accounts total; the remainder use AES "
+                        "and are only crackable with a weak password.)")
+        if admin_weak:
             self._add("S-KerberoastableAdmin",
-                      f"{len(admin_kerberoastable)} admin account(s) with SPNs and "
+                      f"{len(admin_weak)} admin account(s) with SPNs and "
                       "no AES encryption types — Kerberoastable with RC4 tickets. "
                       "RC4 TGS tickets can be offline-cracked in hours on commodity hardware. "
-                      "Set AES256/AES128 encryption types and use strong passwords (>25 chars).",
-                      admin_kerberoastable[:20])
-        elif kerberoastable:
+                      "Set AES256/AES128 encryption types and use strong passwords (>25 chars)."
+                      + aes_note,
+                      admin_weak[:20])
+        if weak:
             self._add("S-Kerberoastable",
-                      f"{len(kerberoastable)} account(s) with SPNs and no AES encryption "
+                      f"{len(weak)} account(s) with SPNs and no AES encryption "
                       "types — Kerberoastable with RC4. "
                       "Run: GetUserSPNs.py domain/user -request to harvest crackable hashes. "
-                      "Enforce msDS-SupportedEncryptionTypes to include AES256.",
-                      kerberoastable[:20])
+                      "Enforce msDS-SupportedEncryptionTypes to include AES256."
+                      + aes_note,
+                      weak[:20])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5886,11 +6282,12 @@ _BROAD_SIDS = {
 _DCSYNC_GUIDS = {
     # DCSync needs Get-Changes (…aa) + Get-Changes-All (…ad). The "All" right is
     # …f6ad — NOT …f6ab (that GUID is DS-Replication-Synchronize, which is not a
-    # DCSync primitive). The previous table had …f6ab here and would miss real
-    # Get-Changes-All ACEs.
+    # DCSync primitive). Get-Changes-In-Filtered-Set (…89e95b76) is deliberately
+    # NOT here: it cannot read secret attributes on its own, so it is not a DCSync
+    # right — including it produced false P-DCSync criticals and phantom
+    # control-path edges for principals that only held the filtered-set right.
     "1131f6aa-9c07-11d1-f79f-00c04fc2dcd2": "DS-Replication-Get-Changes",
     "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2": "DS-Replication-Get-Changes-All",
-    "89e95b76-444d-4c62-991a-0facbeda640c": "DS-Replication-Get-Changes-In-Filtered-Set",
 }
 
 
@@ -6148,6 +6545,19 @@ class ControlPathAnalyzer:
     _TAKEOVER = _ACE_GENERIC_ALL | _ACE_GENERIC_WRITE | _ACE_WRITE_DAC | _ACE_WRITE_OWNER
     _MAX_PATHS = 25
 
+    # Targeted WriteProperty attacks: a per-attribute WriteProperty ACE (object-type
+    # ACE whose ObjectType is a specific attribute schemaIDGUID) that yields account
+    # takeover without needing GenericAll/GenericWrite. These are BloodHound's
+    # targeted edges and PingCastle misses them. GenericAll/GenericWrite already
+    # imply these, so we only add an edge for the narrowly-delegated attribute case.
+    _WRITE_ATTR_EDGES = {
+        "5b47d60f-6090-40b2-9f37-2a4de88f3063": "AddKeyCredentialLink",  # msDS-KeyCredentialLink (Shadow Credentials)
+        "3f78c3e5-f79a-46bd-a0b8-9d18116ddc79": "WriteRBCD",             # msDS-AllowedToActOnBehalfOfOtherIdentity
+        "bf9679c0-0de6-11d0-a285-00aa003049e2": "AddMember",            # member
+        "f3a64788-5306-11d1-a9c5-0000f80367c1": "WriteSPN",             # servicePrincipalName (targeted kerberoast)
+    }
+    _FORCE_CHANGE_PWD_GUID = "00299570-246d-11d0-a768-00aa006e0529"      # User-Force-Change-Password extended right
+
     def __init__(self, conn: "ADConnection", data: "ADData", args):
         self.conn = conn; self.data = data; self.args = args
         self.sid2name = {}; self.dn2sid = {}; self.adj = defaultdict(list); self.radj = defaultdict(list)
@@ -6208,7 +6618,12 @@ class ControlPathAnalyzer:
         # not themselves flagged as control-path principals.
         self.seeds = set()
         for rid in (512, 519, 518, 548, 551, 549, 550, 520,    # DA/EA/Schema/AcctOp/BackupOp/SrvOp/PrintOp/GPCreator
-                    516, 521, 498):                            # Domain Controllers / RODC / Enterprise RODC
+                    516, 521, 498,                             # Domain Controllers / RODC / Enterprise RODC
+                    526, 527):                                 # Key Admins / Enterprise Key Admins
+            # 526/527 hold WriteProperty(msDS-KeyCredentialLink) on accounts BY
+            # DESIGN (WHfB key management) — Tier-0-equivalent (shadow-cred any
+            # account). Seeding them stops that default ACE being reported as a
+            # non-privileged AddKeyCredentialLink control path.
             if dsid:
                 self.seeds.add(f"{dsid}-{rid}")
         self.seeds |= {"S-1-5-32-544", "S-1-5-32-548", "S-1-5-32-551", "S-1-5-32-549", "S-1-5-32-550"}
@@ -6348,17 +6763,36 @@ class ControlPathAnalyzer:
                 if psid not in self.sid2name or psid in self.tier0_groups:
                     continue  # only edges from resolvable, non-Tier-0 principals
                 label = None
-                if dcsync and "OBJECT" in ace["TypeName"].upper():
+                is_object = "OBJECT" in ace["TypeName"].upper()
+                ot_guid = ""
+                if is_object:
                     ot = _ace_object_type(ace["Ace"])
                     if ot and len(ot) == 16:
-                        guid = _guid_from_bytes(bytes(ot)).strip("{}").lower()
-                        if guid in _DCSYNC_GUIDS:
-                            label = "DCSync"
+                        ot_guid = _guid_from_bytes(bytes(ot)).strip("{}").lower()
+                ctrl_access = bool(mask & _ACE_DS_CTRL_ACCESS)
+                if dcsync and ot_guid in _DCSYNC_GUIDS:
+                    label = "DCSync"
+                # AllExtendedRights (control-access with NO ObjectType) on the domain
+                # head grants the replication rights -> DCSync. Close the null-GUID gap.
+                elif dcsync and ctrl_access and not ot_guid:
+                    label = "DCSync"
                 if label is None and (mask & self._TAKEOVER):
                     if mask & _ACE_GENERIC_ALL:   label = "GenericAll"
                     elif mask & _ACE_WRITE_DAC:   label = "WriteDacl"
                     elif mask & _ACE_WRITE_OWNER: label = "WriteOwner"
                     else:                          label = "GenericWrite"
+                # Targeted per-attribute WriteProperty (Shadow Credentials / RBCD /
+                # AddMember / WriteSPN). Only when the ACE names a specific dangerous
+                # attribute — GenericAll/GenericWrite already covered the write-all case.
+                if label is None and is_object and (mask & _ACE_DS_WRITE_PROP):
+                    label = self._WRITE_ATTR_EDGES.get(ot_guid)
+                # Targeted control-access on an account: ForceChangePassword (reset
+                # the target's password) or AllExtendedRights (null GUID, which
+                # includes it). Restricted to user/computer targets so it doesn't
+                # over-fire on containers/groups.
+                if label is None and kind == "object" and ctrl_access:
+                    if ot_guid == self._FORCE_CHANGE_PWD_GUID or not ot_guid:
+                        label = "ForceChangePassword"
                 if label:
                     self._edge(psid, target_node, label)
             except Exception:
@@ -6634,10 +7068,14 @@ class ControlPathAnalyzer:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class SMBChecker:
-    def __init__(self, target: str, args, findings: List[Finding]):
+    def __init__(self, target: str, args, findings: List[Finding],
+                 dc_hosts: Optional[List[str]] = None):
         self.target   = target
         self.args     = args
         self.findings = findings
+        # All DC FQDNs to sweep for SMB signing (PingCastle checks every DC, not
+        # just the one you bound to). The primary target is always included.
+        self.dc_hosts = dc_hosts or []
 
     def _add(self, rule_id: str, details: str = "", affected: List[str] = None):
         if rule_id in SUPPRESSED_RULES:
@@ -6660,11 +7098,32 @@ class SMBChecker:
         self._check_smb_signing()
         self._check_smbv1()
 
-    def _get_smb_conn(self) -> Optional["SMBConnection"]:
+    def _signing_targets(self) -> List[Tuple[str, str]]:
+        """(connect_host, fqdn) per DC, primary first, deduped by FQDN. fqdn is used
+        as the Kerberos remoteName so the cifs/<fqdn> SPN matches each DC."""
+        seen: Set[str] = set()
+        out: List[Tuple[str, str]] = []
+        def add(connect_host: str, fqdn: str):
+            if not connect_host:
+                return
+            key = (fqdn or connect_host).lower()
+            if key in seen:
+                return
+            seen.add(key)
+            out.append((connect_host, fqdn or connect_host))
+        add(self.target, self.args.dc_host or self.target)
+        for h in self.dc_hosts:
+            add(h, h)
+        return out
+
+    def _get_smb_conn(self, host: Optional[str] = None,
+                      remote_name: Optional[str] = None) -> Optional["SMBConnection"]:
         try:
+            host = host or self.target
             # Kerberos needs the FQDN as remoteName for the cifs/<fqdn> SPN.
-            remote_name = (self.args.dc_host or self.target) if self.args.kerberos else self.target
-            smb = SMBConnection(remote_name, self.target, timeout=10)
+            if remote_name is None:
+                remote_name = (self.args.dc_host or host) if self.args.kerberos else host
+            smb = SMBConnection(remote_name, host, timeout=10)
             if self.args.kerberos:
                 lm = nt = ""
                 if self.args.hashes:
@@ -6702,30 +7161,36 @@ class SMBChecker:
             return None
 
     def _check_smb_signing(self):
-        # Reuse the authenticated connection (handles password/hash/Kerberos) and
-        # ask impacket directly whether the server REQUIRES SMB signing — the
-        # security-relevant flag for NTLM relay.
-        smb = self._get_smb_conn()
-        if smb is None:
-            return
-        try:
-            required = smb.isSigningRequired()
-        except Exception as e:
-            if self.args.verbose:
-                print(f"[!] SMB signing check failed: {e}")
-            return
-        finally:
+        # Ask impacket whether each DC REQUIRES SMB signing — the security-relevant
+        # flag for NTLM relay. Sweeps every DC and aggregates into ONE finding so a
+        # misconfigured secondary DC isn't missed (and scaled_points isn't inflated
+        # by per-host duplicates).
+        not_required: List[str] = []
+        for host, fqdn in self._signing_targets():
+            smb = self._get_smb_conn(host, fqdn)
+            if smb is None:
+                continue
             try:
-                smb.logoff()
-            except Exception:
-                pass
-        if not required:
+                required = smb.isSigningRequired()
+            except Exception as e:
+                if self.args.verbose:
+                    print(f"[!] SMB signing check failed for {fqdn}: {e}")
+                continue
+            finally:
+                try:
+                    smb.logoff()
+                except Exception:
+                    pass
+            if not required:
+                not_required.append(fqdn)
+        if not_required:
             self._add("A-SMB2SignatureNotRequired",
-                      f"{self.target}: SMB signing is NOT required by the server. "
-                      "Unsigned SMB sessions can be relayed (impacket-ntlmrelayx) — "
-                      "coerce DC/host auth (PetitPotam/PrinterBug) and relay to this "
-                      "or another host for code execution or ADCS (ESC8).",
-                      [self.target])
+                      f"SMB signing is NOT required on {len(not_required)} domain "
+                      f"controller(s): {', '.join(not_required)}. Unsigned SMB sessions "
+                      "can be relayed (impacket-ntlmrelayx) — coerce DC/host auth "
+                      "(PetitPotam/PrinterBug) and relay to this or another host for "
+                      "code execution or ADCS (ESC8).",
+                      not_required)
 
     def _check_smbv1(self):
         try:
@@ -6785,8 +7250,9 @@ EXPOSURE_WEIGHTS = {
     "S-Kerberoastable":55, "S-NoPreAuth":52, "P-ConstrainedDelegService":55,
     "P-RBCD":55, "A-ReversiblePwd":52, "S-Reversible":52, "P-MachineAccountQuota":48,
     "A-DCLdapSign":45, "A-SMB2SignatureNotRequired":45, "A-DCLdapsChannelBinding":42,
+    "A-LDAPSigningDisabled":45, "A-DC-Spooler":40, "A-DC-WebClient":40,
     "S-DesEnabled":45, "A-NullSession":40, "P-AdminCountOrphan":35,
-    "A-SCCM":72, "A-Pre2kComputer":78, "A-WeakLockout":40, "S-OS-NT":78,
+    "A-SCCM":72, "A-Pre2kComputer":78, "A-WeakLockout":20, "S-OS-NT":78,
     "A-CertCAManageLowPriv":88, "A-CertTemplateESC9":80,
     "A-CertTemplateESC5":88, "A-CertTemplateESC13":84, "A-CertTemplateESC15":84,
     "A-CertWeakMapping":78, "A-PasswordInDescription":82, "P-LAPSReadable":88,
@@ -9195,12 +9661,34 @@ def main():
 
     # ── SMB checks ────────────────────────────────────────────────────────────
     if not args.no_smb:
-        smb = SMBChecker(args.dc_ip, args, findings)
+        dc_hosts = [get_str(d["attrs"], "dNSHostName") for d in data.dcs
+                    if get_str(d["attrs"], "dNSHostName")]
+        smb = SMBChecker(args.dc_ip, args, findings, dc_hosts=dc_hosts)
         try:
             smb.run()
         except Exception as e:
             if args.verbose:
                 print(f"[!] SMB check error: {e}")
+
+    # ── coercion → relay reconciliation ───────────────────────────────────────
+    # A DC coercion primitive (Print Spooler / WebClient) is enabled by default on
+    # DCs and is only a Tier-0 path when an unsigned relay SINK exists. Raise the
+    # critical A-DC-Coerce only when BOTH are present (SMB findings are appended
+    # after the engine runs, so this reconciliation happens here).
+    RELAY_SINKS = {"A-SMB2SignatureNotRequired", "A-SMB2SignatureNotEnabled",
+                   "A-DCLdapSign", "A-LDAPSigningDisabled", "A-DCLdapsChannelBinding",
+                   "A-CertEnrollHttp"}
+    present = {f.rule_id for f in findings}
+    coerce_primitive = next((f for f in findings
+                             if f.rule_id in ("A-DC-Spooler", "A-DC-WebClient")), None)
+    sinks_present = sorted(present & RELAY_SINKS)
+    if coerce_primitive and sinks_present:
+        engine._add("A-DC-Coerce",
+                    "A DC authentication-coercion primitive (MS-RPRN / WebClient) is reachable "
+                    "AND an unsigned relay sink is present (" + ", ".join(sinks_present) + "). "
+                    "Coerce DC auth (PetitPotam / PrinterBug) and relay it to that sink "
+                    "(impacket-ntlmrelayx to LDAP/SMB/ADCS) for a path to Tier-0.",
+                    coerce_primitive.affected)
 
     # ── score ─────────────────────────────────────────────────────────────────
     scorer = RiskScorer(findings, data)
