@@ -6555,8 +6555,10 @@ class ControlPathAnalyzer:
         "3f78c3e5-f79a-46bd-a0b8-9d18116ddc79": "WriteRBCD",             # msDS-AllowedToActOnBehalfOfOtherIdentity
         "bf9679c0-0de6-11d0-a285-00aa003049e2": "AddMember",            # member
         "f3a64788-5306-11d1-a9c5-0000f80367c1": "WriteSPN",             # servicePrincipalName (targeted kerberoast)
+        "f30e3bbe-9ff0-11d1-b603-0000f80367c1": "WriteGPLink",          # gPLink (link a rogue GPO)
     }
     _FORCE_CHANGE_PWD_GUID = "00299570-246d-11d0-a768-00aa006e0529"      # User-Force-Change-Password extended right
+    _GPLINK_GUID           = "f30e3bbe-9ff0-11d1-b603-0000f80367c1"      # gP-Link attribute
 
     def __init__(self, conn: "ADConnection", data: "ADData", args):
         self.conn = conn; self.data = data; self.args = args
@@ -6573,6 +6575,8 @@ class ControlPathAnalyzer:
             self._index()
             self._membership_edges()
             self._acl_edges()
+            self._gmsa_edges()
+            self._dc_ou_gplink_edges()
             self._close()
         except Exception as e:
             if self.args.verbose:
@@ -6665,6 +6669,91 @@ class ControlPathAnalyzer:
                 gsid = f"{self.dsid}-{pg}"
                 if gsid in self.sid2name:
                     self._edge(self._sid_of(obj), gsid, "primary group", membership=True)
+
+    def _dc_ou_gplink_edges(self):
+        """WriteGPLink: a non-Tier-0 principal who can write gPLink on (or take over)
+        an OU that scopes domain controllers can link a rogue GPO -> SYSTEM on every
+        DC in that OU -> Tier-0. Reads the DC parent-OU chain (the domain root is
+        already covered by _acl_edges). FP-safe: on a default domain only Tier-0
+        principals hold these rights on the Domain Controllers OU."""
+        base = self.conn.base_dn.lower()
+        ou_dns = set()
+        for dc in self.data.dcs:
+            rest = (dc.get("dn", "") or "").lower()
+            while "," in rest:
+                rest = rest.split(",", 1)[1]
+                if rest == base:
+                    break
+                if rest.startswith("ou="):
+                    ou_dns.add(rest)
+        for dn in ou_dns:
+            sd = self._fetch_one_sd(dn)
+            if not sd:
+                continue
+            dacl = sd["Dacl"]
+            if not dacl:
+                continue
+            for ace in dacl["Data"]:
+                try:
+                    if "DENIED" in ace["TypeName"].upper():
+                        continue
+                    mask = int(ace["Ace"]["Mask"]["Mask"])
+                    psid = ace["Ace"]["Sid"].formatCanonical()
+                except Exception:
+                    continue
+                if psid not in self.sid2name or psid in self.tier0_groups:
+                    continue
+                is_object = "OBJECT" in ace["TypeName"].upper()
+                ot_guid = ""
+                if is_object:
+                    ot = _ace_object_type(ace["Ace"])
+                    if ot and len(ot) == 16:
+                        ot_guid = _guid_from_bytes(bytes(ot)).strip("{}").lower()
+                if mask & (_ACE_GENERIC_ALL | _ACE_GENERIC_WRITE | _ACE_WRITE_DAC | _ACE_WRITE_OWNER):
+                    self._edge(psid, self.domain_root, "WriteGPLink")
+                elif is_object and (mask & _ACE_DS_WRITE_PROP) and ot_guid == self._GPLINK_GUID:
+                    self._edge(psid, self.domain_root, "WriteGPLink")
+
+    def _gmsa_edges(self):
+        """ReadGMSAPassword edges: principals named in a gMSA/dMSA's
+        msDS-GroupMSAMembership can retrieve msDS-ManagedPassword (-> NT hash / AES
+        keys) and authenticate as that account. When the gMSA is privileged, a
+        non-Tier-0 reader has a control path to Tier-0. Complements the broad-only
+        P-GMSAReadable finding by catching narrowly-delegated readers in the graph."""
+        try:
+            objs = self.conn.paged_search(
+                self.conn.base_dn,
+                "(|(objectClass=msDS-GroupManagedServiceAccount)"
+                "(objectClass=msDS-DelegatedManagedServiceAccount))",
+                ["objectSid", "msDS-GroupMSAMembership", "sAMAccountName"])
+        except Exception:
+            return
+        for o in objs:
+            gsid = self._sid_of(o)
+            if not gsid:
+                continue
+            raw = o["attrs"].get("msDS-GroupMSAMembership")
+            if isinstance(raw, list):
+                raw = raw[0] if raw else None
+            if not isinstance(raw, (bytes, bytearray)):
+                continue
+            try:
+                sd = _ldaptypes.SR_SECURITY_DESCRIPTOR(data=raw)
+            except Exception:
+                continue
+            dacl = sd["Dacl"]
+            if not dacl:
+                continue
+            self.sid2name.setdefault(gsid, get_str(o["attrs"], "sAMAccountName") or gsid)
+            for ace in dacl["Data"]:
+                try:
+                    if "DENIED" in ace["TypeName"].upper():
+                        continue
+                    psid = ace["Ace"]["Sid"].formatCanonical()
+                except Exception:
+                    continue
+                if psid in self.sid2name and psid not in self.tier0_groups:
+                    self._edge(psid, gsid, "ReadGMSAPassword")
 
     def _acl_edges(self):
         # Bulk-read SDs for groups, then for EVERY user and computer (roadmap 1 —
