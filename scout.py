@@ -3588,6 +3588,14 @@ class CheckEngine:
         "S-1-5-18", "S-1-5-19", "S-1-5-20",  # SYSTEM, LOCAL/NETWORK SERVICE
         "S-1-5-32-544",  # BUILTIN\Administrators
     }
+    # Operator groups with their Windows-default dangerous privileges — not findings
+    _DEFAULT_OPERATOR_PRIVS = {
+        ("S-1-5-32-549", "sebackupprivilege"),     # Server Operators
+        ("S-1-5-32-549", "serestoreprivilege"),
+        ("S-1-5-32-551", "sebackupprivilege"),     # Backup Operators
+        ("S-1-5-32-551", "serestoreprivilege"),
+        ("S-1-5-32-550", "seloaddriverprivilege"), # Print Operators
+    }
 
     def _m_dangerous_user_rights(self):
         """Detect dangerous privileges assigned to broad/low-priv principals via GPO."""
@@ -3595,18 +3603,6 @@ class CheckEngine:
         if not entries:
             return
         broad = self._broad_low_priv_sids()
-        admin_sids = set(self._ADMIN_SIDS_RIGHTS)
-        try:
-            dsid_raw = self.d.domain_obj["attrs"].get("objectSid")
-            if isinstance(dsid_raw, list):
-                dsid_raw = dsid_raw[0] if dsid_raw else None
-            dsid = sid_to_str(dsid_raw) if dsid_raw else None
-            if dsid and dsid.startswith("S-1-5-21"):
-                admin_sids.add(f"{dsid}-512")   # Domain Admins
-                admin_sids.add(f"{dsid}-519")   # Enterprise Admins
-                admin_sids.add(f"{dsid}-500")   # Administrator
-        except Exception:
-            pass
 
         affected = []
         for entry in entries:
@@ -3618,13 +3614,15 @@ class CheckEngine:
             for sid in sids:
                 if not sid.startswith("S-1-"):
                     continue
-                if sid in admin_sids:
+                if sid not in broad:
+                    continue
+                if (sid, priv_key) in self._DEFAULT_OPERATOR_PRIVS:
                     continue
                 label = broad.get(sid, sid)
                 affected.append(f"{priv_name} → {label}")
         if affected:
             self._add("P-DangerousUserRight",
-                      f"{len(affected)} dangerous user right(s) assigned to non-admin "
+                      f"{len(affected)} dangerous user right(s) assigned to broad "
                       "principals via GPO. These privileges enable direct local privilege "
                       "escalation (debug → SYSTEM, backup → SAM extraction, impersonate → "
                       "potato attacks).",
