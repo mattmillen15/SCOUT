@@ -264,7 +264,7 @@ RULES: Dict[str, Tuple[str, str, int, str]] = {
     "S-DC-Inactive":          ("Domain controller account inactive","Stale",25,"HIGH"),
     "S-DC-NotUpdated":        ("Domain controllers not patched recently","Stale",10,"MEDIUM"),
     "S-PwdNeverExpires":      ("Accounts with password set to never expire","Stale",5,"LOW"),
-    "S-PwdNotRequired":       ("Accounts where no password is required","Stale",15,"HIGH"),
+    "S-PwdNotRequired":       ("Accounts where no password is required","Stale",15,"MEDIUM"),
     "S-Reversible":           ("User accounts with reversible encryption","Stale",15,"HIGH"),
     "S-DesEnabled":           ("Accounts with DES-only encryption","Stale",15,"HIGH"),
     "S-NoPreAuth":            ("User accounts without Kerberos pre-auth","Stale",15,"HIGH"),
@@ -321,17 +321,19 @@ RULES: Dict[str, Tuple[str, str, int, str]] = {
     "P-ModifiableGPO":        ("GPO DACL allows broad principal write access","Privileged",75,"CRITICAL"),
     "P-DCSync":               ("Non-admin principal has DCSync rights on domain root","Privileged",100,"CRITICAL"),
     "P-DangerousACLDomain":   ("Broad principal has WriteDACL/WriteOwner/GenericAll on domain root","Privileged",100,"CRITICAL"),
+    "P-DangerousACLNamingContext": ("Broad principal has WriteDACL/WriteOwner/GenericAll on the Configuration/Schema NC (forest takeover)","Privileged",100,"CRITICAL"),
     "P-DangerousACLDA":       ("Broad principal can write to Domain Admins group","Privileged",100,"CRITICAL"),
     "P-DangerousACLGPO":      ("Broad principal can modify high-value GPO","Privileged",75,"CRITICAL"),
     "P-MachineAccountQuota":  ("ms-DS-MachineAccountQuota > 0 (any user can add machine accounts)","Privileged",25,"HIGH"),
+    "P-KrbRelayUp":           ("KrbRelayUp: MachineAccountQuota > 0 and LDAP signing not required (any user -> SYSTEM on any host)","Privileged",60,"HIGH"),
     "P-OwnsPrivObject":       ("Broad principal owns a privileged AD object","Privileged",50,"CRITICAL"),
     "P-WriteToPrivGroup":     ("Broad principal can add members to privileged group","Privileged",100,"CRITICAL"),
     "A-WDigest":              ("WDigest UseLogonCredential enabled via GPO","Anomaly",50,"CRITICAL"),
     "A-LMCompatibilityLevel": ("LmCompatibilityLevel < 3 via GPO (NTLMv1 allowed)","Anomaly",50,"CRITICAL"),
-    "A-LLMNR":                ("LLMNR not disabled via GPO","Anomaly",25,"HIGH"),
+    "A-LLMNR":                ("LLMNR not disabled via GPO","Anomaly",25,"MEDIUM"),
     "A-NBTNSDisabled":        ("NetBIOS Name Service not disabled via GPO","Anomaly",15,"MEDIUM"),
     "A-CredentialGuard":      ("Credential Guard not configured via GPO","Anomaly",10,"MEDIUM"),
-    "A-HardenedPaths":        ("UNC hardened paths not configured via GPO","Anomaly",25,"HIGH"),
+    "A-HardenedPaths":        ("UNC hardened paths not configured via GPO","Anomaly",25,"MEDIUM"),
     "A-PowerShellLogging":    ("PowerShell script block logging not enabled","Anomaly",10,"MEDIUM"),
     "A-PowerShellTranscript": ("PowerShell transcription not enabled","Anomaly",5,"LOW"),
     "A-WSUS-HTTP":            ("WSUS WUServer using HTTP (not HTTPS)","Anomaly",25,"HIGH"),
@@ -346,7 +348,7 @@ RULES: Dict[str, Tuple[str, str, int, str]] = {
     "P-ComputerInPrivGroup":  ("Computer account is a member of a privileged group","Privileged",50,"CRITICAL"),
     "P-AdminCountOrphan":     ("Orphaned adminCount=1 objects (former privilege, restrictive ACL)","Privileged",10,"MEDIUM"),
     "S-SIDHistoryPrivileged": ("SID history references a privileged / built-in SID","Privileged",75,"CRITICAL"),
-    "A-RestrictRemoteSAM":    ("RestrictRemoteSAM not enforced (anonymous SAM enumeration)","Anomaly",10,"MEDIUM"),
+    "A-RestrictRemoteSAM":    ("RestrictRemoteSAM not enforced (anonymous SAM enumeration)","Anomaly",10,"LOW"),
     "A-NTLMAudit":            ("NTLM auditing not enabled (RestrictSendingNTLMTraffic)","Anomaly",5,"LOW"),
     "A-DSRMLogon":            ("DSRM administrator allowed to log on over the network","Anomaly",25,"HIGH"),
     "A-CertTemplateESC4":     ("Certificate template ACL writable by low-privileged principal (ESC4)","Anomaly",50,"CRITICAL"),
@@ -360,6 +362,7 @@ RULES: Dict[str, Tuple[str, str, int, str]] = {
     "A-SCCMContainerACL":     ("System Management (SCCM) container writable by a broad principal","Anomaly",40,"HIGH"),
     "A-SCCM":                 ("SCCM/MECM site infrastructure exposed (relay / NAA / PXE attack surface)","Anomaly",40,"HIGH"),
     "A-Pre2kComputer":        ("Pre-created (pre-Windows 2000) computer accounts with a predictable password","Anomaly",50,"HIGH"),
+    "A-Certifried":           ("Certifried (CVE-2022-26923): machine-enrollable auth template + MachineAccountQuota > 0","Anomaly",60,"HIGH"),
     "A-WeakLockout":          ("No / weak account-lockout policy (password spraying viable)","Anomaly",10,"MEDIUM"),
     # ── Added — managed-account / KDS / Entra / GPO-link coverage (roadmap) ────
     "P-GMSAReadable":         ("gMSA/dMSA managed password readable by a broad principal","Privileged",50,"CRITICAL"),
@@ -377,8 +380,22 @@ RULES: Dict[str, Tuple[str, str, int, str]] = {
 }
 
 # Field/army palette — oxide red, rust, mustard/brass, olive drab, field gray.
-SEV_COLOR = {"CRITICAL":"#b23a2e","HIGH":"#c2702a","MEDIUM":"#c9a227",
-              "LOW":"#6f8f3f","INFO":"#8a8f78"}
+SEV_COLOR = {"CRITICAL":"#d6453b","HIGH":"#e0863a","MEDIUM":"#d8b84a",
+              "LOW":"#82a455","INFO":"#5f93a6"}
+# MIL-STD-2525-style affiliation glyphs — redundant shape+color so severity reads
+# even in monochrome / on a night-vision TTY.
+SEV_GLYPH = {"CRITICAL":"◆","HIGH":"▲","MEDIUM":"■","LOW":"●","INFO":"◇"}
+# ── terminal (ANSI 256-color) field scheme: alert-red / amber / khaki / OD / steel ──
+ANSI_SEV = {"CRITICAL":"\033[1;38;5;160m","HIGH":"\033[38;5;208m","MEDIUM":"\033[38;5;178m",
+            "LOW":"\033[38;5;107m","INFO":"\033[38;5;109m"}
+ANSI = {"brass":"\033[38;5;179m","bone":"\033[38;5;223m","faint":"\033[38;5;240m",
+        "od":"\033[38;5;107m","reset":"\033[0m"}
+def _band_ansi(v: int) -> str:
+    """Color a 0-100 risk score by band (green→khaki→amber→alert-red)."""
+    if v >= 85: return "\033[1;38;5;160m"
+    if v >= 70: return "\033[38;5;208m"
+    if v >= 40: return "\033[38;5;178m"
+    return "\033[38;5;107m"
 CAT_COLOR  = {"Anomaly":"#c2702a","Privileged":"#a8843c",
                "Stale":"#5d7a86","Trust":"#6f8f3f"}
 
@@ -477,6 +494,8 @@ RULE_MITRE: Dict[str, List[str]] = {
     "P-ConstrainedDelegService": ["T1558: Steal/Forge Kerberos Tickets"],
     "P-DelegationDCt2a4d": ["T1134.001: Token Impersonation/Theft"],
     "P-MachineAccountQuota": ["T1136: Create Account", "T1098: Account Manipulation"],
+    "P-KrbRelayUp": ["T1187: Forced Authentication", "T1557: Adversary-in-the-Middle"],
+    "P-DangerousACLNamingContext": ["T1484: Domain or Tenant Policy Modification", "T1649: Steal or Forge Authentication Certificates"],
     "A-CertTempCustomSubject": ["T1649: Steal/Forge Authentication Certificates (ESC1)"],
     "A-CertTempAnyPurpose": ["T1649: Authentication Certificates (ESC2)"],
     "A-CertTempAgent": ["T1649: Authentication Certificates (ESC3)"],
@@ -545,6 +564,7 @@ RULE_MITRE: Dict[str, List[str]] = {
     "A-TombstoneLifetime": ["T1485: Data Destruction"],
     "S-OS-2012": ["T1210: Exploitation of Remote Services"],
     "A-Pre2kComputer": ["T1078: Valid Accounts", "T1110: Brute Force"],
+    "A-Certifried": ["T1649: Steal or Forge Authentication Certificates"],
     "A-WeakLockout": ["T1110.003: Password Spraying"],
     "P-ExchangePrivEsc": ["T1222.001: ACL Modification", "T1098: Account Manipulation"],
     "P-GMSAReadable": ["T1555: Credentials from Password Stores", "T1078: Valid Accounts"],
@@ -607,6 +627,8 @@ OP_CATEGORY = {
     "P-RBCD-Dangerous":"Privilege Escalation","P-DelegationDCt2a4d":"Privilege Escalation",
     "P-DelegationDCa2d2":"Privilege Escalation","P-DangerousExtendedRight":"Privilege Escalation",
     "P-MachineAccountQuota":"Privilege Escalation","P-DNSAdmin":"Privilege Escalation",
+    "P-KrbRelayUp":"Privilege Escalation","A-Certifried":"Privilege Escalation",
+    "P-DangerousACLNamingContext":"Privilege Escalation",
     "P-ExchangePrivEsc":"Privilege Escalation","A-MembershipEveryone":"Privilege Escalation",
     "P-AdminNum":"Privilege Escalation","P-SchemaAdmin":"Privilege Escalation",
     "A-AdminSDHolder":"Privilege Escalation","P-DelegationEveryone":"Privilege Escalation",
@@ -689,6 +711,16 @@ SUPPRESSED_RULES = {
     "A-NoServicePolicy", "A-BackupMetadata", "S-DefaultOUChanged", "S-JavaSchema",
     "S-TerminalServicesGPO", "S-ADRegistration", "S-FolderOptions", "S-FirewallScript",
     "S-DefenderASR", "P-OperatorsEmpty", "A-DnsZoneTransfert", "A-DnsZoneUpdate2",
+    # A-ProtectedUsers is the same issue as P-ProtectedUsers (privileged accounts
+    # not in Protected Users) with identical remediation — keep only the superset.
+    "A-ProtectedUsers",
+    # Non-exploitable defaults / low-signal noise:
+    # - A-DnsZoneAUCreateChild: Authenticated-Users CreateChild on AD-integrated
+    #   DNS zones is a Windows DEFAULT present on every domain (ADIDNS surface is
+    #   covered by the dynamic-update checks instead).
+    # - T-Inactive: infers staleness from the trust object's whenChanged (edit
+    #   time, not usage) so a healthy stable trust always trips it.
+    "A-DnsZoneAUCreateChild", "T-Inactive",
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1465,6 +1497,37 @@ RULE_DOCS: Dict[str, Dict[str, Any]] = {
             "Pre-stage with a random password and the correct joining identity, not the Pre-Windows 2000 option.",
         ],
         "refs": ["https://github.com/garrettfoster13/pre2k"],
+    },
+    "A-Certifried": {
+        "description": "Certifried (CVE-2022-26923): any authenticated user can request a certificate that impersonates a domain controller.",
+        "why": "With MachineAccountQuota>0 a low-privileged user can create a machine account, then — on a template that permits machine enrollment and carries an authentication EKU — request a certificate while spoofing a DC's dNSHostName. PKINIT with that certificate authenticates AS the DC: full domain compromise from a standard user.",
+        "technical": "Preconditions: ms-DS-MachineAccountQuota > 0 AND a published template enrollable by Domain Computers / Authenticated Users with an authentication EKU (Client Auth / PKINIT / Smart Card Logon / Any Purpose). Mitigated by KB5014754 strong certificate-mapping enforcement — confirm the CA and DCs are in full enforcement before treating as live.",
+        "exploit": [
+            "certipy account create -u you@domain.local -p pass -user evilpc -dns dc.domain.local",
+            "certipy req -u 'evilpc$'@domain.local -p pass -ca <CA> -template <tmpl>",
+            "certipy auth -pfx dc.pfx            # PKINIT as the DC -> DCSync",
+        ],
+        "remediation": [
+            "Set ms-DS-MachineAccountQuota = 0 and delegate machine-join to a controlled group.",
+            "Enable strong certificate-mapping enforcement (KB5014754) on the CA and all DCs.",
+            "Remove machine-enrollment / authentication EKUs from templates that do not need them.",
+        ],
+        "refs": ["https://research.ifcr.dk/certifried-active-directory-domain-privilege-escalation-cve-2022-26923-9e098fe298f4"],
+    },
+    "P-KrbRelayUp": {
+        "description": "KrbRelayUp: MachineAccountQuota>0 combined with LDAP signing not required lets any domain user escalate to SYSTEM on any domain-joined host.",
+        "why": "A standard user creates a machine account (MAQ>0), relays local Kerberos authentication to LDAP (which accepts an unsigned bind), writes msDS-AllowedToActOnBehalfOfOtherIdentity (RBCD) on the victim computer, then uses S4U to get a SYSTEM ticket. A reliable local-to-domain escalation needing no extra credentials.",
+        "technical": "Preconditions observed by SCOUT: ms-DS-MachineAccountQuota > 0 AND the DC accepted an unsigned authenticated LDAP bind (LDAP signing not required). Fixing EITHER precondition breaks the chain.",
+        "exploit": [
+            "KrbRelayUp.exe relay -Domain domain.local -ComputerName victim$",
+            "addcomputer.py + ntlmrelayx -t ldap://dc --delegate-access   # RBCD variant",
+            "getST.py -spn cifs/victim -impersonate Administrator 'domain/evilpc$:pass'",
+        ],
+        "remediation": [
+            "Enforce LDAP signing AND LDAP channel binding on all DCs (this alone breaks the relay).",
+            "Set ms-DS-MachineAccountQuota = 0.",
+        ],
+        "refs": ["https://github.com/Dec0ne/KrbRelayUp"],
     },
     "A-WeakLockout": {
         "description": "The domain (or a fine-grained policy) has no — or a very high — account-lockout threshold.",
@@ -2400,6 +2463,30 @@ class ADConnection:
         print(f"[+] Kerberos LDAP bind successful ({url}).")
 
         self._impacket = ic
+        # Guard against impacket's lack of a socket timeout: without this, a
+        # mis-framed/desynced response makes every subsequent search hang
+        # forever (observed on schema-NC reads). A finite timeout turns that into
+        # a fast error that _impacket_search() recovers from via reconnect.
+        self._impacket_timeout = getattr(self.args, "timeout", 20) or 20
+        try:
+            ic._socket.settimeout(self._impacket_timeout)
+        except Exception:
+            pass
+        # Reconnect closure used by _impacket_search() after a poisoning error:
+        # rebind a fresh impacket LDAP connection with the ticket we already
+        # cached (KRB5CCNAME was set during TGT acquisition) and retry the search.
+        _url, _lm, _nt = url, lm, nt
+        def _mk_impacket():
+            nc = ildap.LDAPConnection(_url, "", self.args.dc_ip)
+            nc.kerberosLogin(self.args.username or "", "", self.args.domain,
+                             lmhash=_lm, nthash=_nt, aesKey=self.args.aes_key or "",
+                             kdcHost=self.args.dc_ip, useCache=True)
+            try:
+                nc._socket.settimeout(self._impacket_timeout)
+            except Exception:
+                pass
+            return nc
+        self._mk_impacket = _mk_impacket
         # Remember the FQDN so the SMB/SYSVOL Kerberos logins build a valid SPN
         # (cifs/<fqdn>, not cifs/<ip> which yields KDC_ERR_S_PRINCIPAL_UNKNOWN).
         if not self.args.dc_host and dc_fqdn and dc_fqdn != self.args.dc_ip:
@@ -2459,7 +2546,8 @@ class ADConnection:
         return True
 
     def _impacket_search(self, base: str, flt: str, attrs: List[str],
-                         page_size: int = 500, sd_flags: Optional[int] = None) -> List[Dict]:
+                         page_size: int = 500, sd_flags: Optional[int] = None,
+                         scope: Optional[str] = None) -> List[Dict]:
         from impacket.ldap.ldapasn1 import SimplePagedResultsControl
         from impacket.ldap.ldap import LDAPSearchError
         controls = [SimplePagedResultsControl(size=page_size)]
@@ -2479,17 +2567,42 @@ class ADConnection:
                 controls.append(sdc)
             except Exception:
                 pass
-        try:
-            raw = self._impacket.search(searchBase=base, searchFilter=flt,
-                                        attributes=attrs, searchControls=controls)
-        except LDAPSearchError as e:
-            raw = e.getAnswers()
-        except Exception as e:
-            if self.args.verbose:
-                print(f"[!] impacket search error: {e}")
-            return []
+        kw = {}
+        if scope is not None:
+            try:
+                from impacket.ldap.ldapasn1 import Scope as _Scope
+                kw["scope"] = _Scope(scope)   # 'baseObject' | 'singleLevel' | 'wholeSubtree'
+            except Exception:
+                pass
+        # Resilient search. Some AD responses (notably schema-NC subtree reads)
+        # make impacket's decoder mis-frame a PDU and raise mid-stream, leaving
+        # unread bytes in the socket and DESYNCING the connection — every later
+        # search then blocks forever (impacket sets no socket timeout). The bind
+        # sets a socket timeout so a desync fails fast instead of hanging, and
+        # here we reconnect once with the cached ticket and retry, so one bad
+        # response can't abort the whole Kerberos/hash-backed collection pass.
+        raw = None
+        for attempt in (1, 2):
+            try:
+                raw = self._impacket.search(searchBase=base, searchFilter=flt,
+                                            attributes=attrs, searchControls=controls, **kw)
+                break
+            except LDAPSearchError as e:
+                try: raw = e.getAnswers()
+                except Exception: raw = []
+                break
+            except Exception as e:
+                if attempt == 1 and getattr(self, "_mk_impacket", None):
+                    try:
+                        self._impacket = self._mk_impacket()
+                        continue
+                    except Exception:
+                        pass
+                if self.args.verbose:
+                    print(f"[!] impacket search error ({base}): {e}")
+                return []
         out = []
-        for entry in raw:
+        for entry in (raw or []):
             try:
                 dn = str(entry["objectName"])
                 ad = {}
@@ -2541,7 +2654,15 @@ class ADConnection:
         # etc.) sees an empty descriptor — the root cause of ESC false positives.
         sd_flags = 0x07 if any(a.lower() == "ntsecuritydescriptor" for a in attrs) else None
         if getattr(self, "_impacket", None):
-            return self._impacket_search(base, flt, attrs, page_size, sd_flags)
+            # Map the ldap3 scope to impacket's scope string so single-object /
+            # schema reads can request baseObject (a subtree read of the schema NC
+            # desyncs impacket's decoder — see _impacket_search).
+            imp_scope = None
+            if scope == ldap3.BASE:
+                imp_scope = "baseObject"
+            elif scope == ldap3.LEVEL:
+                imp_scope = "singleLevel"
+            return self._impacket_search(base, flt, attrs, page_size, sd_flags, imp_scope)
         results = []
         try:
             ctrls = security_descriptor_control(sdflags=sd_flags) if sd_flags is not None else None
@@ -2568,8 +2689,9 @@ class ADConnection:
                 print(f"[!] LDAP search error ({base}, {flt}): {e}")
         return results
 
-    def search_one(self, base: str, flt: str, attrs: List[str]) -> Optional[Dict]:
-        r = self.paged_search(base, flt, attrs, page_size=5)
+    def search_one(self, base: str, flt: str, attrs: List[str],
+                   scope=ldap3.SUBTREE) -> Optional[Dict]:
+        r = self.paged_search(base, flt, attrs, scope=scope, page_size=5)
         return r[0] if r else None
 
     def fetch_sd(self, dn: str, sdflags: int = 0x07) -> Optional[bytes]:
@@ -2738,7 +2860,8 @@ class ADData:
         self.domain_level = getattr(c, "domain_func", -1)
         self.forest_level = getattr(c, "forest_func", -1)
 
-        sv = c.search_one(self.sch, "(objectClass=dMD)", ["objectVersion"])
+        sv = c.search_one(self.sch, "(objectClass=*)", ["objectVersion"],
+                          scope=ldap3.BASE)
         if sv:
             self.schema_version = get_int(sv["attrs"], "objectVersion")
 
@@ -2778,12 +2901,14 @@ class ADData:
             self.machine_account_quota = get_int(
                 self.domain_obj["attrs"], "ms-DS-MachineAccountQuota", -1)
 
-        # LAPS schema check
-        laps_attr = c.search_one(self.sch,
-            "(lDAPDisplayName=ms-Mcs-AdmPwd)", ["lDAPDisplayName"])
+        # LAPS schema check — baseObject reads of the attribute's schema object
+        # (NOT a schema-NC subtree search: those desync impacket's decoder and
+        # hang the Kerberos/hash backend). noSuchObject => attribute absent.
+        laps_attr = c.search_one(f"CN=ms-Mcs-AdmPwd,{self.sch}",
+            "(objectClass=*)", ["lDAPDisplayName"], scope=ldap3.BASE)
         if not laps_attr:
-            laps_attr = c.search_one(self.sch,
-                "(lDAPDisplayName=msLAPS-Password)", ["lDAPDisplayName"])
+            laps_attr = c.search_one(f"CN=ms-LAPS-Password,{self.sch}",
+                "(objectClass=*)", ["lDAPDisplayName"], scope=ldap3.BASE)
         self.laps_installed = laps_attr is not None
 
     # ── users ────────────────────────────────────────────────────────────────
@@ -2999,6 +3124,17 @@ class CheckEngine:
             return
         t, cat, pts, sev = self._rule(rule_id)
         aff = _dedup_keep_order(affected or [])
+        # Emit ONE finding per rule_id. Some rules are contributed from more than
+        # one code path or in a per-object loop; merge into the existing finding
+        # (union the affected objects, keep the first/richest details, rescale
+        # points) instead of rendering the same rule as several cards.
+        for f in self.findings:
+            if f.rule_id == rule_id:
+                f.affected = _dedup_keep_order(list(f.affected) + aff)
+                f.points = scaled_points(rule_id, pts, len(f.affected))
+                if details and not f.details:
+                    f.details = details
+                return
         self.findings.append(Finding(
             rule_id=rule_id, title=t, category=cat,
             points=scaled_points(rule_id, pts, len(aff)), severity=sev,
@@ -3425,7 +3561,7 @@ class CheckEngine:
             return
         conn = getattr(self.d, "conn", None)
         if getattr(conn, "ldap_signing_not_required", None) is True:
-            self._add("P-MachineAccountQuota",
+            self._add("P-KrbRelayUp",
                       f"ms-DS-MachineAccountQuota = {self.d.machine_account_quota} AND LDAP "
                       "signing is not required — KrbRelayUp attack chain is viable: any "
                       "authenticated user can create a machine account, relay Kerberos auth "
@@ -3451,7 +3587,7 @@ class CheckEngine:
                 dc_sids = {f"{s}-515" for s in self._broad_low_priv_sids()
                            if s.startswith("S-1-5-21") and s.endswith("-515")}
                 if any("Domain Computers" in e or "Authenticated Users" in e for e in enrollers):
-                    self._add("A-Pre2kComputer",
+                    self._add("A-Certifried",
                               f"CVE-2022-26923 (Certifried): MachineAccountQuota="
                               f"{self.d.machine_account_quota} and template '{cn}' is enrollable "
                               f"by {', '.join(enrollers)} with an authentication EKU. Create a "
@@ -3807,25 +3943,29 @@ class CheckEngine:
         self._sid_idx_cache = idx
         return idx
 
-    def _rbcd_allowed_principals(self, a) -> List[str]:
+    def _rbcd_allowed_principals(self, a) -> Optional[List[str]]:
         """Principals named in msDS-AllowedToActOnBehalfOfOtherIdentity — i.e. the
         accounts that can already use S4U to impersonate any user TO this object.
-        These are the specific principals an operator needs (issue #4); the bare
-        target name alone doesn't say who holds the delegation."""
+
+        Returns None when the SD is missing/unparseable (can't tell who, if
+        anyone, is granted), [] when the SD parses but its DACL grants NOBODY (an
+        empty/benign RBCD value — not an active delegation), or the list of
+        granted principals. The None vs [] distinction is what lets _m_rbcd fail
+        CLOSED instead of reporting an empty RBCD blob as 'instant DA'."""
         raw = a.get("msDS-AllowedToActOnBehalfOfOtherIdentity")
         if isinstance(raw, list):
             raw = raw[0] if raw else None
         if not isinstance(raw, (bytes, bytearray)) or not HAS_IMPACKET_LDAP:
-            return []
+            return None
         try:
             sd = _ldaptypes.SR_SECURITY_DESCRIPTOR(data=raw)
         except Exception:
-            return []
+            return None
         idx = self._sid_index()
         out: List[str] = []
         dacl = sd["Dacl"]
         if not dacl:
-            return []
+            return []   # DACL absent → grants nobody
         for ace in dacl["Data"]:
             try:
                 if "DENIED" in ace["TypeName"].upper():
@@ -3844,10 +3984,17 @@ class CheckEngine:
             if not get_list(a, "msDS-AllowedToActOnBehalfOfOtherIdentity") \
                and not get_str(a, "msDS-AllowedToActOnBehalfOfOtherIdentity"):
                 continue
-            sam = get_str(a, "sAMAccountName")
             allowed = self._rbcd_allowed_principals(a)
-            who = ", ".join(allowed) if allowed else "principals unreadable from SD"
-            entry = f"{sam} ← {who}"
+            # Fail CLOSED: only report RBCD that actually GRANTS a principal. An
+            # empty DACL (allowed == []) means the attribute is set but delegates
+            # to nobody — functionally no RBCD — and an unparseable SD
+            # (allowed is None) can't be confirmed. Reporting either is the
+            # classic "RBCD on the DC = instant DA" false positive (verified live:
+            # ECORP-DC$ carries a 0-ACE RBCD SD owned by Administrators).
+            if not allowed:
+                continue
+            sam = get_str(a, "sAMAccountName")
+            entry = f"{sam} ← {', '.join(allowed)}"
             if obj["dn"] in dc_dns:
                 dangerous.append(entry)
             else:
@@ -4858,6 +5005,12 @@ class CheckEngine:
         # ACE (type 0x05) may be scoped to a single non-dangerous property.
         takeover = (self._ADS_GENERIC_ALL | self._ADS_GENERIC_WRITE
                     | self._ADS_WRITE_DACL | self._ADS_WRITE_OWNER)
+        def _right_name(m):
+            if m & self._ADS_GENERIC_ALL:   return "GenericAll"
+            if m & self._ADS_WRITE_DACL:    return "WriteDacl"
+            if m & self._ADS_WRITE_OWNER:   return "WriteOwner"
+            if m & self._ADS_GENERIC_WRITE: return "GenericWrite"
+            return "write"
         out: List[str] = []
         dacl = sd["Dacl"]
         if not dacl:
@@ -4872,12 +5025,13 @@ class CheckEngine:
             if sidstr not in broad:
                 continue
             # For object ACEs, GenericWrite includes WriteProp which may be
-            # scoped — only flag full takeover permissions.
+            # scoped — only flag full takeover permissions. Name the exact matched
+            # right so the finding is self-evidencing (e.g. "Everyone (GenericWrite)").
             if ace["AceType"] == 0x05:
                 if mask & (self._ADS_GENERIC_ALL | self._ADS_WRITE_DACL | self._ADS_WRITE_OWNER):
-                    out.append(broad[sidstr])
+                    out.append(f"{broad[sidstr]} ({_right_name(mask)})")
             elif mask & takeover:
-                out.append(broad[sidstr])
+                out.append(f"{broad[sidstr]} ({_right_name(mask)})")
         return _dedup_keep_order(out)
 
     _BROAD_MEMBER_SIDS = {
@@ -5026,8 +5180,27 @@ class CheckEngine:
                 if sid in default_sids:
                     continue
                 mask = int(ace["Ace"]["Mask"]["Mask"])
-                write_bits = _ACE_WRITE_DAC | _ACE_WRITE_OWNER | _ACE_GENERIC_ALL | _ACE_GENERIC_WRITE | _ACE_DS_WRITE_PROP
-                if mask & write_bits:
+                # GenericAll/GenericWrite/WriteDacl/WriteOwner are takeover rights
+                # regardless of ACE scope.
+                takeover = (_ACE_WRITE_DAC | _ACE_WRITE_OWNER
+                            | _ACE_GENERIC_ALL | _ACE_GENERIC_WRITE)
+                dangerous = bool(mask & takeover)
+                # WriteProperty is a persistence backdoor ONLY when UNSCOPED. An
+                # object ACE carrying an ObjectType GUID (ACE_OBJECT_TYPE_PRESENT)
+                # scopes the write to a single property/property-set — e.g. the
+                # default Cert Publishers / Terminal Server License Servers ACEs
+                # on AdminSDHolder (mask 0x30 = RP|WP on one property) — which is
+                # NOT a backdoor. Only an unscoped WriteProperty counts.
+                if mask & _ACE_DS_WRITE_PROP:
+                    scoped = False
+                    if "OBJECT" in ace["TypeName"].upper():
+                        try:
+                            scoped = bool(int(ace["Ace"]["Flags"]) & 0x01)
+                        except Exception:
+                            scoped = True   # uncertain → treat as scoped (benign)
+                    if not scoped:
+                        dangerous = True
+                if dangerous:
                     non_default.append(sid)
             except Exception:
                 continue
@@ -5561,12 +5734,15 @@ class CheckEngine:
         threshold = 180
         inactive = []
         never_logon = []
+        priv = self._priv_sam_set()   # already reported (with more context) by P-Inactive
         for u in self.d.users:
             uac = get_int(u["attrs"], "userAccountControl")
             if uac_has(uac, UAC_ACCOUNTDISABLE):
                 continue
             if uac_has(uac, UAC_SERVER_TRUST) or uac_has(uac, UAC_WORKSTATION_TRUST):
                 continue
+            if get_str(u["attrs"], "sAMAccountName").lower() in priv:
+                continue   # avoid double-counting privileged accounts as generic stale users
             llt = filetime_to_dt(get_int(u["attrs"], "lastLogonTimestamp"))
             age = days_since(llt)
             sam = get_str(u["attrs"], "sAMAccountName")
@@ -5683,12 +5859,15 @@ class CheckEngine:
 
     def _s_pwd_not_required(self):
         affected = []
+        builtin_skip = {"guest", "defaultaccount"}   # ship with PASSWD_NOTREQD by default
         for u in self.d.users:
             uac = get_int(u["attrs"], "userAccountControl")
             if uac_has(uac, UAC_ACCOUNTDISABLE):
                 continue
             if uac_has(uac, UAC_PASSWD_NOTREQD):
                 sam = get_str(u["attrs"], "sAMAccountName")
+                if sam.lower() in builtin_skip:
+                    continue
                 affected.append(sam)
         if affected:
             self._add("S-PwdNotRequired",
@@ -6444,6 +6623,7 @@ class CheckEngine:
     def _check_acl(self):
         self._p_dcsync_rights()
         self._p_dangerous_acl_domain()
+        self._p_dangerous_acl_naming_context()
         self._p_dangerous_acl_priv_groups()
         self._p_modifiable_gpo()
         self._p_machine_account_quota()
@@ -6490,6 +6670,20 @@ class CheckEngine:
                           "This allows the principal to change permissions, take ownership, "
                           "or modify all properties on the domain root — full domain compromise path.",
                           [f['sid_name'], f['object']])
+
+    def _p_dangerous_acl_naming_context(self):
+        ncs = [f for f in self.d.acl_findings
+               if f.get("type") in ("dangerous_acl", "owner", "write_property")
+               and f.get("object", "") in ("Configuration NC", "Schema NC")]
+        for f in ncs:
+            self._add("P-DangerousACLNamingContext",
+                      f"{f['sid_name']} ({f['sid']}) has {f['right']} on {f['object']}. "
+                      "Control of the Configuration partition lets an attacker publish or enable a "
+                      "vulnerable certificate template and add a rogue CA to NTAuthCertificates "
+                      "(forge a 'golden' certificate authenticating as any user); control of the "
+                      "Schema lets them poison a class defaultSecurityDescriptor so every FUTURE "
+                      "object of that class is attacker-writable. Either is full-forest compromise.",
+                      [f['sid_name'], f['object']])
 
     def _p_dangerous_acl_priv_groups(self):
         group_findings = [f for f in self.d.acl_findings
@@ -6992,6 +7186,16 @@ class ACLAnalyzer:
         # AdminSDHolder
         ash_dn = f"CN=AdminSDHolder,CN=System,{self.conn.base_dn}"
         self._check_object_acl(ash_dn, "AdminSDHolder")
+        # Configuration + Schema naming-context heads. A broad principal with
+        # WriteDacl/WriteOwner/GenericAll/Owner here is full-forest compromise:
+        # Configuration control lets you publish a vulnerable cert template or add
+        # a rogue CA to NTAuthCertificates (golden cert); Schema control lets you
+        # poison a class defaultSecurityDescriptor so every future object is
+        # attacker-writable. Inherited ACEs flow down to PKI/sites/services.
+        if getattr(self.conn, "cfg_nc", ""):
+            self._check_object_acl(self.conn.cfg_nc, "Configuration NC", check_owner=True)
+        if getattr(self.conn, "sch_nc", ""):
+            self._check_object_acl(self.conn.sch_nc, "Schema NC", check_owner=True)
         # All GPO objects
         for gpo in self.data.gpos:
             dn = gpo.get("dn", "")
@@ -7194,6 +7398,7 @@ class ControlPathAnalyzer:
     _WRITE_ATTR_EDGES = {
         "5b47d60f-6090-40b2-9f37-2a4de88f3063": "AddKeyCredentialLink",  # msDS-KeyCredentialLink (Shadow Credentials)
         "3f78c3e5-f79a-46bd-a0b8-9d18116ddc79": "WriteRBCD",             # msDS-AllowedToActOnBehalfOfOtherIdentity
+        "4c164200-20c0-11d0-a768-00aa006e0529": "WriteRBCD",             # Account-Restrictions property SET (grants msDS-AllowedToActOnBehalfOfOtherIdentity + userAccountControl) -> RBCD/takeover
         "bf9679c0-0de6-11d0-a285-00aa003049e2": "AddMember",            # member
         "f3a64788-5306-11d1-a9c5-0000f80367c1": "WriteSPN",             # servicePrincipalName (targeted kerberoast)
         "f30e3bbe-9ff0-11d1-b603-0000f80367c1": "WriteGPLink",          # gPLink (link a rogue GPO)
@@ -7216,6 +7421,7 @@ class ControlPathAnalyzer:
             self._index()
             self._membership_edges()
             self._acl_edges()
+            self._adcs_edges()
             self._gmsa_edges()
             self._dc_ou_gplink_edges()
             self._close()
@@ -7472,6 +7678,40 @@ class ControlPathAnalyzer:
             # GPOs not linked to a DC-affecting container intentionally get no
             # Tier-0 edge — controlling them is still surfaced as a finding, but
             # it is not a path to Domain Admin.
+
+    def _adcs_edges(self):
+        """ADCS objects whose control IS domain compromise, modeled as Tier-0
+        targets. Writing NTAuthCertificates forges a trusted 'golden' certificate
+        for any principal (incl. DA); taking over an Enterprise CA object is ESC5.
+        The group/computer/GPO edge set never covered PKI, so a broad principal's
+        GenericWrite/WriteDacl/WriteOwner over these objects — the real planted
+        path on many domains — produced no control path and left the graph empty.
+        Seeding them makes those edges a visible route to Domain Admin."""
+        # Enterprise CA objects — SDs were already read during collection.
+        for svc in getattr(self.data, "enrollment_svcs", []) or []:
+            raw = svc["attrs"].get("nTSecurityDescriptor")
+            if isinstance(raw, list):
+                raw = raw[0] if raw else None
+            if not raw:
+                continue
+            try:
+                sd = _ldaptypes.SR_SECURITY_DESCRIPTOR(data=raw)
+            except Exception:
+                continue
+            node = "ADCS:" + svc.get("dn", "ca").lower()
+            self.sid2name[node] = "CA: " + (get_str(svc["attrs"], "cn") or dn_base(svc.get("dn", "")))
+            self.seeds.add(node); self.tier0_groups.add(node)
+            self._add_acl_edges(sd, node, "pki")
+        # NTAuthCertificates (the golden-certificate trust store).
+        cfg = getattr(self.conn, "cfg_nc", "")
+        if cfg:
+            ntauth = f"CN=NTAuthCertificates,CN=Public Key Services,CN=Services,{cfg}"
+            sd = self._fetch_one_sd(ntauth)
+            if sd:
+                node = "ADCS:ntauth"
+                self.sid2name[node] = "NTAuthCertificates"
+                self.seeds.add(node); self.tier0_groups.add(node)
+                self._add_acl_edges(sd, node, "pki")
 
     def _add_acl_edges(self, sd, target_node, kind, dcsync=False):
         try:
@@ -7979,6 +8219,7 @@ EXPOSURE_WEIGHTS = {
     # foothold-dependent / lower leverage
     "S-Kerberoastable":55, "S-NoPreAuth":52, "P-ConstrainedDelegService":55,
     "P-RBCD":55, "A-ReversiblePwd":52, "S-Reversible":52, "P-MachineAccountQuota":48,
+    "A-Certifried":72, "P-KrbRelayUp":60, "P-DangerousACLNamingContext":95,
     "A-DCLdapSign":45, "A-SMB2SignatureNotRequired":45, "A-DCLdapsChannelBinding":42,
     "A-LDAPSigningDisabled":45, "A-DC-Spooler":40, "A-DC-WebClient":40,
     "S-DesEnabled":45, "A-NullSession":40, "P-AdminCountOrphan":35,
@@ -8357,48 +8598,70 @@ def rule_compliance(rule_id: str, opcat: str) -> Dict[str, List[str]]:
 # vertically stretched. Used both in CSS and (literally) inside SVG <text>.
 
 _KC_CSS = r"""
+@import url('https://fonts.googleapis.com/css2?family=Saira:wght@400;500;600&family=Saira+Condensed:wght@500;600;700&family=Saira+Stencil+One&family=JetBrains+Mono:wght@400;500;700&display=swap');
 :root{
-  --bg:#15170f; --surface:#1c1f13; --surface2:#242818; --surface3:#2d321f;
-  --border:#363c23; --border2:#4a5230; --track:#2f341c;
-  --text:#e9e4d3; --muted:#a0a585; --faint:#717954;
-  --accent:#c7a64f; --accent2:#869150; --deck:#d3c193;
-  --crit:#bd4234; --high:#cb7a2f; --med:#cda52b; --low:#74934a; --info:#8c917a;
-  --ok:#82a155; --warn:#cda52b; --bad:#bd4234;
-  --shadow:0 4px 22px rgba(0,0,0,.42);
-  --mono:'JetBrains Mono','SFMono-Regular',ui-monospace,Menlo,Consolas,monospace;
-  --sans:'Segoe UI','Helvetica Neue',Arial,system-ui,-apple-system,sans-serif;
-  --r:8px; --r-sm:4px;
+  /* SCOUT — FIELD INTELLIGENCE DOSSIER (dark, primary): olive-black ground, bone ink, brass + OD green */
+  --bg:#12140d; --surface:#191c12; --surface2:#202417; --surface3:#2a2f1e;
+  --border:#363a24; --border2:#4c5132; --track:#262b19;
+  --text:#e9e6d4; --muted:#aaab90; --faint:#74765d;
+  --accent:#c6a44e; --accent2:#808e4a; --deck:#d2c08f;
+  /* severity — MIL-STD-2525 affiliation ramp (alert red / amber / khaki / OD / steel) */
+  --crit:#d6453b; --high:#e0863a; --med:#d8b84a; --low:#82a455; --info:#5f93a6;
+  --ok:#82a455; --warn:#d8b84a; --bad:#d6453b;
+  --shadow:0 2px 0 rgba(0,0,0,.30);
+  --display:"Saira Condensed","Oswald","Arial Narrow",sans-serif;
+  --sans:"Saira","Inter",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --mono:"JetBrains Mono","Share Tech Mono",ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;
+  --stencil:"Saira Stencil One","Stardos Stencil",var(--display);
+  --grid:rgba(198,164,78,.045);
+  --r:3px; --r-sm:2px;
 }
 html[data-theme=light]{
-  --bg:#dedac6; --surface:#edead8; --surface2:#e4dfc9; --surface3:#d8d2b9;
-  --border:#c0b794; --border2:#aaa07c; --track:#d0c9ae;
-  --text:#21250e; --muted:#585d40; --faint:#787d5c;
-  --accent:#7c611f; --accent2:#536530; --deck:#5a5230;
-  --shadow:0 3px 14px rgba(60,55,30,.16);
+  /* FIELD DOSSIER — LIGHT: manila field paper, iron-gall ink, dark brass */
+  --bg:#d8d3bd; --surface:#e7e2cb; --surface2:#ded8bf; --surface3:#cfc9ac;
+  --border:#b3ac8c; --border2:#8f8868; --track:#cfc9ac;
+  --text:#20221a; --muted:#4d4f37; --faint:#7b7b5d;
+  --accent:#785b14; --accent2:#4f5d2c; --deck:#5a5230;
+  --crit:#b23128; --high:#a4601d; --med:#897015; --low:#4f6b2e; --info:#3b6274;
+  --ok:#4f6b2e; --warn:#897015; --bad:#b23128;
+  --shadow:0 2px 0 rgba(60,55,30,.12);
+  --grid:rgba(90,70,20,.06);
 }
 *{box-sizing:border-box;margin:0;padding:0}
-body{font-family:var(--sans);background:var(--bg);color:var(--text);font-size:14px;
-  line-height:1.55;-webkit-font-smoothing:antialiased}
+body{font-family:var(--sans);background:var(--bg);color:var(--text);font-size:13.5px;
+  line-height:1.55;-webkit-font-smoothing:antialiased;
+  background-image:linear-gradient(var(--grid) 1px,transparent 1px),linear-gradient(90deg,var(--grid) 1px,transparent 1px);
+  background-size:40px 40px}
 a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
 code{font-family:var(--mono);font-size:.85em;background:var(--surface3);padding:1px 6px;
   border-radius:var(--r-sm);color:var(--deck)}
 .kc-mono{font-family:var(--mono);font-size:.88em}
 .kc-muted{color:var(--muted)}
-h1,h2,h3,h4{font-weight:700;letter-spacing:.01em}
-.ulabel{font-family:var(--mono);font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--faint)}
+h1,h2,h3,h4{font-family:var(--display);font-weight:600;letter-spacing:.02em}
+.ulabel{font-family:var(--mono);font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--faint)}
 
-/* ── slim header ── */
-.kc-head{display:flex;align-items:center;gap:14px;padding:14px 26px;
-  background:linear-gradient(180deg,#1d2113,#15170f);border-bottom:1px solid var(--border);position:relative}
-html[data-theme=light] .kc-head{background:linear-gradient(180deg,#d2cbb0,#dedac6)}
+/* ── classification banner (full-bleed, top of document) ── */
+.kc-classbar{font-family:var(--mono);font-size:10px;letter-spacing:.22em;text-transform:uppercase;
+  text-align:center;color:var(--accent);background:var(--surface2);border-bottom:1px solid var(--border2);
+  padding:5px 10px;position:relative}
+.kc-classbar::before,.kc-classbar::after{content:"";position:absolute;top:0;bottom:0;width:66px;
+  background:repeating-linear-gradient(135deg,var(--accent) 0 9px,transparent 9px 18px);opacity:.28}
+.kc-classbar::before{left:0} .kc-classbar::after{right:0}
+
+/* ── masthead header ── */
+.kc-head{display:flex;align-items:center;gap:15px;padding:16px 26px;
+  background:linear-gradient(180deg,#1b1f12,var(--bg));border-bottom:1px solid var(--border);position:relative}
+html[data-theme=light] .kc-head{background:linear-gradient(180deg,#e2ddc5,var(--bg))}
 .kc-head::after{content:"";position:absolute;left:0;right:0;bottom:-3px;height:3px;
-  background:repeating-linear-gradient(135deg,var(--accent) 0 16px,#15170f 16px 32px);opacity:.8}
-.kc-head .mark{font-size:26px;color:var(--accent);line-height:1}
-.kc-head .name{font-size:24px;font-weight:800;letter-spacing:.26em;color:var(--text)}
-.kc-head .full{font-size:12px;color:var(--muted);letter-spacing:.02em;border-left:1px solid var(--border2);
-  padding-left:14px;margin-left:2px}
-.kc-head .class{margin-left:auto;font-family:var(--mono);font-size:10px;letter-spacing:.18em;
-  color:#15170f;background:var(--accent);padding:4px 11px;border-radius:3px;font-weight:700}
+  background:repeating-linear-gradient(135deg,var(--accent) 0 16px,transparent 16px 32px);opacity:.75}
+.kc-head .mark{color:var(--accent);line-height:0;display:flex}
+.kc-reticle{color:var(--accent)}
+.kc-head .name{font-family:var(--stencil);font-size:27px;font-weight:400;letter-spacing:.14em;
+  color:var(--text);line-height:1}
+.kc-head .full{font-family:var(--mono);font-size:11px;color:var(--muted);letter-spacing:.04em;
+  border-left:1px solid var(--border2);padding-left:14px;margin-left:2px;text-transform:uppercase}
+.kc-head .class{margin-left:auto;font-family:var(--mono);font-size:10px;letter-spacing:.16em;
+  color:var(--bg);background:var(--accent);padding:5px 12px;border-radius:2px;font-weight:700}
 
 /* ── sticky nav ── */
 .kc-nav{position:sticky;top:0;z-index:50;display:flex;align-items:center;gap:12px;
@@ -8417,12 +8680,14 @@ html[data-theme=light] .kc-nav{background:rgba(222,218,198,.96)}
 
 /* ── layout — wide ── */
 .kc-container{max-width:1480px;margin:0 auto;padding:24px 28px 64px}
-.kc-section{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);
-  padding:22px 28px;margin-bottom:20px;box-shadow:var(--shadow)}
-.kc-h2{font-size:16px;letter-spacing:.05em;text-transform:uppercase;color:var(--text);
-  padding-bottom:10px;margin-bottom:16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:9px}
-.kc-h2 .kc-count{color:var(--muted);font-weight:400}
-.kc-h2 .tag{margin-left:auto;font-family:var(--mono);font-size:10px;letter-spacing:.1em;
+.kc-section{background:var(--surface);border:1px solid var(--border);border-top:2px solid var(--border2);
+  border-radius:var(--r-sm);padding:20px 26px 22px;margin-bottom:18px;box-shadow:var(--shadow)}
+.kc-h2{font-family:var(--display);font-size:18px;font-weight:600;letter-spacing:.09em;text-transform:uppercase;
+  color:var(--text);padding:0 0 9px 13px;margin-bottom:16px;border-bottom:1px solid var(--border);
+  display:flex;align-items:center;gap:9px;position:relative}
+.kc-h2::before{content:"";position:absolute;left:0;top:2px;bottom:9px;width:4px;background:var(--accent)}
+.kc-h2 .kc-count{font-family:var(--mono);font-size:12px;color:var(--muted);font-weight:400;letter-spacing:.04em}
+.kc-h2 .tag{margin-left:auto;font-family:var(--mono);font-size:10px;letter-spacing:.12em;
   text-transform:uppercase;color:var(--faint);font-weight:400}
 .kc-sub{color:var(--muted);font-size:13px;margin-bottom:16px;max-width:980px}
 .kc-sub-h{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--deck);margin:20px 0 10px;font-weight:700}
@@ -8683,6 +8948,7 @@ html[data-theme=light] .kc-term{background:#21250e;color:#dfe6c4}
   border-left:3px solid var(--c,var(--accent));border-radius:var(--r-sm);padding:5px 12px 5px 9px}
 .kc-sevchip b{font-size:18px;font-weight:800;color:var(--c,var(--accent));font-variant-numeric:tabular-nums;line-height:1}
 .kc-sevchip span{font-family:var(--mono);font-size:10px;letter-spacing:.05em;text-transform:uppercase;color:var(--muted)}
+.kc-sevchip .kc-sevg{color:var(--c,var(--accent));font-size:11px;font-style:normal;line-height:1}
 .kc-sevchip.zero{opacity:.45}
 .kc-verdictline{font-family:var(--mono);font-size:11px;color:var(--muted)}
 .kc-verdictline b{font-weight:700}
@@ -8926,12 +9192,21 @@ class HTMLReporter:
 
     # ── slim header / nav ──────────────────────────────────────────────────────
     def _head(self):
+        reticle = (
+            '<svg class="kc-reticle" width="30" height="30" viewBox="0 0 30 30" aria-hidden="true">'
+            '<circle cx="15" cy="15" r="11" fill="none" stroke="currentColor" stroke-width="1.3"/>'
+            '<circle cx="15" cy="15" r="3.1" fill="none" stroke="currentColor" stroke-width="1.3"/>'
+            '<path d="M15 1.5v6M15 22.5v6M1.5 15h6M22.5 15h6" stroke="currentColor" stroke-width="1.3"/>'
+            '<path d="M15 10.4l2.3 4h-4.6z" fill="currentColor"/>'
+            '</svg>')
         return (
+            '<div class="kc-classbar">CLASSIFIED // FOUO &mdash; SCOUT FIELD INTELLIGENCE &mdash; '
+            'AUTHORIZED PERSONNEL ONLY</div>'
             '<header class="kc-head" id="top">'
-            '<span class="mark">✶</span>'
+            f'<span class="mark">{reticle}</span>'
             f'<span class="name">{TOOL_NAME}</span>'
             f'<span class="full">{self._e(TOOL_LONG)}</span>'
-            '<span class="class">CONFIDENTIAL</span>'
+            '<span class="class">CLASSIFIED // FOUO</span>'
             '</header>')
 
     def _nav(self):
@@ -9030,6 +9305,7 @@ class HTMLReporter:
             if s == "INFO" and not n:
                 continue
             chips += (f'<div class="kc-sevchip{"" if n else " zero"}" style="--c:{SEV_COLOR[s]}">'
+                      f'<i class="kc-sevg">{SEV_GLYPH[s]}</i>'
                       f'<b>{n}</b><span>{names[s]}</span></div>')
         return f'<div class="kc-sevchips">{chips}</div>'
 
@@ -9325,11 +9601,15 @@ class HTMLReporter:
         cp = self._cp(); edges = cp.get("edges") or []; meta = cp.get("nodes") or {}
         if not edges:
             return ""
-        names = list(meta.keys())
-        adj = defaultdict(set); radj = defaultdict(set)
+        # Only draw nodes that actually participate in an edge — the Tier-0 group
+        # targets with no controller would otherwise render as a column of orphan
+        # boxes and bury the real paths.
+        adj = defaultdict(set); radj = defaultdict(set); connected = set()
         for e in edges:
             if e["src"] in meta and e["dst"] in meta:
                 adj[e["src"]].add(e["dst"]); radj[e["dst"]].add(e["src"])
+                connected.add(e["src"]); connected.add(e["dst"])
+        names = [n for n in meta if n in connected]
         # layer = longest distance from a source; relax with a cap to survive cycles
         layer = {n: 0 for n in names}
         for _ in range(len(names) + 1):
@@ -10335,12 +10615,25 @@ def main():
     auth_mode = ("Kerberos" if args.kerberos else
                  "NTLM (pass-the-hash)" if args.hashes else
                  "null session" if args.null_session else "NTLM")
-    print(f"\n{'='*60}")
-    print(f"  {TOOL_NAME} v{VERSION} — AD Security Assessment")
-    print(f"  Domain : {args.domain}")
-    print(f"  Target : {args.dc_ip}")
-    print(f"  Proto  : {'LDAPS' if args.ldaps else 'LDAP'}  |  Auth: {auth_mode}")
-    print(f"{'='*60}\n")
+    # ── SITREP banner (left-anchored so ANSI codes never break box alignment) ──
+    _nc = args.no_color
+    br   = "" if _nc else ANSI["brass"]
+    bone = "" if _nc else ANSI["bone"]
+    fnt  = "" if _nc else ANSI["faint"]
+    od   = "" if _nc else ANSI["od"]
+    rs   = "" if _nc else ANSI["reset"]
+    rule = f"{br}{'='*64}{rs}"
+    proto = "LDAPS" if args.ldaps else "LDAP"
+    print()
+    print(rule)
+    print(f"  {bone}>>  S C O U T  <<{rs}   {od}FIELD INTELLIGENCE // RECON ELEMENT{rs}")
+    print(f"  {br}( + ){rs}  {fnt}ACTIVE DIRECTORY DOMAIN ASSESSMENT · v{VERSION}{rs}")
+    print(f"{br}{'-'*64}{rs}")
+    print(f"  {fnt}DOMAIN{rs} {bone}{args.domain}{rs}    {fnt}DC{rs} {bone}{args.dc_ip}{rs}    "
+          f"{fnt}PROTO{rs} {bone}{proto}{rs}    {fnt}AUTH{rs} {bone}{auth_mode}{rs}")
+    print(f"  {fnt}CLASSIFIED // FOUO — AUTHORIZED PERSONNEL ONLY{rs}")
+    print(rule)
+    print()
 
     # ── connect ──────────────────────────────────────────────────────────────
     ad_conn = ADConnection(args)
@@ -10451,34 +10744,39 @@ def main():
     sevc = defaultdict(int)
     for f in findings:
         sevc[f.severity] += 1
-    print(f"\n{'='*60}")
-    print(f"  RISK          : {scores.get('risk',0):3d}/100  ({scores.get('risk_word','')} risk)")
-    print(f"  EXPOSURE      : {scores['exposure']:3d}/100  ({scores.get('verdict','')})")
-    print(f"  HYGIENE DEBT  : {scores['hygiene']:3d}/100  (misconfig & stale load)")
-    print(f"{'='*60}")
-    print(f"  Findings : {len(findings)}  "
-          f"(CRIT {sevc['CRITICAL']} · HIGH {sevc['HIGH']} · "
-          f"MED {sevc['MEDIUM']} · LOW {sevc['LOW']})")
-    if changes:
-        print(f"  Changes  : +{len(changes['new'])} new · -{len(changes['fixed'])} fixed · "
-              f"~{len(changes['modified'])} modified · {len(changes['unchanged'])} unchanged "
-              f"(baseline {changes['baseline_date']})")
-    print(f"{'='*60}")
+    # colored helpers (honor --no-color)
+    def _c(code):
+        return "" if args.no_color else code
+    rs = _c(ANSI["reset"]); brass = _c(ANSI["brass"]); faint = _c(ANSI["faint"])
 
-    sev_order = {"CRITICAL":0,"HIGH":1,"MEDIUM":2,"LOW":3,"INFO":4}
+    def _meter(v, width=22):
+        fill = max(0, min(width, int(round(v / 100.0 * width))))
+        return "#" * fill + "." * (width - fill)
+
+    print()
+    h = "|== ASSESSMENT "
+    print(f"{brass}{h}{'='*(64-len(h))}|{rs}")
+    for label, key, word in (("RISK", "risk", scores.get('risk_word', '') + " risk"),
+                             ("EXPOSURE", "exposure", scores.get('verdict', '')),
+                             ("HYGIENE", "hygiene", "misconfig & stale debt")):
+        v = scores.get(key, 0); bc = _c(_band_ansi(v))
+        print(f"   {label:9s} {bc}[{_meter(v)}]{rs} {bc}{v:3d}/100{rs}  {faint}{word}{rs}")
+    cr, hi, me, lo = sevc['CRITICAL'], sevc['HIGH'], sevc['MEDIUM'], sevc['LOW']
+    fl = f"|== FINDINGS  {len(findings)} TOTAL · CRIT {cr} · HIGH {hi} · MED {me} · LOW {lo} "
+    print(f"{brass}{fl}{'='*max(1,64-len(fl))}|{rs}")
+    if changes:
+        print(f"   {faint}DELTA{rs} +{len(changes['new'])} new · -{len(changes['fixed'])} fixed · "
+              f"~{len(changes['modified'])} modified  {faint}(baseline {changes['baseline_date']}){rs}")
+    print()
+
+    sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
     sorted_findings = sorted(findings,
-        key=lambda f:(sev_order.get(f.severity,5),f.category))
+        key=lambda f: (sev_order.get(f.severity, 5), f.category))
     for f in sorted_findings:
-        color_map = {"CRITICAL":"\033[91m","HIGH":"\033[93m",
-                      "MEDIUM":"\033[33m","LOW":"\033[32m","INFO":"\033[36m"}
-        reset = "\033[0m"
-        if args.no_color:
-            color_map = defaultdict(str)
-            reset = ""
-        c = color_map.get(f.severity,"")
-        print(f"  {c}[{f.severity:8s}]{reset} [{f.rule_id}] {f.title}")
+        c = _c(ANSI_SEV.get(f.severity, "")); g = SEV_GLYPH.get(f.severity, "*")
+        print(f"   {c}{g} {f.severity:8s}{rs} {faint}{f.rule_id:26s}{rs} {f.title}")
         if f.details and args.verbose:
-            print(f"           {f.details[:120]}")
+            print(f"       {faint}{f.details[:140]}{rs}")
 
     # ── HTML report ───────────────────────────────────────────────────────────
     if not args.output:
