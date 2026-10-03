@@ -197,6 +197,9 @@ RULES: Dict[str, Tuple[str, str, int, str]] = {
     "A-CertROCA":             ("ROCA weak RSA key in certificate","Anomaly",30,"CRITICAL"),
     "A-CertWeakDSA":          ("Weak DSA key in certificate","Anomaly",10,"MEDIUM"),
     "A-CertWeakRsaComponent": ("Weak RSA component in certificate","Anomaly",25,"HIGH"),
+    "A-CertESC6":             ("Enterprise CA honours requester-supplied SAN on all templates (ESC6)","Anomaly",50,"CRITICAL"),
+    "A-CertESC11":            ("Enterprise CA does not enforce encryption for ICertPassage RPC (ESC11)","Anomaly",40,"HIGH"),
+    "A-CertESC16":            ("Enterprise CA disables the SID security extension CA-wide (ESC16)","Anomaly",40,"HIGH"),
     "A-BadSuccessor":         ("dMSA bad-successor attack delegation exists","Anomaly",50,"CRITICAL"),
     "A-WeakRSARootCert":      ("Root CA uses weak RSA (<2048-bit)","Anomaly",10,"MEDIUM"),
     "A-WeakRSARootCert2":     ("Intermediate CA uses weak RSA key","Anomaly",10,"MEDIUM"),
@@ -244,6 +247,7 @@ RULES: Dict[str, Tuple[str, str, int, str]] = {
     "P-RODCDeniedGroup":      ("RODC denied group not configured","Privileged",5,"LOW"),
     "P-ServiceDomainAdmin":   ("Service account is member of Domain Admins","Privileged",50,"CRITICAL"),
     "P-SchemaAdmin":          ("Schema Admins group is not empty","Privileged",25,"HIGH"),
+    "P-SchemaDefaultSD":       ("Broad principal can write all future objects via class defaultSecurityDescriptor","Privileged",50,"HIGH"),
     "P-RecycleBin":           ("AD Recycle Bin not enabled","Privileged",5,"LOW"),
     "P-ProtectedUsers":       ("Privileged accounts not in Protected Users group","Privileged",10,"MEDIUM"),
     "P-LogonDenied":          ("Admin accounts not restricted by deny-logon GPO","Privileged",10,"MEDIUM"),
@@ -325,6 +329,7 @@ RULES: Dict[str, Tuple[str, str, int, str]] = {
     "P-DangerousACLDA":       ("Broad principal can write to Domain Admins group","Privileged",100,"CRITICAL"),
     "P-DangerousACLGPO":      ("Broad principal can modify high-value GPO","Privileged",75,"CRITICAL"),
     "P-MachineAccountQuota":  ("ms-DS-MachineAccountQuota > 0 (any user can add machine accounts)","Privileged",25,"HIGH"),
+    "P-DangerousGPLinkSite":  ("Broad principal can link a GPO to an AD Site (WriteGPLink/takeover)","Privileged",50,"HIGH"),
     "P-KrbRelayUp":           ("KrbRelayUp: MachineAccountQuota > 0 and LDAP signing not required (any user -> SYSTEM on any host)","Privileged",60,"HIGH"),
     "P-OwnsPrivObject":       ("Broad principal owns a privileged AD object","Privileged",50,"CRITICAL"),
     "P-WriteToPrivGroup":     ("Broad principal can add members to privileged group","Privileged",100,"CRITICAL"),
@@ -496,6 +501,11 @@ RULE_MITRE: Dict[str, List[str]] = {
     "P-MachineAccountQuota": ["T1136: Create Account", "T1098: Account Manipulation"],
     "P-KrbRelayUp": ["T1187: Forced Authentication", "T1557: Adversary-in-the-Middle"],
     "P-DangerousACLNamingContext": ["T1484: Domain or Tenant Policy Modification", "T1649: Steal or Forge Authentication Certificates"],
+    "P-SchemaDefaultSD":["T1222.001: Windows File and Directory Permissions Modification","T1098: Account Manipulation"],
+    "P-DangerousGPLinkSite": ["T1484.001: Group Policy Modification", "T1222.001: ACL Modification"],
+    "A-CertESC6": ["T1649: Steal or Forge Authentication Certificates (ESC6)"],
+    "A-CertESC11": ["T1649: Authentication Certificates (ESC11)", "T1557: Adversary-in-the-Middle (Relay)"],
+    "A-CertESC16": ["T1649: Authentication Certificates (ESC16)", "T1556: Modify Authentication Process"],
     "A-CertTempCustomSubject": ["T1649: Steal/Forge Authentication Certificates (ESC1)"],
     "A-CertTempAnyPurpose": ["T1649: Authentication Certificates (ESC2)"],
     "A-CertTempAgent": ["T1649: Authentication Certificates (ESC3)"],
@@ -629,6 +639,9 @@ OP_CATEGORY = {
     "P-MachineAccountQuota":"Privilege Escalation","P-DNSAdmin":"Privilege Escalation",
     "P-KrbRelayUp":"Privilege Escalation","A-Certifried":"Privilege Escalation",
     "P-DangerousACLNamingContext":"Privilege Escalation",
+    "P-SchemaDefaultSD":"Persistence",
+    "P-DangerousGPLinkSite":"Privilege Escalation",
+    "A-CertESC6":"Privilege Escalation","A-CertESC11":"Privilege Escalation","A-CertESC16":"Privilege Escalation",
     "P-ExchangePrivEsc":"Privilege Escalation","A-MembershipEveryone":"Privilege Escalation",
     "P-AdminNum":"Privilege Escalation","P-SchemaAdmin":"Privilege Escalation",
     "A-AdminSDHolder":"Privilege Escalation","P-DelegationEveryone":"Privilege Escalation",
@@ -1528,6 +1541,90 @@ RULE_DOCS: Dict[str, Dict[str, Any]] = {
             "Set ms-DS-MachineAccountQuota = 0.",
         ],
         "refs": ["https://github.com/Dec0ne/KrbRelayUp"],
+    },
+    "P-SchemaDefaultSD": {
+        "description": "A classSchema object's defaultSecurityDescriptor grants a broad/low-privileged principal (Everyone, Authenticated Users, Domain Users or Domain Computers) a takeover-class right (GenericAll/GenericWrite/WriteDacl/WriteOwner, or unscoped WriteProperty).",
+        "why": "defaultSecurityDescriptor is the SDDL ACL the DC stamps onto EVERY newly-created object of that class. If a broad principal gets write/owner/full-control there, every FUTURE object of the class (e.g. every new user or computer) is created already attacker-controllable — a durable, self-replenishing persistence and future-object-takeover primitive that survives cleanup of individual objects.",
+        "technical": "Enumerate (objectClass=classSchema) in the Schema NC and read defaultSecurityDescriptor (an SDDL STRING, not nTSecurityDescriptor bytes). Parse only the D: (DACL) section — the S: (SACL) audit ACEs must be ignored. Flag an ALLOW ACE whose trustee is WD/AU/DU/DC or SID S-1-1-0 / S-1-5-11 / -513 / -515 and whose rights contain GA/GW/WD/WO, or WP when the ACE is unscoped (no ObjectType GUID). Stock default SDs grant write only to DA/SY/CO/EA/BA and give broad principals read-only (RPLCLORC), so they do not flag.",
+        "exploit": [
+            "Confirm the class: Get-ADObject -SearchBase (Get-ADRootDSE).schemaNamingContext -LDAPFilter '(lDAPDisplayName=user)' -Properties defaultSecurityDescriptor",
+            "Wait for / induce creation of a new object of the class; the broad ACE is applied automatically.",
+            "Abuse the granted right on the new object: e.g. GenericAll/WriteDacl -> set a password, add an SPN and Kerberoast, or configure RBCD; WriteOwner -> take ownership then rewrite the DACL.",
+        ],
+        "remediation": [
+            "Reset the class's defaultSecurityDescriptor to the Microsoft default via the Active Directory Schema snap-in (schmmgmt.msc) — the Default Security tab.",
+            "Remove any ACE granting Everyone / Authenticated Users / Domain Users / Domain Computers write, write-DACL, write-owner or full control.",
+            "Note: changing a defaultSecurityDescriptor only affects objects created afterwards; audit and re-ACL existing objects of the class separately.",
+            "Audit who holds write access to the schema (Schema Admins membership and the Schema NC DACL), since editing defaultSecurityDescriptor requires it.",
+        ],
+        "refs": [
+            "MS-ADTS 3.1.1.4.5.14 defaultSecurityDescriptor",
+            "https://learn.microsoft.com/windows/win32/secauthz/security-descriptor-definition-language",
+        ],
+    },
+    "P-DangerousGPLinkSite": {
+        "description": "A broad / low-privileged principal can write the gPLink attribute on (or take over) an AD Site object.",
+        "why": "Whoever controls a site's gPLink can link a malicious GPO to the site and execute code as SYSTEM on every computer in the site on the next gpupdate. When the site contains a domain controller this is a direct Tier-0 / full-domain-compromise path.",
+        "technical": "WriteProperty on the gPLink attribute (schemaIDGUID f30e3bbe-9ff0-11d1-b603-0000f80367c1), or GenericAll/GenericWrite/WriteDacl/WriteOwner, held by a broad principal on a CN=<site>,CN=Sites,CN=Configuration object. Only ACEs effective on the site itself are counted (INHERIT_ONLY aces are ignored); object-scoped WriteProperty to an unrelated attribute is not dangerous. Default site ACLs grant broad principals read only.",
+        "exploit": [
+            "New-GPO -Name evil; add a Computer-side startup script / scheduled task to the GPO.",
+            "SharpGPOAbuse.exe --AddComputerTask --TaskName x --Command cmd.exe --Arguments '/c ...' --GPOName evil",
+            "Point the site's gPLink at the rogue GPO (Set-ADReplicationSite -GPLink, or write gPLink via LDAP) -> SYSTEM on every computer (incl. DCs) in the site on gpupdate.",
+        ],
+        "remediation": [
+            "Audit the site DACL: (Get-Acl 'AD:CN=<site>,CN=Sites,CN=Configuration,<domain-dn>').Access",
+            "Remove WriteProperty(gPLink)/GenericWrite/GenericAll/WriteDacl/WriteOwner from non-Tier-0 principals; sites should be writable only by Enterprise/Domain Admins and SYSTEM.",
+            "If the right is inherited from CN=Sites or the Configuration NC, remediate at the inherited source.",
+        ],
+        "refs": [
+            "https://bloodhound.readthedocs.io/en/latest/data-analysis/edges.html#writegplink",
+            "https://wald0.com/?p=179",
+        ],
+    },
+    "A-CertESC6": {
+        "description": "An Enterprise CA has EDITF_ATTRIBUTESUBJECTALTNAME2 set in its EditFlags policy, so it honours a requester-supplied Subject Alternative Name on every certificate it issues.",
+        "why": "The flag overrides per-template name settings CA-wide: any principal who can enroll in ANY client-authentication template can put an arbitrary UPN (e.g. a Domain Admin) in the SAN and PKINIT as that account. A single template with Authenticated-Users enroll turns into full domain compromise.",
+        "technical": "HKLM\\SYSTEM\\CurrentControlSet\\Services\\CertSvc\\Configuration\\<CAName>\\EditFlags REG_DWORD, bit 0x00040000 (EDITF_ATTRIBUTESUBJECTALTNAME2) set. Read over MS-RRP remote registry; fails closed if the CA/key is unreadable.",
+        "exploit": [
+            "certipy req -u user@domain -p pass -ca <CAName> -target <ca-fqdn> -template User -upn administrator@domain",
+            "certipy auth -pfx administrator.pfx -dc-ip <dc>   # PKINIT -> TGT as DA",
+        ],
+        "remediation": [
+            "certutil -setreg policy\\EditFlags -EDITF_ATTRIBUTESUBJECTALTNAME2  (then restart certsvc).",
+            "Never allow requester-supplied SAN globally; scope SAN supply to specific, approval-gated templates.",
+            "Audit who holds Enroll on client-auth templates published to this CA.",
+        ],
+        "refs": ["https://posts.specterops.io/certified-pre-owned-d95910965cd2", "https://github.com/ly4k/Certipy"],
+    },
+    "A-CertESC11": {
+        "description": "An Enterprise CA does not enforce encryption (packet privacy) on its ICertPassage RPC enrollment interface (IF_ENFORCEENCRYPTICERTREQUEST clear in InterfaceFlags).",
+        "why": "Without enforced encryption, coerced NTLM authentication can be relayed straight to the CA's MS-ICPR RPC endpoint to obtain a certificate for the victim — the RPC analogue of ESC8, requiring no HTTP web-enrollment vdir.",
+        "technical": "HKLM\\SYSTEM\\CurrentControlSet\\Services\\CertSvc\\Configuration\\<CAName>\\InterfaceFlags REG_DWORD, bit 0x00000200 (IF_ENFORCEENCRYPTICERTREQUEST) NOT set. Only fires on a value actually read back; an unreadable flag is never treated as 'clear'.",
+        "exploit": [
+            "certipy relay -target rpc://<ca-fqdn> -ca <CAName> -template <client-auth-template>",
+            "Coerce a privileged host with PetitPotam/PrinterBug and relay its NTLM to the CA RPC interface.",
+        ],
+        "remediation": [
+            "certutil -setreg CA\\InterfaceFlags +IF_ENFORCEENCRYPTICERTREQUEST  (then restart certsvc).",
+            "Require packet privacy on the CA's RPC interface and disable NTLM where possible.",
+            "Enable Extended Protection for Authentication on enrollment services.",
+        ],
+        "refs": ["https://github.com/ly4k/Certipy", "https://learn.microsoft.com/windows-server/identity/ad-cs/"],
+    },
+    "A-CertESC16": {
+        "description": "An Enterprise CA lists the SID security-extension OID (1.3.6.1.4.1.311.25.2) in DisableExtensionList, so it strips szOID_NTDS_CA_SECURITY_EXT from every certificate it issues.",
+        "why": "The SID extension is what binds a certificate strongly to one account under KB5014754. Disabling it CA-wide removes that binding for all templates, so a certificate whose SAN names a privileged account maps implicitly to that account — ESC9-style weak mapping, but across the whole CA rather than one template.",
+        "technical": "HKLM\\SYSTEM\\CurrentControlSet\\Services\\CertSvc\\Configuration\\<CAName>\\DisableExtensionList REG_MULTI_SZ contains '1.3.6.1.4.1.311.25.2'. Read over MS-RRP; the list is split on NULs and matched exactly.",
+        "exploit": [
+            "certipy req -u user@domain -p pass -ca <CAName> -template <esc16-template> -upn targetadmin@domain",
+            "certipy auth -pfx out.pfx -dc-ip <dc>   # implicit weak mapping authenticates as targetadmin",
+        ],
+        "remediation": [
+            "Remove the OID from DisableExtensionList (certutil -setreg policy\\DisableExtensionList) and restart certsvc.",
+            "Apply the KB5014754 strong-mapping enforcement (StrongCertificateBindingEnforcement = 2) on DCs.",
+            "Ensure issued certificates carry the SID security extension.",
+        ],
+        "refs": ["https://github.com/ly4k/Certipy", "https://support.microsoft.com/help/5014754"],
     },
     "A-WeakLockout": {
         "description": "The domain (or a fine-grained policy) has no — or a very high — account-lockout threshold.",
@@ -3039,7 +3136,7 @@ class ADData:
     def _collect_sites(self):
         self.sites = self.conn.paged_search(
             f"CN=Sites,{self.cfg}",
-            "(objectClass=site)", ["cn","distinguishedName","gPLink"])
+            "(objectClass=site)", ["cn","distinguishedName","gPLink","nTSecurityDescriptor"])
         self.subnets = self.conn.paged_search(
             f"CN=Subnets,CN=Sites,{self.cfg}",
             "(objectClass=subnet)", ["cn","siteObject","description"])
@@ -4608,10 +4705,196 @@ class CheckEngine:
     # msPKI-Enrollment-Flag bits
     _CT_PEND_ALL_REQUESTS = 0x00000002   # manager approval required
 
+    # ESC6/11/16 — CA-config registry bits read over MS-RRP (remote registry).
+    _EDITF_ATTRIBUTESUBJECTALTNAME2 = 0x00040000   # EditFlags: requester-supplied SAN CA-wide (ESC6)
+    _IF_ENFORCEENCRYPTICERTREQUEST  = 0x00000200   # InterfaceFlags: encrypt ICertPassage RPC (missing = ESC11)
+    _CA_SID_EXTENSION_OID           = "1.3.6.1.4.1.311.25.2"  # szOID_NTDS_CA_SECURITY_EXT (disabled CA-wide = ESC16)
+
+    def _rrp_read_ca_config(self, host: str, ca_name: str) -> Optional[Dict[str, Any]]:
+        """Best-effort read of a CA host's CertSvc configuration over MS-RRP
+        (remote registry via \\PIPE\\winreg over SMB), reusing the creds SCOUT
+        runs with. Returns {"EditFlags":int|None, "InterfaceFlags":int|None,
+        "DisableExtensionList":list|None} on success, or None if the host is
+        unreachable / RemoteRegistry is off / the bind fails. Each individual
+        value that is absent or access-denied comes back as None — the caller
+        FAILS CLOSED on None (no finding), it never infers a value from a
+        failure."""
+        if not HAS_IMPACKET_SMB:
+            return None
+        from impacket.dcerpc.v5 import transport, rrp
+        smb = None
+        dce = None
+        try:
+            # host is the CA's dNSHostName (an FQDN), which doubles as the Kerberos
+            # remoteName so impacket builds a valid cifs/<fqdn> SPN.
+            smb = SMBConnection(host, host, timeout=10)
+            if self.args.kerberos:
+                lm = nt = ""
+                if self.args.hashes:
+                    h = self.args.hashes
+                    lm, nt = (h.split(":", 1) if ":" in h else ("", h))
+                smb.kerberosLogin(self.args.username or "", self.args.password or "",
+                                  self.args.domain or "", lm, nt,
+                                  self.args.aes_key or "", kdcHost=self.args.dc_ip,
+                                  useCache=bool(os.environ.get("KRB5CCNAME")))
+            elif self.args.hashes:
+                h = self.args.hashes
+                lm, nt = (h.split(":", 1) if ":" in h else ("", h))
+                if len(lm) != 32:
+                    lm = "aad3b435b51404eeaad3b435b51404ee"
+                smb.login(self.args.username or "", "", self.args.domain or "", lm, nt)
+            elif self.args.username and self.args.password:
+                smb.login(self.args.username, self.args.password, self.args.domain or "")
+            else:
+                # No usable creds (null session can't read HKLM) — fail closed.
+                return None
+            rpc = transport.DCERPCTransportFactory(r"ncacn_np:%s[\pipe\winreg]" % host)
+            rpc.set_smb_connection(smb)
+            dce = rpc.get_dce_rpc()
+            dce.connect()
+            dce.bind(rrp.MSRPC_UUID_RRP)
+        except Exception as e:
+            if getattr(self.args, "verbose", False):
+                print(f"[.] ADCS CA-config: cannot reach remote registry on {host} "
+                      f"({type(e).__name__}: {e}) — skipping ESC6/11/16 for {ca_name}")
+            try:
+                if dce is not None:
+                    dce.disconnect()
+            except Exception:
+                pass
+            try:
+                if smb is not None:
+                    smb.logoff()
+            except Exception:
+                pass
+            return None
+
+        key_path = (r"SYSTEM\CurrentControlSet\Services\CertSvc\Configuration\%s"
+                    % ca_name)
+        result: Dict[str, Any] = {"EditFlags": None, "InterfaceFlags": None,
+                                  "DisableExtensionList": None}
+        try:
+            hklm = rrp.hOpenLocalMachine(dce)["phKey"]
+            try:
+                hkey = rrp.hBaseRegOpenKey(dce, hklm, key_path)["phkResult"]
+            except Exception as e:
+                if getattr(self.args, "verbose", False):
+                    print(f"[.] ADCS CA-config: cannot open {key_path} on {host} "
+                          f"({type(e).__name__}: {e}) — skipping ESC6/11/16 for {ca_name}")
+                return None
+            try:
+                for val_name, dword in (("EditFlags", True),
+                                        ("InterfaceFlags", True),
+                                        ("DisableExtensionList", False)):
+                    try:
+                        _, data = rrp.hBaseRegQueryValue(dce, hkey, val_name)
+                    except Exception:
+                        continue  # absent / access-denied for this value -> leave None
+                    if dword:
+                        try:
+                            result[val_name] = int(data)
+                        except (TypeError, ValueError):
+                            pass
+                    else:
+                        raw = data
+                        if isinstance(raw, (bytes, bytearray)):
+                            raw = bytes(raw).decode("utf-16-le", "replace")
+                        if isinstance(raw, str):
+                            result[val_name] = [s for s in raw.split("\x00") if s]
+            finally:
+                try:
+                    rrp.hBaseRegCloseKey(dce, hkey)
+                except Exception:
+                    pass
+        except Exception as e:
+            if getattr(self.args, "verbose", False):
+                print(f"[.] ADCS CA-config: registry read failed on {host} "
+                      f"({type(e).__name__}: {e})")
+            return None
+        finally:
+            try:
+                dce.disconnect()
+            except Exception:
+                pass
+            try:
+                smb.logoff()
+            except Exception:
+                pass
+        return result
+
+    def _a_adcs_ca_registry_config(self):
+        """ESC6 / ESC11 / ESC16 — one shared per-CA registry read. Fails CLOSED:
+        an unreachable CA, RemoteRegistry off, or access-denied yields NO finding
+        (verbose breadcrumb only). A finding fires only on a value actually read
+        back from the CA that proves the dangerous setting."""
+        if getattr(self.args, "no_adcs", False):
+            return
+        if not HAS_IMPACKET_SMB:
+            return
+        for svc in self.d.enrollment_svcs:
+            ca_name = get_str(svc["attrs"], "cn")
+            host = get_str(svc["attrs"], "dNSHostName")
+            if not ca_name or not host:
+                continue
+            cfg = self._rrp_read_ca_config(host, ca_name)
+            if cfg is None:
+                continue
+
+            # ESC6: EDITF_ATTRIBUTESUBJECTALTNAME2 set -> requester-supplied SAN on
+            # EVERY template issued by this CA. A low-priv principal enrolls any
+            # client-auth template with a Domain Admin UPN in the SAN and PKINITs
+            # to that account. Fire ONLY on a value we read back with the bit set.
+            edit = cfg.get("EditFlags")
+            if isinstance(edit, int) and (edit & self._EDITF_ATTRIBUTESUBJECTALTNAME2):
+                self._add("A-CertESC6",
+                          f"ESC6: Enterprise CA '{ca_name}' on {host} has "
+                          f"EDITF_ATTRIBUTESUBJECTALTNAME2 set (EditFlags=0x{edit:08x}). "
+                          "The CA honours a requester-supplied Subject Alternative Name on "
+                          "EVERY certificate it issues, overriding per-template settings. A "
+                          "low-privileged user enrolls any client-authentication template "
+                          "with a Domain Admin UPN in the SAN and uses PKINIT to obtain that "
+                          "account's TGT. "
+                          "certipy req -ca "
+                          f"{ca_name} -template User -upn administrator@domain -dns dc.domain",
+                          [f"{ca_name} ({host})"])
+
+            # ESC11: IF_ENFORCEENCRYPTICERTREQUEST NOT set -> the ICertPassage (MS-ICPR)
+            # RPC interface does not require packet privacy, so coerced NTLM can be
+            # relayed to it to obtain a certificate (no ESC8 web endpoint needed).
+            iflags = cfg.get("InterfaceFlags")
+            if isinstance(iflags, int) and not (iflags & self._IF_ENFORCEENCRYPTICERTREQUEST):
+                self._add("A-CertESC11",
+                          f"ESC11: Enterprise CA '{ca_name}' on {host} does NOT enforce "
+                          f"encryption for ICertPassage requests (InterfaceFlags=0x{iflags:08x}, "
+                          "IF_ENFORCEENCRYPTICERTREQUEST clear). Coerced NTLM authentication "
+                          "can be relayed to the CA's RPC enrollment interface to issue a "
+                          "certificate for the victim — no HTTP web-enrollment endpoint "
+                          "required. Combine with PetitPotam/PrinterBug coercion. "
+                          "(certipy relay -target rpc://<ca> -ca " + ca_name + ")",
+                          [f"{ca_name} ({host})"])
+
+            # ESC16: the SID security extension OID is in DisableExtensionList, so the
+            # CA strips szOID_NTDS_CA_SECURITY_EXT from every issued cert CA-wide.
+            # With strong mapping disabled, a certificate with a forged/attacker SAN
+            # maps implicitly to a privileged account (ESC9-style, but CA-wide).
+            disabled = cfg.get("DisableExtensionList")
+            if isinstance(disabled, list) and any(
+                    (o or "").strip() == self._CA_SID_EXTENSION_OID for o in disabled):
+                self._add("A-CertESC16",
+                          f"ESC16: Enterprise CA '{ca_name}' on {host} has the SID security "
+                          f"extension OID ({self._CA_SID_EXTENSION_OID}) in its "
+                          "DisableExtensionList — it strips szOID_NTDS_CA_SECURITY_EXT from "
+                          "every certificate it issues. With the strong SID binding gone, a "
+                          "certificate whose SAN names a privileged account maps implicitly "
+                          "to that account, re-opening ESC9-style weak-mapping escalation "
+                          "across all templates. Remove the OID and re-enable the extension.",
+                          [f"{ca_name} ({host})"])
+
     def _a_adcs_checks(self):
         if self.args.no_adcs:
             return
         self._a_adcs_cert_weakness()
+        self._a_adcs_ca_registry_config()
 
         # ESC8: reachable HTTP web-enrollment endpoint (relay-able). A bare open
         # port 80 is NOT ESC8 — the /certsrv relay vdir must actually exist and
@@ -5267,6 +5550,7 @@ class CheckEngine:
         self._p_unconstrained_delegation()
         self._p_service_domain_admin()
         self._p_schema_admin()
+        self._p_schema_default_sd()
         self._p_recycle_bin()
         self._p_protected_users_priv()
         self._p_rodc_checks()
@@ -5491,6 +5775,286 @@ class CheckEngine:
             self._add("P-ServiceDomainAdmin",
                       f"{len(affected)} service account(s) with SPN are members of Domain Admins.",
                       affected[:20])
+
+    # ── Schema defaultSecurityDescriptor abuse (P-SchemaDefaultSD) ─────────────
+    _SCHEMA_SD_DANGEROUS_RIGHTS = {"GA", "GW", "WD", "WO"}  # GenericAll/Write, WriteDacl, WriteOwner
+    _SCHEMA_SD_BROAD_ALIASES = {
+        "WD": "Everyone", "AU": "Authenticated Users", "DU": "Domain Users",
+        "DC": "Domain Computers", "AN": "Anonymous",
+    }
+
+    @staticmethod
+    def _sddl_top_sections(sddl: str) -> Dict[str, str]:
+        """Split an SDDL string into its O:/G:/D:/S: sections at parenthesis
+        depth 0. This is essential for FP-safety: a defaultSecurityDescriptor can
+        carry a SACL (e.g. domainDNS has S:(AU;SA;WDWOWP;;;WD)) whose audit ACEs
+        name broad trustees with write bits — those are AUDIT entries, not grants,
+        and must never be read as DACL ACEs. Section markers only count when they
+        sit outside every ACE's parentheses."""
+        sections: Dict[str, str] = {}
+        i = 0
+        n = len(sddl)
+        depth = 0
+        cur = None
+        start = 0
+        while i < n:
+            ch = sddl[i]
+            if depth == 0 and ch in "OGDS" and i + 1 < n and sddl[i + 1] == ":":
+                if cur is not None:
+                    sections[cur] = sddl[start:i]
+                cur = ch
+                i += 2
+                start = i
+                continue
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            i += 1
+        if cur is not None:
+            sections[cur] = sddl[start:]
+        return sections
+
+    def _schema_sd_broad_trustee(self, trustee: str) -> str:
+        """Return a friendly name if the SDDL trustee is a broad/low-priv principal
+        (by two-letter alias or by SID), else ''. Tier-0 aliases (SY/BA/DA/EA/CO/…)
+        and the domain -512/-519/etc. SIDs deliberately return '' so standard
+        default SDs never flag."""
+        t = (trustee or "").strip().upper()
+        if t in self._SCHEMA_SD_BROAD_ALIASES:
+            return self._SCHEMA_SD_BROAD_ALIASES[t]
+        if t == "S-1-1-0":
+            return "Everyone"
+        if t == "S-1-5-11":
+            return "Authenticated Users"
+        if t == "S-1-5-7":
+            return "Anonymous"
+        if t.startswith("S-1-5-21"):
+            if t.endswith("-513"):
+                return "Domain Users"
+            if t.endswith("-515"):
+                return "Domain Computers"
+        return ""
+
+    def _schema_sd_dangerous_grants(self, sddl: str) -> List[Tuple[str, str]]:
+        """Parse a classSchema defaultSecurityDescriptor (an SDDL *string*, not
+        nTSecurityDescriptor bytes) and return (principal_name, rights) for every
+        DACL grant that hands a BROAD principal a takeover-class right. Fails
+        closed: an unparseable / empty descriptor yields no finding."""
+        out: List[Tuple[str, str]] = []
+        if not sddl:
+            return out
+        try:
+            dacl = self._sddl_top_sections(sddl).get("D")
+        except Exception:
+            return out
+        if not dacl:
+            return out
+        for m in re.finditer(r"\(([^)]*)\)", dacl):
+            fields = m.group(1).split(";")
+            if len(fields) < 6:
+                continue
+            ace_type = fields[0].strip().upper()
+            # ALLOW variants only — never DENY (D/OD) or AUDIT (AU/OU/AL/OL).
+            if ace_type not in ("A", "OA", "XA", "ZA"):
+                continue
+            rights = fields[2].strip()
+            object_guid = fields[3].strip()
+            trustee = fields[5].strip()
+            who = self._schema_sd_broad_trustee(trustee)
+            if not who:
+                continue
+            toks = {rights[j:j + 2].upper()
+                    for j in range(0, len(rights) - (len(rights) % 2), 2)}
+            bad = set(toks & self._SCHEMA_SD_DANGEROUS_RIGHTS)
+            # WriteProperty is a takeover primitive ONLY when UNSCOPED. An object
+            # ACE (OA) carrying an ObjectType GUID scopes WP to one attribute
+            # (benign); a plain ACE (A) or an OA with no GUID is domain-wide WP.
+            if "WP" in toks and object_guid == "":
+                bad.add("WP")
+            if bad:
+                out.append((who, "+".join(sorted(bad))))
+        return out
+
+    def _p_schema_default_sd(self):
+        """P-SchemaDefaultSD — a classSchema defaultSecurityDescriptor grants a
+        broad principal a takeover right, so EVERY future object of that class is
+        attacker-writable (persistence / takeover of future users/computers)."""
+        try:
+            objs = self.d.conn.paged_search(
+                self.d.conn.sch_nc,
+                "(objectClass=classSchema)",
+                ["lDAPDisplayName", "defaultSecurityDescriptor"])
+        except Exception:
+            return
+        affected: List[str] = []
+        detail_lines: List[str] = []
+        for o in objs:
+            attrs = o.get("attrs", {})
+            cls = get_str(attrs, "lDAPDisplayName") or o.get("dn", "")
+            sddl = get_str(attrs, "defaultSecurityDescriptor")
+            grants = self._schema_sd_dangerous_grants(sddl)
+            if not grants:
+                continue
+            for who, rights in grants:
+                affected.append(cls)
+                detail_lines.append(f"class '{cls}': {who} granted {rights}")
+        if not affected:
+            return
+        self._add(
+            "P-SchemaDefaultSD",
+            "One or more classSchema objects grant a broad/low-privileged "
+            "principal a takeover-class right in their defaultSecurityDescriptor. "
+            "defaultSecurityDescriptor is the ACL stamped onto EVERY newly-created "
+            "object of that class, so any future object of these classes is "
+            "immediately attacker-writable — a durable persistence and "
+            "future-object-takeover primitive (e.g. every new user or computer). "
+            + "; ".join(detail_lines) + ". Restore the default descriptor "
+            "(it should grant write only to SELF/SYSTEM/admin principals) with "
+            "the Schema snap-in or by resetting defaultSecurityDescriptor.",
+            _dedup_keep_order(affected))
+
+    # ── P-DangerousGPLinkSite: writable gPLink on an AD Site object ───────────
+    _SITE_GPLINK_GUID = "f30e3bbe-9ff0-11d1-b603-0000f80367c1"   # gP-Link attribute schemaIDGUID
+
+    def _sites_with_dcs(self) -> Dict[str, List[str]]:
+        """Map lowercased Site DN -> names of domain controllers that live in that
+        site (best effort; empty on any failure). A DC's server object sits at
+        CN=<dc>,CN=Servers,CN=<site>,CN=Sites,CN=Configuration,... and its
+        serverReference points back to the DC computer object, so a site holding a
+        DC is the Tier-0 case (a rogue GPO linked there runs as SYSTEM on a DC)."""
+        out: Dict[str, List[str]] = {}
+        dc_dns: Dict[str, str] = {}
+        for dc in getattr(self.d, "dcs", []) or []:
+            dn = (dc.get("dn", "") or get_str(dc["attrs"], "distinguishedName")).lower()
+            if dn:
+                dc_dns[dn] = (get_str(dc["attrs"], "dNSHostName")
+                              or get_str(dc["attrs"], "sAMAccountName") or dn_base(dn))
+        cfg = getattr(self.d, "cfg", "") or ""
+        if not dc_dns or not cfg:
+            return out
+        try:
+            servers = self.d.conn.paged_search(
+                f"CN=Sites,{cfg}", "(objectClass=server)",
+                ["distinguishedName", "serverReference"])
+        except Exception:
+            return out
+        for srv in servers or []:
+            ref = get_str(srv["attrs"], "serverReference").lower()
+            if not ref or ref not in dc_dns:
+                continue
+            srv_dn = (srv.get("dn", "") or get_str(srv["attrs"], "distinguishedName")).lower()
+            parts = srv_dn.split(",")
+            if len(parts) >= 3:                       # strip CN=<dc>,CN=Servers,
+                site_dn = ",".join(parts[2:])
+                out.setdefault(site_dn, []).append(dc_dns[ref])
+        return out
+
+    def _p_dangerous_gplink_site(self):
+        """P-DangerousGPLinkSite: a broad / low-privileged principal that can write
+        the gPLink attribute on (or take over) an AD Site object can link a rogue
+        GPO to the site and gain SYSTEM on every computer in that site (and on the
+        DCs when the site contains one -> Tier-0 / full domain compromise).
+
+        FP-safe: only broad principals (Everyone / Authenticated Users / Domain
+        Users|Computers / BUILTIN Users) are flagged; INHERIT_ONLY aces (which do
+        not apply to the site object itself) are skipped; and WriteProperty counts
+        only when UNSCOPED (basic ACE, an object ACE with no ObjectType, or an
+        object ACE scoped to the gPLink attribute) -- an object-scoped WP to an
+        unrelated attribute is ignored. Default site ACLs grant broad principals
+        read only, so this does not fire on a clean domain."""
+        if not HAS_IMPACKET_LDAP:
+            return
+        sites = getattr(self.d, "sites", None)
+        if not sites:
+            return
+        broad = self._broad_low_priv_sids()
+        dc_sites = self._sites_with_dcs()
+        takeover = (self._ADS_GENERIC_ALL | self._ADS_WRITE_DACL | self._ADS_WRITE_OWNER)
+        affected: List[str] = []
+        clauses: List[str] = []
+        tier0_hit = False
+        for site in sites:
+            raw = site["attrs"].get("nTSecurityDescriptor")
+            if isinstance(raw, list):
+                raw = raw[0] if raw else None
+            if not isinstance(raw, (bytes, bytearray)):
+                continue
+            try:
+                sd = _ldaptypes.SR_SECURITY_DESCRIPTOR(data=raw)
+            except Exception:
+                continue
+            dacl = sd["Dacl"]
+            if not dacl:
+                continue
+            site_name = get_str(site["attrs"], "cn") or dn_base(site.get("dn", ""))
+            site_dn = (site.get("dn", "") or get_str(site["attrs"], "distinguishedName")).lower()
+            hits: Dict[str, str] = {}
+            for ace in dacl["Data"]:
+                try:
+                    atype = ace["AceType"]
+                    if atype not in (0x00, 0x05):          # ALLOWED / ALLOWED_OBJECT only
+                        continue
+                    if int(ace["AceFlags"]) & 0x08:        # INHERIT_ONLY -> not effective here
+                        continue
+                    mask = int(ace["Ace"]["Mask"]["Mask"])
+                    sidstr = ace["Ace"]["Sid"].formatCanonical()
+                except Exception:
+                    continue
+                if sidstr not in broad:
+                    continue
+                right = None
+                if atype == 0x05:
+                    # Object ACE: GenericWrite/WriteProp may be scoped to one
+                    # attribute. Full takeover always applies; a write right counts
+                    # only when unscoped (no ObjectType) or scoped to gPLink.
+                    if mask & takeover:
+                        right = ("GenericAll" if mask & self._ADS_GENERIC_ALL
+                                 else "WriteDacl" if mask & self._ADS_WRITE_DACL
+                                 else "WriteOwner")
+                    elif mask & (self._ADS_GENERIC_WRITE | self._ADS_WRITE_PROP):
+                        ot = _ace_object_type(ace["Ace"])
+                        if not ot:
+                            right = "WriteProperty (all attributes)"
+                        else:
+                            try:
+                                guid = _guid_from_bytes(ot).strip("{}").lower()
+                            except Exception:
+                                guid = ""
+                            if guid == self._SITE_GPLINK_GUID:
+                                right = "WriteProperty (gPLink)"
+                else:
+                    # Basic ACE applies to every property of the object.
+                    if mask & self._ADS_GENERIC_ALL:      right = "GenericAll"
+                    elif mask & self._ADS_GENERIC_WRITE:  right = "GenericWrite"
+                    elif mask & self._ADS_WRITE_DACL:     right = "WriteDacl"
+                    elif mask & self._ADS_WRITE_OWNER:    right = "WriteOwner"
+                    elif mask & self._ADS_WRITE_PROP:     right = "WriteProperty (all attributes)"
+                if right and right not in (hits.get(broad[sidstr]) or ""):
+                    hits[broad[sidstr]] = right
+            if not hits:
+                continue
+            dcs_here = dc_sites.get(site_dn, [])
+            who = ", ".join(f"{n} ({r})" for n, r in hits.items())
+            if dcs_here:
+                tier0_hit = True
+                clauses.append(f"site '{site_name}' [{who}] (contains DC(s): "
+                               f"{', '.join(sorted(set(dcs_here)))} -> Tier-0)")
+            else:
+                clauses.append(f"site '{site_name}' [{who}]")
+            for n in hits:
+                affected.append(f"{n} -> {site_name}")
+        if not clauses:
+            return
+        t0 = (" At least one affected site contains a domain controller, so this is "
+              "a direct path to SYSTEM on a DC (full domain compromise).") if tier0_hit else ""
+        self._add("P-DangerousGPLinkSite",
+                  "Broad principal(s) can write the gPLink attribute on AD Site "
+                  f"object(s): {'; '.join(clauses)}. An attacker can link a malicious "
+                  "GPO to the site and gain SYSTEM on every computer in that site on "
+                  f"the next gpupdate.{t0} Remove non-Tier-0 write access from the "
+                  "site's ACL (gPLink / GenericWrite / WriteDacl / WriteOwner).",
+                  _dedup_keep_order(affected))
 
     def _p_schema_admin(self):
         sa = self.d.priv_group_members.get("Schema Admins", [])
@@ -6627,6 +7191,7 @@ class CheckEngine:
         self._p_dangerous_acl_priv_groups()
         self._p_modifiable_gpo()
         self._p_machine_account_quota()
+        self._p_dangerous_gplink_site()
 
     def _p_dcsync_rights(self):
         # DCSync requires BOTH DS-Replication-Get-Changes AND -Get-Changes-All on
@@ -7424,6 +7989,7 @@ class ControlPathAnalyzer:
             self._adcs_edges()
             self._gmsa_edges()
             self._dc_ou_gplink_edges()
+            self._dc_site_gplink_edges()
             self._close()
         except Exception as e:
             if self.args.verbose:
@@ -7678,6 +8244,76 @@ class ControlPathAnalyzer:
             # GPOs not linked to a DC-affecting container intentionally get no
             # Tier-0 edge — controlling them is still surfaced as a finding, but
             # it is not a path to Domain Admin.
+
+    def _dc_site_gplink_edges(self):
+        """WriteGPLink on an AD Site that contains a domain controller: a non-Tier-0
+        principal who can write gPLink on (or take over) such a site can link a
+        rogue GPO -> SYSTEM on that DC -> Tier-0. Complements _dc_ou_gplink_edges
+        (which covers the DC's parent-OU chain). Only sites that hold a DC yield an
+        edge to the domain root. FP-safe: INHERIT_ONLY aces (not effective on the
+        site object) are skipped, and WriteProperty counts only when unscoped or
+        scoped to the gPLink attribute."""
+        d = self.data
+        cfg = getattr(d, "cfg", "") or ""
+        sites = getattr(d, "sites", None)
+        if not cfg or not sites:
+            return
+        dc_dns = set()
+        for dc in getattr(d, "dcs", []) or []:
+            dn = (dc.get("dn", "") or "").lower()
+            if dn:
+                dc_dns.add(dn)
+        if not dc_dns:
+            return
+        dc_site_dns = set()
+        try:
+            servers = self.conn.paged_search(
+                f"CN=Sites,{cfg}", "(objectClass=server)",
+                ["distinguishedName", "serverReference"])
+        except Exception:
+            servers = []
+        for srv in servers or []:
+            ref = get_str(srv["attrs"], "serverReference").lower()
+            if ref and ref in dc_dns:
+                parts = (srv.get("dn", "") or "").lower().split(",")
+                if len(parts) >= 3:
+                    dc_site_dns.add(",".join(parts[2:]))
+        if not dc_site_dns:
+            return
+        for site in sites:
+            site_dn = (site.get("dn", "") or get_str(site["attrs"], "distinguishedName")).lower()
+            if site_dn not in dc_site_dns:
+                continue
+            sd = self._fetch_one_sd(site_dn)
+            if not sd:
+                continue
+            dacl = sd["Dacl"]
+            if not dacl:
+                continue
+            for ace in dacl["Data"]:
+                try:
+                    if "DENIED" in ace["TypeName"].upper():
+                        continue
+                    if int(ace["AceFlags"]) & 0x08:        # INHERIT_ONLY
+                        continue
+                    mask = int(ace["Ace"]["Mask"]["Mask"])
+                    psid = ace["Ace"]["Sid"].formatCanonical()
+                except Exception:
+                    continue
+                if psid not in self.sid2name or psid in self.tier0_groups:
+                    continue
+                is_object = "OBJECT" in ace["TypeName"].upper()
+                ot_guid = ""
+                if is_object:
+                    ot = _ace_object_type(ace["Ace"])
+                    if ot and len(ot) == 16:
+                        ot_guid = _guid_from_bytes(bytes(ot)).strip("{}").lower()
+                if mask & (_ACE_GENERIC_ALL | _ACE_WRITE_DAC | _ACE_WRITE_OWNER):
+                    self._edge(psid, self.domain_root, "WriteGPLink (site)")
+                elif (not is_object) and (mask & (_ACE_GENERIC_WRITE | _ACE_DS_WRITE_PROP)):
+                    self._edge(psid, self.domain_root, "WriteGPLink (site)")
+                elif is_object and (mask & _ACE_DS_WRITE_PROP) and (not ot_guid or ot_guid == self._GPLINK_GUID):
+                    self._edge(psid, self.domain_root, "WriteGPLink (site)")
 
     def _adcs_edges(self):
         """ADCS objects whose control IS domain compromise, modeled as Tier-0
@@ -8220,6 +8856,9 @@ EXPOSURE_WEIGHTS = {
     "S-Kerberoastable":55, "S-NoPreAuth":52, "P-ConstrainedDelegService":55,
     "P-RBCD":55, "A-ReversiblePwd":52, "S-Reversible":52, "P-MachineAccountQuota":48,
     "A-Certifried":72, "P-KrbRelayUp":60, "P-DangerousACLNamingContext":95,
+    "P-SchemaDefaultSD":72,
+    "P-DangerousGPLinkSite":88,
+    "A-CertESC6":90, "A-CertESC11":80, "A-CertESC16":78,
     "A-DCLdapSign":45, "A-SMB2SignatureNotRequired":45, "A-DCLdapsChannelBinding":42,
     "A-LDAPSigningDisabled":45, "A-DC-Spooler":40, "A-DC-WebClient":40,
     "S-DesEnabled":45, "A-NullSession":40, "P-AdminCountOrphan":35,
