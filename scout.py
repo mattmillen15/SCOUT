@@ -329,6 +329,7 @@ RULES: Dict[str, Tuple[str, str, int, str]] = {
     "P-DangerousACLDA":       ("Broad principal can write to Domain Admins group","Privileged",100,"CRITICAL"),
     "P-DangerousACLGPO":      ("Broad principal can modify high-value GPO","Privileged",75,"CRITICAL"),
     "P-MachineAccountQuota":  ("ms-DS-MachineAccountQuota > 0 (any user can add machine accounts)","Privileged",25,"HIGH"),
+    "P-WritableSysvolScript": ("Broad principal can write a GPO startup/logon script in SYSVOL (code exec)","Privileged",50,"HIGH"),
     "P-DangerousGPLinkSite":  ("Broad principal can link a GPO to an AD Site (WriteGPLink/takeover)","Privileged",50,"HIGH"),
     "P-KrbRelayUp":           ("KrbRelayUp: MachineAccountQuota > 0 and LDAP signing not required (any user -> SYSTEM on any host)","Privileged",60,"HIGH"),
     "P-OwnsPrivObject":       ("Broad principal owns a privileged AD object","Privileged",50,"CRITICAL"),
@@ -503,6 +504,7 @@ RULE_MITRE: Dict[str, List[str]] = {
     "P-DangerousACLNamingContext": ["T1484: Domain or Tenant Policy Modification", "T1649: Steal or Forge Authentication Certificates"],
     "P-SchemaDefaultSD":["T1222.001: Windows File and Directory Permissions Modification","T1098: Account Manipulation"],
     "P-DangerousGPLinkSite": ["T1484.001: Group Policy Modification", "T1222.001: ACL Modification"],
+    "P-WritableSysvolScript": ["T1037: Boot or Logon Initialization Scripts", "T1484.001: Group Policy Modification"],
     "A-CertESC6": ["T1649: Steal or Forge Authentication Certificates (ESC6)"],
     "A-CertESC11": ["T1649: Authentication Certificates (ESC11)", "T1557: Adversary-in-the-Middle (Relay)"],
     "A-CertESC16": ["T1649: Authentication Certificates (ESC16)", "T1556: Modify Authentication Process"],
@@ -641,6 +643,7 @@ OP_CATEGORY = {
     "P-DangerousACLNamingContext":"Privilege Escalation",
     "P-SchemaDefaultSD":"Persistence",
     "P-DangerousGPLinkSite":"Privilege Escalation",
+    "P-WritableSysvolScript":"Privilege Escalation",
     "A-CertESC6":"Privilege Escalation","A-CertESC11":"Privilege Escalation","A-CertESC16":"Privilege Escalation",
     "P-ExchangePrivEsc":"Privilege Escalation","A-MembershipEveryone":"Privilege Escalation",
     "P-AdminNum":"Privilege Escalation","P-SchemaAdmin":"Privilege Escalation",
@@ -1625,6 +1628,21 @@ RULE_DOCS: Dict[str, Dict[str, Any]] = {
             "Ensure issued certificates carry the SID security extension.",
         ],
         "refs": ["https://github.com/ly4k/Certipy", "https://support.microsoft.com/help/5014754"],
+    },
+    "P-WritableSysvolScript": {
+        "description": "A broad / low-privileged principal can write a GPO's startup/logon script folder in SYSVOL.",
+        "why": "GPO startup/shutdown scripts run as SYSTEM and logon/logoff scripts run as the user, on every host the GPO applies to. If a non-admin can write the script folder they can overwrite an existing script (or add one) and execute code fleet-wide — SYSTEM on every affected machine when it is a machine script. The SYSVOL filesystem ACL is enforced independently of the GPO AD-object DACL, so this can be exploitable even when the GPO object itself looks locked down.",
+        "technical": "For each GPO under \\\\<domain>\\SYSVOL\\<domain>\\Policies\\{GUID}, read the SMB security descriptor of Machine\\Scripts and User\\Scripts and flag a write-class right (FILE_WRITE_DATA/APPEND/WRITE_EA/WRITE_ATTR/DELETE/WRITE_DAC/WRITE_OWNER/GENERIC_WRITE/GENERIC_ALL) granted to Everyone / Authenticated Users / Users / Domain Users / Domain Computers. Only folders that exist (scripts configured) are considered.",
+        "exploit": [
+            "Confirm write: smbcacls //dc/SYSVOL '<domain>/Policies/{GUID}/Machine/Scripts'",
+            "Edit Machine\\Scripts\\psscripts.ini / scripts.ini to add your script, drop the payload in the folder.",
+            "On the next gpupdate the Scripts client-side extension runs it as SYSTEM on every computer the GPO targets.",
+        ],
+        "remediation": [
+            "Reset the SYSVOL script-folder ACL so only Administrators / SYSTEM / Enterprise Admins have write; broad principals should have read+execute only.",
+            "Audit how the broad write ACE was introduced (often a mis-scoped delegation or a bad folder re-ACL).",
+        ],
+        "refs": ["https://wald0.com/?p=179", "https://github.com/FSecureLABS/SharpGPOAbuse"],
     },
     "A-WeakLockout": {
         "description": "The domain (or a fine-grained policy) has no — or a very high — account-lockout threshold.",
@@ -2888,6 +2906,7 @@ class ADData:
             "registry_pol":  [],       # [{gpo_name, key, name, regtype, data}]
             "inf_settings":  [],       # [{gpo_name, section, key, value}]
             "gpo_files":     [],       # raw file paths found
+            "writable_scripts": [],    # [{gpo_name, path, principal, context}]
         }
         # populated by ACLAnalyzer
         self.acl_findings: List[Dict] = []
@@ -4783,8 +4802,9 @@ class CheckEngine:
                           f"({type(e).__name__}: {e}) — skipping ESC6/11/16 for {ca_name}")
                 return None
             try:
-                for val_name, dword in (("EditFlags", True),
-                                        ("InterfaceFlags", True),
+                # InterfaceFlags (ESC11) and DisableExtensionList (ESC16) live on
+                # the CA root key.
+                for val_name, dword in (("InterfaceFlags", True),
                                         ("DisableExtensionList", False)):
                     try:
                         _, data = rrp.hBaseRegQueryValue(dce, hkey, val_name)
@@ -4801,6 +4821,35 @@ class CheckEngine:
                             raw = bytes(raw).decode("utf-16-le", "replace")
                         if isinstance(raw, str):
                             result[val_name] = [s for s in raw.split("\x00") if s]
+                # EditFlags (ESC6) is NOT on the CA root — it lives under the
+                # active policy module: Configuration\<CA>\PolicyModules\<module>\
+                # EditFlags (module name is usually CertificateAuthority_Microsoft
+                # Default.Policy but is enumerated so it works on any CA).
+                try:
+                    pm_root = rrp.hBaseRegOpenKey(
+                        dce, hklm, key_path + r"\PolicyModules")["phkResult"]
+                    idx = 0
+                    while result["EditFlags"] is None:
+                        try:
+                            mod = rrp.hBaseRegEnumKey(dce, pm_root, idx)["lpNameOut"]
+                        except Exception:
+                            break
+                        idx += 1
+                        mod = mod.rstrip("\x00")
+                        try:
+                            mk = rrp.hBaseRegOpenKey(
+                                dce, hklm, key_path + r"\PolicyModules\\" + mod)["phkResult"]
+                            _, ef = rrp.hBaseRegQueryValue(dce, mk, "EditFlags")
+                            rrp.hBaseRegCloseKey(dce, mk)
+                            result["EditFlags"] = int(ef)
+                        except Exception:
+                            continue
+                    try:
+                        rrp.hBaseRegCloseKey(dce, pm_root)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
             finally:
                 try:
                     rrp.hBaseRegCloseKey(dce, hkey)
@@ -6056,6 +6105,23 @@ class CheckEngine:
                   "site's ACL (gPLink / GenericWrite / WriteDacl / WriteOwner).",
                   _dedup_keep_order(affected))
 
+    def _p_writable_sysvol_script(self):
+        ws = self.d.sysvol_data.get("writable_scripts", [])
+        if not ws:
+            return
+        affected, details = [], []
+        for w in ws:
+            affected.append(f"{w['principal']} -> {w['gpo_name']}\\{w['path']}")
+            details.append(f"GPO '{w['gpo_name']}': {w['principal']} can write "
+                           f"{w['path']} (executes as {w['context']})")
+        self._add("P-WritableSysvolScript",
+                  "A broad principal can write startup/logon script folder(s) in "
+                  "SYSVOL: " + "; ".join(details) + ". Overwriting or adding a script "
+                  "runs code as SYSTEM (machine scripts) or the user (logon scripts) "
+                  "on every host the GPO applies to. The SYSVOL script folder should "
+                  "be writable only by administrators / SYSTEM.",
+                  _dedup_keep_order(affected))
+
     def _p_schema_admin(self):
         sa = self.d.priv_group_members.get("Schema Admins", [])
         active = [get_str(m["attrs"],"sAMAccountName") for m in sa
@@ -6882,6 +6948,7 @@ class CheckEngine:
         # Presence-based checks (only fire on an actual bad value found in SYSVOL)
         # are always safe to run.
         self._p_gpp_passwords()
+        self._p_writable_sysvol_script()
         self._a_wdigest()
         self._a_lm_compat()
         self._a_wsus_http_gpo()
@@ -7529,6 +7596,81 @@ class SYSVOLChecker:
             lm = "aad3b435b51404eeaad3b435b51404ee"
         return lm, nt
 
+    # ── writable startup/logon scripts (P-WritableSysvolScript) ───────────────
+    _SCRIPT_WRITE_MASK = (0x2 | 0x4 | 0x10 | 0x100 | 0x10000 | 0x40000 | 0x80000
+                          | 0x40000000 | 0x10000000)   # Write*/Delete/WDAC/WOWN/GW/GA
+    _SCRIPT_BROAD_SIDS = {"S-1-1-0": "Everyone", "S-1-5-11": "Authenticated Users",
+                          "S-1-5-32-545": "Users"}
+
+    def _read_sysvol_sd(self, path):
+        """Owner+Group+DACL of a SYSVOL path over SMB (READ_CONTROL + SMB2 security
+        QUERY_INFO). Returns an SR_SECURITY_DESCRIPTOR, or None on any failure
+        (fails closed)."""
+        tid = fid = None
+        try:
+            tid = self.smb.connectTree("SYSVOL")
+            fid = self.smb.openFile(tid, path, desiredAccess=0x00020000)  # READ_CONTROL
+            from impacket.smb3structs import SMB2_0_INFO_SECURITY
+            raw = self.smb.getSMBServer().queryInfo(
+                tid, fid, infoType=SMB2_0_INFO_SECURITY, fileInfoClass=0,
+                additionalInformation=0x07, flags=0)
+            return _ldaptypes.SR_SECURITY_DESCRIPTOR(data=bytes(raw))
+        except Exception:
+            return None
+        finally:
+            try:
+                if fid is not None:
+                    self.smb.closeFile(tid, fid)
+            except Exception:
+                pass
+
+    def _broad_script_writers(self, sd, dsid):
+        """{name: sid} for broad/low-priv principals holding a write-class right in
+        a SYSVOL path's DACL. INHERIT_ONLY aces (not effective here) are skipped."""
+        out = {}
+        if not sd or not sd["Dacl"]:
+            return out
+        for ace in sd["Dacl"]["Data"]:
+            try:
+                if "ALLOWED" not in ace["TypeName"].upper():
+                    continue
+                if int(ace["AceFlags"]) & 0x08:        # INHERIT_ONLY
+                    continue
+                sidstr = ace["Ace"]["Sid"].formatCanonical()
+                mask = int(ace["Ace"]["Mask"]["Mask"])
+            except Exception:
+                continue
+            name = self._SCRIPT_BROAD_SIDS.get(sidstr)
+            if not name and dsid and sidstr in (dsid + "-513", dsid + "-515"):
+                name = "Domain Users" if sidstr.endswith("-513") else "Domain Computers"
+            if name and (mask & self._SCRIPT_WRITE_MASK):
+                out[name] = sidstr
+        return out
+
+    def _scan_writable_scripts(self, guid, display_name, base_path):
+        """A broad principal who can write a GPO's startup/logon Scripts folder in
+        SYSVOL can overwrite (or add) a script for code execution as SYSTEM (machine
+        scripts) or the logged-on user. Only fires when the Scripts folder actually
+        exists (scripts are configured) AND a broad principal has write there — the
+        SYSVOL filesystem ACL, which can differ from the GPO AD-object DACL."""
+        dsid = ""
+        if self.data.domain_obj:
+            rs = self.data.domain_obj["attrs"].get("objectSid")
+            if isinstance(rs, list):
+                rs = rs[0] if rs else None
+            dsid = sid_to_str(rs) if rs else ""
+        for sub, ctx in (("Machine\\Scripts", "SYSTEM"),
+                         ("User\\Scripts", "the logged-on user")):
+            folder = base_path + sub
+            try:
+                self.smb.listPath("SYSVOL", folder + "\\*")   # exists / is populated?
+            except Exception:
+                continue
+            writers = self._broad_script_writers(self._read_sysvol_sd(folder), dsid)
+            for name in writers:
+                self.data.sysvol_data["writable_scripts"].append(
+                    {"gpo_name": display_name, "path": sub, "principal": name, "context": ctx})
+
     def _walk_sysvol(self):
         domain = self.args.domain.upper()
         base_path = f"\\{domain}\\Policies\\"
@@ -7556,6 +7698,7 @@ class SYSVOLChecker:
         return guid
 
     def _scan_gpo(self, guid: str, display_name: str, base_path: str):
+        self._scan_writable_scripts(guid, display_name, base_path)
         # Scan Registry.pol files
         for subpath in ["Machine\\Registry.pol", "User\\Registry.pol"]:
             full = base_path + subpath
@@ -8858,6 +9001,7 @@ EXPOSURE_WEIGHTS = {
     "A-Certifried":72, "P-KrbRelayUp":60, "P-DangerousACLNamingContext":95,
     "P-SchemaDefaultSD":72,
     "P-DangerousGPLinkSite":88,
+    "P-WritableSysvolScript":80,
     "A-CertESC6":90, "A-CertESC11":80, "A-CertESC16":78,
     "A-DCLdapSign":45, "A-SMB2SignatureNotRequired":45, "A-DCLdapsChannelBinding":42,
     "A-LDAPSigningDisabled":45, "A-DC-Spooler":40, "A-DC-WebClient":40,
