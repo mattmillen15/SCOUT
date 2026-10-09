@@ -73,6 +73,12 @@ except ImportError:
     HAS_IMPACKET_LDAP = False
 
 try:
+    import socks as _pysocks
+    HAS_PYSOCKS = True
+except ImportError:
+    HAS_PYSOCKS = False
+
+try:
     from Crypto.Cipher import AES
     HAS_PYCRYPTO = True
 except ImportError:
@@ -2179,6 +2185,10 @@ Examples:
   %(prog)s -d corp.local -u john -p 'P@ssw0rd' --dc-ip 10.0.0.1 --ldaps
   %(prog)s -d corp.local -u john -p 'P@ssw0rd' --dc-ip 10.0.0.1 --output /tmp/report.html
   %(prog)s -d corp.local --ccache /tmp/krb5cc_1000 --dc-ip 10.0.0.1
+
+Relay (no creds — NTLM relayed via ntlmrelayx -socks):
+  %(prog)s -d corp.local -u relayed_user --dc-ip 10.0.0.1 --relay
+  %(prog)s -d corp.local -u relayed_user --dc-ip 10.0.0.1 --relay 127.0.0.1:1080
         """)
 
     auth = p.add_argument_group("Authentication")
@@ -2208,6 +2218,12 @@ Examples:
                       help="DC FQDN for the Kerberos SPN (auto-resolved if omitted)")
 
     conn = p.add_argument_group("Connection")
+    conn.add_argument("--relay",     metavar="[HOST:PORT]", nargs="?", const="127.0.0.1:1080",
+                      help="NTLM relay mode: route LDAP through an ntlmrelayx SOCKS "
+                           "proxy (default 127.0.0.1:1080). No real creds needed — "
+                           "supply -u DOMAIN\\\\user matching the relayed session; any "
+                           "password is accepted. Automatically disables SMB/SYSVOL "
+                           "checks. Requires PySocks (pip install pysocks).")
     conn.add_argument("--ldaps",     action="store_true", help="Use LDAPS (port 636)")
     conn.add_argument("--port",      type=int, default=0,
                       help="Override LDAP port (default 389 / 636 with --ldaps)")
@@ -2301,6 +2317,22 @@ class ADConnection:
         # depends on ldap3's server.info (which is absent on the Kerberos path).
         self.domain_func = -1
         self.forest_func = -1
+        # ── SOCKS relay state ────────────────────────────────────────────────
+        self._relay = bool(getattr(args, "relay", None))
+        self._relay_host = "127.0.0.1"
+        self._relay_port = 1080
+        if self._relay:
+            hp = args.relay
+            if ":" in hp:
+                h, p = hp.rsplit(":", 1)
+                self._relay_host = h
+                self._relay_port = int(p)
+            else:
+                # bare host or bare port
+                try:
+                    self._relay_port = int(hp)
+                except ValueError:
+                    self._relay_host = hp
 
     def _ldap_port(self) -> int:
         if self.args.port:
@@ -2352,8 +2384,15 @@ class ADConnection:
         # with LDAPAttributeError if any is absent (e.g. the LAPS attributes on a
         # domain without LAPS → 0 computers collected). SCOUT never uses the
         # schema; it only needs RootDSE naming contexts + functional levels.
+        #
+        # Relay mode: get_info=NONE — suppress all pre-/post-bind rootDSE
+        # queries. The ntlmrelayx LDAP SOCKS plugin only answers two pre-bind
+        # searches (supportedCapabilities, supportedSASLMechanisms); any other
+        # pre-bind LDAP message kills the connection. We manually query
+        # rootDSE after the bind instead.
+        info_level = ldap3.NONE if self._relay else DSA
         return Server(self.args.dc_ip, port=port, use_ssl=self.args.ldaps,
-                      tls=tls, get_info=DSA, connect_timeout=self.args.timeout)
+                      tls=tls, get_info=info_level, connect_timeout=self.args.timeout)
 
     def connect(self) -> bool:
         """Establish an authenticated LDAP session, choosing the most robust
@@ -2361,6 +2400,9 @@ class ADConnection:
 
         Strategy
         --------
+        * Relay mode (--relay) -> PySocks through ntlmrelayx SOCKS; NTLM bind
+          with a dummy password; the SOCKS plugin ignores the password and
+          matches on DOMAIN\\user against its active relay pool.
         * Kerberos requested (-k / --ccache / --aes-key)  -> impacket Kerberos.
           SCOUT requests a TGT itself from the supplied password, NT hash
           (overpass-the-hash) or AES key, then binds with GSS-SPNEGO. This
@@ -2370,6 +2412,10 @@ class ADConnection:
           strongerAuthRequired (signing/channel-binding enforced) we transparently
           upgrade to Kerberos when usable credentials are available.
         """
+        # ── Relay / SOCKS path ──────────────────────────────────────────────
+        if self._relay:
+            return self._connect_relay()
+
         # Explicit Kerberos path -------------------------------------------------
         if self.args.kerberos or self.args.ccache or self.args.aes_key:
             return self._connect_kerberos()
@@ -2434,6 +2480,125 @@ class ADConnection:
 
         self._extract_root_info()
         return True
+
+    # ── NTLM relay / SOCKS path ────────────────────────────────────────────
+    def _connect_relay(self) -> bool:
+        """Connect to the DC's LDAP through ntlmrelayx's SOCKS proxy.
+
+        The impacket LDAP SOCKS plugin fakes the NTLM "sicily" bind: it
+        replays the real server challenge, ignores the client's password,
+        and matches the client's DOMAIN\\user against the active relay pool.
+        We route ldap3's TCP socket through PySocks so every byte goes via
+        the relay, use get_info=NONE so no pre-bind rootDSE query trips the
+        plugin, and supply a dummy password (the plugin never checks it).
+        """
+        if not HAS_PYSOCKS:
+            print("[-] PySocks not installed (pip install pysocks). "
+                  "Required for --relay mode.")
+            return False
+
+        if not self.args.username:
+            print("[-] --relay requires -u/--username matching the relayed "
+                  "session (e.g. -u samrtest1 -d ecorp.local).")
+            return False
+
+        user = f"{self.args.domain}\\{self.args.username}"
+        password = self.args.password if self.args.password is not None else "RelayDummyPw"
+
+        print(f"[*] Relay mode: routing LDAP through SOCKS5 "
+              f"{self._relay_host}:{self._relay_port}")
+        print(f"[*] Binding as {user} (password ignored by relay proxy)")
+
+        # Build a Server with get_info=NONE — no pre/post-bind rootDSE queries
+        self.server = self._build_server()
+
+        # Temporarily monkeypatch socket.socket so ldap3's _open_socket()
+        # creates a PySocks socksocket that routes through the relay proxy.
+        _orig_socket = socket.socket
+        _relay_h, _relay_p = self._relay_host, self._relay_port
+
+        def _socks_factory(*args, **kwargs):
+            s = _pysocks.socksocket(*args, **kwargs)
+            s.set_proxy(_pysocks.SOCKS5, _relay_h, _relay_p)
+            return s
+
+        socket.socket = _socks_factory
+        try:
+            self.conn = Connection(
+                self.server, user=user, password=password,
+                authentication=NTLM, auto_bind=True, check_names=False)
+        except (LDAPBindError, LDAPSocketOpenError) as e:
+            msg = str(e)
+            if "socket" in msg.lower() or "connection refused" in msg.lower():
+                print(f"[-] Cannot reach SOCKS proxy at "
+                      f"{self._relay_host}:{self._relay_port}: {e}")
+                print("    Is ntlmrelayx running with -socks?")
+            elif "invalidCredentials" in msg or "No session" in msg:
+                print(f"[-] Relay bind failed: {e}")
+                print(f"    Make sure ntlmrelayx has an active LDAP session for "
+                      f"{user}. Check 'socks' in the ntlmrelayx interactive shell.")
+            else:
+                print(f"[-] Relay bind failed: {e}")
+            return False
+        except Exception as e:
+            print(f"[-] Relay connection error: {e}")
+            return False
+        finally:
+            socket.socket = _orig_socket
+
+        if not self.conn or not self.conn.bound:
+            print(f"[-] Relay bind failed: {self.conn.result if self.conn else ''}")
+            return False
+
+        print("[+] Relay bind successful — running as the relayed identity.")
+        # The DC accepted an unsigned NTLM bind over the relay — LDAP signing
+        # is NOT required (this is a precondition for the relay to work at all).
+        if not self.args.ldaps:
+            self.ldap_signing_not_required = True
+
+        # Manually query rootDSE for naming contexts (get_info=NONE means
+        # ldap3 didn't do this for us).
+        self._extract_root_info_manual()
+        return True
+
+    def _extract_root_info_manual(self):
+        """Post-bind rootDSE query over an established connection.
+        Used in relay mode where Server(get_info=NONE) suppresses the
+        automatic rootDSE read."""
+        try:
+            self.conn.search(
+                search_base="", search_filter="(objectClass=*)",
+                search_scope=ldap3.BASE,
+                attributes=["defaultNamingContext", "configurationNamingContext",
+                            "schemaNamingContext", "rootDomainNamingContext",
+                            "domainFunctionality", "forestFunctionality"])
+            if self.conn.response:
+                for entry in self.conn.response:
+                    if entry.get("type") != "searchResEntry":
+                        continue
+                    a = entry.get("raw_attributes", {})
+                    def _first(key):
+                        v = a.get(key, [])
+                        if v and isinstance(v[0], bytes):
+                            return v[0].decode("utf-8", errors="replace")
+                        return v[0] if v else ""
+                    self.base_dn = _first("defaultNamingContext")
+                    self.cfg_nc  = _first("configurationNamingContext")
+                    self.sch_nc  = _first("schemaNamingContext")
+                    self.gc_root = _first("rootDomainNamingContext")
+                    def _lvl(key):
+                        v = _first(key)
+                        try:    return int(v)
+                        except (TypeError, ValueError): return -1
+                    self.domain_func = _lvl("domainFunctionality")
+                    self.forest_func = _lvl("forestFunctionality")
+                    break
+        except Exception as e:
+            print(f"[!] rootDSE query failed: {e}")
+        if not self.base_dn:
+            # Derive from domain FQDN as a last resort
+            self.base_dn = ",".join(f"DC={c}" for c in self.args.domain.split("."))
+            print(f"[!] Could not read rootDSE; deriving base DN: {self.base_dn}")
 
     def _do_bind(self) -> None:
         # check_names=False is essential: with the schema loaded (get_info=ALL),
@@ -8111,6 +8276,17 @@ class ControlPathAnalyzer:
         "f3a64788-5306-11d1-a9c5-0000f80367c1": "WriteSPN",             # servicePrincipalName (targeted kerberoast)
         "f30e3bbe-9ff0-11d1-b603-0000f80367c1": "WriteGPLink",          # gPLink (link a rogue GPO)
     }
+    # Object-class kinds where each targeted-WriteProperty edge is valid.
+    # Inherited ACEs propagate attribute GUIDs to child object classes where
+    # the attribute doesn't exist (e.g. gPLink on a group) — dead-weight
+    # entries that create false control-path edges if not filtered out.
+    _WRITE_ATTR_KINDS = {
+        "AddKeyCredentialLink": ("object",),       # msDS-KeyCredentialLink: user/computer
+        "WriteRBCD":            ("object",),       # msDS-AllowedToActOnBehalf…: computer
+        "AddMember":            ("group",),        # member: group
+        "WriteSPN":             ("object",),       # servicePrincipalName: user/computer
+        "WriteGPLink":          ("domain root",),  # gPLink: OU/site/domain; OUs+sites via dedicated funcs
+    }
     _FORCE_CHANGE_PWD_GUID = "00299570-246d-11d0-a768-00aa006e0529"      # User-Force-Change-Password extended right
     _GPLINK_GUID           = "f30e3bbe-9ff0-11d1-b603-0000f80367c1"      # gP-Link attribute
 
@@ -8535,6 +8711,8 @@ class ControlPathAnalyzer:
                 # attribute — GenericAll/GenericWrite already covered the write-all case.
                 if label is None and is_object and (mask & _ACE_DS_WRITE_PROP):
                     label = self._WRITE_ATTR_EDGES.get(ot_guid)
+                    if label and kind not in self._WRITE_ATTR_KINDS.get(label, (kind,)):
+                        label = None
                 # Targeted control-access on an account: ForceChangePassword (reset
                 # the target's password) or AllExtendedRights (null GUID, which
                 # includes it). Restricted to user/computer targets so it doesn't
@@ -8568,8 +8746,30 @@ class ControlPathAnalyzer:
         principals = {s for s in reach if s in self.sid2name and not s.startswith("GPO:")}
         control = principals - admins - self.tier0_groups - {self.domain_root}
         broad = [self.sid2name[s] for s in control if s in self.broad]
+        # ── Broad-SID collapse ──────────────────────────────────────────────
+        # A broad principal (Domain Users / Authenticated Users / …) reaching
+        # Tier-0 is ONE finding, not N findings for each of its members.
+        # Reverse-BFS from seeds but do NOT expand through broad SIDs: any
+        # principal that reaches a seed only via a broad SID is "broad-covered"
+        # and suppressed from the paths, graph and controller lists.
+        broad_in_control = {s for s in control if s in self.broad}
+        broad_covered_count = 0
+        if broad_in_control:
+            indiv_reach = set()
+            dq = list(self.seeds)
+            while dq:
+                n = dq.pop()
+                for src, _ in self.radj.get(n, []):
+                    if src not in indiv_reach:
+                        indiv_reach.add(src)
+                        if src not in self.broad:
+                            dq.append(src)
+            individual = {s for s in control if s in indiv_reach}
+            broad_covered_count = len(control) - len(individual)
+        else:
+            individual = control
         # shortest path (forward BFS) for the most interesting principals
-        prio = sorted(control, key=lambda s: (0 if s in self.broad else 1, self.sid2name.get(s,"")))
+        prio = sorted(individual, key=lambda s: (0 if s in self.broad else 1, self.sid2name.get(s,"")))
         paths = []
         for s in prio[:self._MAX_PATHS]:
             p = self._shortest(s)
@@ -8577,8 +8777,6 @@ class ControlPathAnalyzer:
                 paths.append((self.sid2name.get(s, s), p, s in self.broad))
         nodes, edges = self._build_node_registry(paths)
         hv = self._high_value_targets()
-        # ensure every node rendered in the HV view — target, controllers AND the
-        # intermediate hops on each controller's path — resolves in the click drawer
         for g in hv:
             names = [g["name"]]
             for c in g["controllers"]:
@@ -8587,7 +8785,8 @@ class ControlPathAnalyzer:
             for nm in names:
                 if nm not in nodes:
                     nodes[nm] = self._node_meta(nm)
-        self.data.control_paths = {"count": len(control), "broad": _dedup_keep_order(broad),
+        self.data.control_paths = {"count": len(individual), "broad": _dedup_keep_order(broad),
+                                   "broad_covered": broad_covered_count,
                                    "paths": paths, "nodes": nodes, "edges": edges,
                                    "hv_targets": hv}
 
@@ -8698,17 +8897,27 @@ class ControlPathAnalyzer:
                         continue
                     reach.add(src); nexthop[src] = (n, lbl); dq.append(src)
             controllers = []
+            broad_covered = 0
             for s in reach:
                 if (s not in self.sid2name or s.startswith("GPO:")
                         or s in members_sids or s in self.tier0_groups or s == self.domain_root):
                     continue
-                # nexthop is a BFS tree rooted at t, so following it always reaches
-                # t; the cap (graph size) is a defensive bound, never a real truncation.
                 path, cur, guard, cap = [], s, 0, len(nexthop) + 2
                 while cur != t and cur in nexthop and guard < cap:
                     nh, lbl = nexthop[cur]
                     path.append((self._node_name(cur), lbl, self._node_name(nh)))
                     cur = nh; guard += 1
+                # Collapse: a non-broad principal whose path goes through a
+                # broad SID is "covered" — only the broad SID is actionable.
+                if s not in self.broad:
+                    via_broad = False
+                    cur_check = s
+                    while cur_check != t and cur_check in nexthop:
+                        cur_check = nexthop[cur_check][0]
+                        if cur_check in self.broad:
+                            via_broad = True; break
+                    if via_broad:
+                        broad_covered += 1; continue
                 ent = self.sid2obj.get(s)
                 controllers.append({"name": self._node_name(s),
                                     "type": ent[0] if ent else "group",
@@ -8723,7 +8932,8 @@ class ControlPathAnalyzer:
             members.sort(key=lambda m: (m.get("sam") or "").lower())
             out.append({"name": self._node_name(t), "sid": t, "is_domain": t == self.domain_root,
                         "member_count": len(members_sids), "members": members[:200],
-                        "controller_count": len(controllers), "controllers": controllers[:50]})
+                        "controller_count": len(controllers), "broad_covered": broad_covered,
+                        "controllers": controllers[:50]})
         out.sort(key=lambda g: (-g["controller_count"], g["name"]))
         return out
 
@@ -10685,7 +10895,8 @@ class HTMLReporter:
         """Inbound control paths to a high-value target — the principals that can
         take control of it WITHOUT being a member, each with the resolved path."""
         ctrls = g["controllers"]
-        if not ctrls:
+        bc = g.get("broad_covered", 0)
+        if not ctrls and not bc:
             return ('<p class="kc-ap-sub" style="margin-top:12px"><span class="kc-ok">'
                     'No principal outside the membership can take control of this group.</span></p>')
         chains = ""
@@ -10694,16 +10905,21 @@ class HTMLReporter:
             if c["path"]:
                 for (_src, label, dst) in c["path"]:
                     ne += [label, self._pnode(dst, "crown" if dst == g["name"] else "")]
-            else:   # defensive: a controller always has a >=1-hop path, but never crash
+            else:
                 ne += ["controls", self._pnode(g["name"], "crown")]
             chains += self._chain(ne, "CRITICAL" if c["broad"] else "HIGH", "")
         extra = g["controller_count"] - len(ctrls)
         more = f'<p class="kc-ap-sub">… and {extra} more principal(s).</p>' if extra > 0 else ""
+        bc_note = (f'<p class="kc-ap-sub" style="color:var(--faint)">'
+                   f'{bc} additional principal(s) reach this target only through the '
+                   f'broad-SID path above (group membership) and are not listed individually.</p>'
+                   if bc else "")
+        n_shown = g["controller_count"]
         return ('<div class="kc-sub-h" style="margin-top:14px">Non-members with outbound control over this group '
                 '<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--faint)">'
-                f'— {g["controller_count"]} principal(s) hold an outbound control path that ends at this group; '
+                f'— {n_shown} distinct control path(s); '
                 'click any node</span></div>'
-                f'{chains}{more}')
+                f'{chains}{more}{bc_note}')
 
     def _privileged_section(self):
         pgm = self.data.priv_group_members
@@ -10714,8 +10930,8 @@ class HTMLReporter:
             if g.get("is_domain"): return -1
             try: return self._PRIV_ORDER.index(g["name"])
             except ValueError: return 99
-        hv = sorted(hv, key=lambda g: (0 if (g["controller_count"] or g["is_domain"] or pgm.get(g["name"])) else 1,
-                                       -g["controller_count"], rank(g)))
+        hv = sorted(hv, key=lambda g: (0 if (g["controller_count"] or g.get("broad_covered") or g["is_domain"] or pgm.get(g["name"])) else 1,
+                                       -(g["controller_count"] + g.get("broad_covered", 0)), rank(g)))
         hv_names = {g["name"] for g in hv}
 
         # 1) high-value targets — members + who can take control of them
@@ -10743,8 +10959,14 @@ class HTMLReporter:
                 mem_tbl = ('<div class="kc-sub-h">Members</div>' + self._hv_member_facts_table(g["members"])
                            if g["members"] else "")
             cc = g["controller_count"]
-            warn = (f' · <span class="kc-bad">{cc} non-member(s) with outbound control</span>' if cc
-                    else ' · <span class="kc-ok">no non-member control path</span>')
+            bc = g.get("broad_covered", 0)
+            if cc:
+                warn = f' · <span class="kc-bad">{cc} control path(s)</span>'
+                if bc:
+                    warn += f' <span class="kc-detail">(+{bc} via broad group)</span>'
+            else:
+                warn = (' · <span class="kc-ok">no non-member control path</span>'
+                        if not bc else f' · <span class="kc-detail">{bc} via broad group only</span>')
             head_n = ("domain head" if g["is_domain"] else f"{mem_count} member(s)") + warn
             gid = f"hv-{gi}"; gi += 1
             hv_blocks += (
@@ -10788,10 +11010,27 @@ class HTMLReporter:
         if not hv_blocks and not other_blocks and not graph_blk:
             return ""
         n_ctrl = cp.get("count", 0)
-        intro = (f'<p class="kc-sub">Who holds privilege, and who can <em>take</em> it. '
-                 f'{n_ctrl} non-privileged principal(s) have a control path to a Tier-0 group. '
-                 'Expand a target to see its members and exactly who can take control of it.</p>'
-                 if hv else '<p class="kc-sub">Privileged group membership.</p>')
+        broad_names = cp.get("broad", [])
+        bc = cp.get("broad_covered", 0)
+        if hv:
+            parts = ['<p class="kc-sub">Who holds privilege, and who can <em>take</em> it.']
+            if broad_names:
+                parts.append(f' <strong>{", ".join(self._e(b) for b in broad_names)}</strong>'
+                             f' {"has" if len(broad_names) == 1 else "have"} a control path to Tier-0')
+                if bc:
+                    parts.append(f' (covering {bc} domain principal{"s" if bc != 1 else ""})')
+                parts.append('.')
+            non_broad = n_ctrl - len(broad_names)
+            if non_broad > 0:
+                parts.append(f' {non_broad} additional individual principal{"s" if non_broad != 1 else ""}'
+                             f' {"have" if non_broad != 1 else "has"} a direct control path.')
+            elif not broad_names and n_ctrl:
+                parts.append(f' {n_ctrl} non-privileged principal{"s" if n_ctrl != 1 else ""}'
+                             f' {"have" if n_ctrl != 1 else "has"} a control path to a Tier-0 group.')
+            parts.append(' Expand a target to see its members and who can take control of it.</p>')
+            intro = "".join(parts)
+        else:
+            intro = '<p class="kc-sub">Privileged group membership.</p>'
         hv_hdr = ('<div class="kc-sub-h">High-value targets '
                   '<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--faint)">'
                   '— click a group: members + who can take control</span></div>') if hv_blocks else ""
@@ -11381,9 +11620,32 @@ def main():
     if args.ccache or args.aes_key or args.save_ccache:
         args.kerberos = True
 
+    # ── Relay mode overrides ─────────────────────────────────────────────
+    if getattr(args, "relay", None):
+        # Relay cannot use Kerberos (the relay IS NTLM)
+        if args.kerberos:
+            print("[!] --relay is incompatible with -k / --ccache / --aes-key "
+                  "(relay uses NTLM). Ignoring Kerberos flags.")
+            args.kerberos = False
+            args.ccache = None
+            args.aes_key = None
+        # Force --no-smb: SMB/SYSVOL need real creds (no relay session)
+        if not args.no_smb:
+            args.no_smb = True
+            print("[*] Relay mode: SMB/SYSVOL checks disabled (no real creds)")
+        # Don't prompt for a password — any dummy value works
+        if args.password is None:
+            args.password = "RelayDummyPw"
+        # Require a username
+        if not args.username:
+            print("[-] --relay requires -u/--username matching the relayed "
+                  "session (e.g. -u samrtest1 -d ecorp.local).")
+            sys.exit(1)
+
     # Prompt for a password when we have a user but no secret of any kind —
     # this covers both the NTLM path and "get me a TGT from a password".
     if (not args.null_session and not args.no_pass
+            and not getattr(args, "relay", None)
             and args.username and args.password is None
             and not args.hashes and not args.aes_key and not args.ccache
             and not os.environ.get("KRB5CCNAME")):
@@ -11395,7 +11657,8 @@ def main():
         args.null_session = True
         print("[*] No credentials provided — attempting null session")
 
-    auth_mode = ("Kerberos" if args.kerberos else
+    auth_mode = ("NTLM relay (SOCKS)" if getattr(args, "relay", None) else
+                 "Kerberos" if args.kerberos else
                  "NTLM (pass-the-hash)" if args.hashes else
                  "null session" if args.null_session else "NTLM")
     # ── SITREP banner (left-anchored so ANSI codes never break box alignment) ──
