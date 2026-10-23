@@ -3099,24 +3099,24 @@ class ADData:
             steps.append(("ADCS objects", self._collect_adcs))
         steps.append(("DNS zones", self._collect_dns))
         self.collect_errors: List[str] = []
-        for label, fn in steps:
-            print(f"[*] Collecting {label}...")
+        total = len(steps) + 1   # +1 for ADWS check
+        for i, (label, fn) in enumerate(steps, 1):
+            print(f"\r[*] Collecting directory data… {i}/{total}", end="", flush=True)
             try:
                 fn()
             except Exception as e:
                 self.collect_errors.append(f"{label}: {e}")
-                print(f"[!] Collection of {label} failed: {e}")
+                print(f"\n[!] Collection of {label} failed: {e}")
                 if self.args.verbose:
                     traceback.print_exc()
-        print("[*] Checking ADWS availability...")
+        print(f"\r[*] Collecting directory data… {total}/{total}", end="", flush=True)
         try:
             self.adws_available = check_port(self.args.dc_ip, 9389, timeout=3)
         except Exception:
             pass
         n = sum(len(x) for x in (self.users, self.computers, self.dcs)) + len(self.groups)
-        print(f"[*] Data collection complete "
-              f"({len(self.users)} users, {len(self.computers)} computers, "
-              f"{len(self.groups)} groups, {len(self.dcs)} DCs).")
+        print(f"\r[*] Collected {len(self.users)} users, {len(self.computers)} computers, "
+              f"{len(self.groups)} groups, {len(self.dcs)} DCs.{' '*20}")
         if not n:
             print("[!] WARNING: no directory objects were collected — results "
                   "will be incomplete. Check account rights and connectivity.")
@@ -9620,7 +9620,7 @@ def rule_compliance(rule_id: str, opcat: str) -> Dict[str, List[str]]:
 # vertically stretched. Used both in CSS and (literally) inside SVG <text>.
 
 _KC_CSS = r"""
-@import url('https://fonts.googleapis.com/css2?family=Saira:wght@400;500;600&family=Saira+Condensed:wght@500;600;700&family=Saira+Stencil+One&family=JetBrains+Mono:wght@400;500;700&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Saira+Condensed:wght@500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
 :root{
   /* SCOUT — FIELD INTELLIGENCE DOSSIER (dark, primary): olive-black ground, bone ink, brass + OD green */
   --bg:#12140d; --surface:#191c12; --surface2:#202417; --surface3:#2a2f1e;
@@ -9632,10 +9632,8 @@ _KC_CSS = r"""
   --ok:#82a455; --warn:#d8b84a; --bad:#d6453b;
   --shadow:0 2px 0 rgba(0,0,0,.30);
   --display:"Saira Condensed","Oswald","Arial Narrow",sans-serif;
-  --sans:"Saira","Inter",system-ui,-apple-system,"Segoe UI",sans-serif;
-  --mono:"JetBrains Mono","Share Tech Mono",ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;
-  --stencil:"Saira Stencil One","Stardos Stencil",var(--display);
-  --grid:rgba(198,164,78,.045);
+  --sans:"Saira Condensed",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --mono:"JetBrains Mono",ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;
   --r:3px; --r-sm:2px;
 }
 html[data-theme=light]{
@@ -9647,13 +9645,10 @@ html[data-theme=light]{
   --crit:#b23128; --high:#a4601d; --med:#897015; --low:#4f6b2e; --info:#3b6274;
   --ok:#4f6b2e; --warn:#897015; --bad:#b23128;
   --shadow:0 2px 0 rgba(60,55,30,.12);
-  --grid:rgba(90,70,20,.06);
 }
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:var(--sans);background:var(--bg);color:var(--text);font-size:13.5px;
-  line-height:1.55;-webkit-font-smoothing:antialiased;
-  background-image:linear-gradient(var(--grid) 1px,transparent 1px),linear-gradient(90deg,var(--grid) 1px,transparent 1px);
-  background-size:40px 40px}
+  line-height:1.55;-webkit-font-smoothing:antialiased}
 a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
 code{font-family:var(--mono);font-size:.85em;background:var(--surface3);padding:1px 6px;
   border-radius:var(--r-sm);color:var(--deck)}
@@ -9662,28 +9657,16 @@ code{font-family:var(--mono);font-size:.85em;background:var(--surface3);padding:
 h1,h2,h3,h4{font-family:var(--display);font-weight:600;letter-spacing:.02em}
 .ulabel{font-family:var(--mono);font-size:10px;letter-spacing:.16em;text-transform:uppercase;color:var(--faint)}
 
-/* ── classification banner (full-bleed, top of document) ── */
-.kc-classbar{font-family:var(--mono);font-size:10px;letter-spacing:.22em;text-transform:uppercase;
-  text-align:center;color:var(--accent);background:var(--surface2);border-bottom:1px solid var(--border2);
-  padding:5px 10px;position:relative}
-.kc-classbar::before,.kc-classbar::after{content:"";position:absolute;top:0;bottom:0;width:66px;
-  background:repeating-linear-gradient(135deg,var(--accent) 0 9px,transparent 9px 18px);opacity:.28}
-.kc-classbar::before{left:0} .kc-classbar::after{right:0}
-
 /* ── masthead header ── */
 .kc-head{display:flex;align-items:center;gap:15px;padding:16px 26px;
-  background:linear-gradient(180deg,#1b1f12,var(--bg));border-bottom:1px solid var(--border);position:relative}
-html[data-theme=light] .kc-head{background:linear-gradient(180deg,#e2ddc5,var(--bg))}
-.kc-head::after{content:"";position:absolute;left:0;right:0;bottom:-3px;height:3px;
-  background:repeating-linear-gradient(135deg,var(--accent) 0 16px,transparent 16px 32px);opacity:.75}
+  background:var(--surface);border-bottom:1px solid var(--border);position:relative}
 .kc-head .mark{color:var(--accent);line-height:0;display:flex}
 .kc-reticle{color:var(--accent)}
-.kc-head .name{font-family:var(--stencil);font-size:27px;font-weight:400;letter-spacing:.14em;
+.kc-head .name{font-family:var(--display);font-size:27px;font-weight:700;letter-spacing:.14em;
   color:var(--text);line-height:1}
 .kc-head .full{font-family:var(--mono);font-size:11px;color:var(--muted);letter-spacing:.04em;
   border-left:1px solid var(--border2);padding-left:14px;margin-left:2px;text-transform:uppercase}
-.kc-head .class{margin-left:auto;font-family:var(--mono);font-size:10px;letter-spacing:.16em;
-  color:var(--bg);background:var(--accent);padding:5px 12px;border-radius:2px;font-weight:700}
+
 
 /* ── sticky nav ── */
 .kc-nav{position:sticky;top:0;z-index:50;display:flex;align-items:center;gap:12px;
@@ -9875,6 +9858,9 @@ html[data-theme=light] .kc-nav{background:rgba(222,218,198,.96)}
 .kc-frow{cursor:pointer}
 .kc-frow:hover td{background:var(--surface2)}
 .kc-frow:focus{outline:2px solid var(--accent);outline-offset:-2px}
+.kc-frow-low td{opacity:.7;font-size:12.5px}
+.kc-details summary::-webkit-details-marker{display:none}
+.kc-details[open] summary{margin-bottom:6px}
 .kc-toggle{display:inline-block;width:18px;height:18px;line-height:16px;text-align:center;border:1px solid var(--border2);
   border-radius:50%;color:var(--muted);font-weight:700;font-size:12px}
 .kc-frow:hover .kc-toggle{border-color:var(--accent);color:var(--accent)}
@@ -10222,13 +10208,10 @@ class HTMLReporter:
             '<path d="M15 10.4l2.3 4h-4.6z" fill="currentColor"/>'
             '</svg>')
         return (
-            '<div class="kc-classbar">CLASSIFIED // FOUO &mdash; SCOUT FIELD INTELLIGENCE &mdash; '
-            'AUTHORIZED PERSONNEL ONLY</div>'
             '<header class="kc-head" id="top">'
             f'<span class="mark">{reticle}</span>'
             f'<span class="name">{TOOL_NAME}</span>'
             f'<span class="full">{self._e(TOOL_LONG)}</span>'
-            '<span class="class">CLASSIFIED // FOUO</span>'
             '</header>')
 
     def _nav(self):
@@ -10241,6 +10224,7 @@ class HTMLReporter:
         if getattr(self.data, "gpos", None):
             items.append(("gpo","Group Policy",""))
         items.append(("findings","Findings",str(len(self.findings))))
+        items.append(("inventory","Inventory",""))
         links = ""
         for sid, name, badge in items:
             b = f'<span class="kc-navb">{badge}</span>' if badge else ""
@@ -10349,9 +10333,7 @@ class HTMLReporter:
                f'<div class="kc-verdictline">Exposure verdict: '
                f'<b style="color:{vcol}">{self._e(word)}</b> · all scores: higher = worse</div>'
                '</div>')
-        readout = ('<div class="kc-readout"><div class="col">'
-                   f'{self._donut()}{self._sev_legend()}</div></div>')
-        return f'<div class="kc-hero">{grade_card}{mid}{readout}</div>'
+        return f'<div class="kc-hero">{grade_card}{mid}</div>'
 
     def _narrative(self):
         s = self.scores
@@ -10448,9 +10430,12 @@ class HTMLReporter:
                 f'{self._dossier()}'
                 f'<div><div class="kc-narrative">{self._narrative()}</div>{self._key_risks()}</div>'
                 '</div>'
-                f'{self._category_strip()}'
-                f'{self._inventory_block()}'
                 f'{self._collection_notes()}</section>')
+
+    def _inventory_section(self):
+        return ('<section class="kc-section" id="sec-inventory">'
+                '<h2 class="kc-h2">Domain inventory</h2>'
+                f'{self._inventory_block()}</section>')
 
     # ── Priorities: top priorities (ranked by exploitability) + quick wins ────
     _PSEUDO_WEIGHT = {"CRITICAL":80, "HIGH":55, "MEDIUM":30, "LOW":12, "INFO":0}
@@ -10847,6 +10832,12 @@ class HTMLReporter:
                  f'<div class="kc-pstat"><b>{ca_n}</b><span>certificate authorities</span></div>'
                  f'<div class="kc-pstat"><b>{unconstrained}</b><span>unconstrained hosts</span></div>'
                  f'</div>')
+        if len(chains) > 5:
+            top5 = "".join(h for _, h, _ in chains[:5])
+            rest = "".join(h for _, h, _ in chains[5:])
+            body = (top5 +
+                    f'<details class="kc-details"><summary class="kc-bh" style="cursor:pointer;margin:10px 0">'
+                    f'{len(chains)-5} more attack paths ▸</summary>{rest}</details>')
         return ('<section class="kc-section kc-critborder" id="sec-paths">'
                 '<h2 class="kc-h2">Attack paths<span class="tag">foothold → Tier 0</span></h2>'
                 '<p class="kc-sub">Identified routes from a low-privileged position to Tier-0, '
@@ -11375,8 +11366,9 @@ class HTMLReporter:
             groups.append(f'<div class="kc-fwgrp"><span class="kc-fwlbl">STIG</span>{chips}</div>')
         if not groups:
             return ""
-        return ('<div class="kc-block"><div class="kc-bh">Frameworks</div>'
-                f'<div class="kc-fw">{"".join(groups)}</div></div>')
+        return ('<details class="kc-block kc-details"><summary class="kc-bh" style="cursor:pointer">'
+                'Frameworks ▸</summary>'
+                f'<div class="kc-fw">{"".join(groups)}</div></details>')
 
     def _finding_panel(self, f):
         doc = self._doc(f.rule_id); desc = doc.get("description") or ""
@@ -11408,31 +11400,33 @@ class HTMLReporter:
                 content = det + ("\n" if det and flat else "") + flat
                 term_block = f'<pre class="kc-term">{content}</pre>'
             parts.append(f'<div class="kc-block"><div class="kc-bh">{hdr}</div>{term_block}{rich}</div>')
-        # 3) narrative
+        # 3) narrative — merged desc + why + technical into a single block
+        narr_parts = []
         if desc:
-            parts.append(f'<div class="kc-block"><div class="kc-bh">What it is</div><div class="kc-bb">{self._e(desc)}</div></div>')
+            narr_parts.append(self._e(desc))
         if doc.get("why"):
-            parts.append(f'<div class="kc-block"><div class="kc-bh">Why it matters</div><div class="kc-bb">{self._e(doc["why"])}</div></div>')
-        if doc.get("technical"):
-            parts.append(f'<div class="kc-block"><div class="kc-bh">Technical</div><div class="kc-bb kc-mono">{self._e(doc["technical"])}</div></div>')
+            narr_parts.append(self._e(doc["why"]))
+        if narr_parts:
+            tech = f'<div class="kc-bb kc-mono" style="margin-top:6px">{self._e(doc["technical"])}</div>' if doc.get("technical") else ""
+            parts.append(f'<div class="kc-block"><div class="kc-bh">Analysis</div>'
+                         f'<div class="kc-bb">{" — ".join(narr_parts)}</div>{tech}</div>')
         # 4) tradecraft
         if doc.get("exploit"):
             items = "".join(f'<li><code>{self._e(x)}</code><button class="kc-copy" onclick="kcCopy(this)">copy</button></li>' for x in doc["exploit"])
             parts.append(f'<div class="kc-block kc-attack"><div class="kc-bh">Exploitation</div><ul class="kc-cmd">{items}</ul></div>')
+        # unified remediation (generic + PowerShell)
+        rem_items = ""
         if doc.get("remediation"):
-            items = "".join(f'<li>{self._e(x)}</li>' for x in doc["remediation"])
-            parts.append(f'<div class="kc-block kc-fix"><div class="kc-bh">Remediation</div><ul class="kc-fixlist">{items}</ul></div>')
-        # copy-able PowerShell remediation, substituted for this environment
+            rem_items += "".join(f'<li>{self._e(x)}</li>' for x in doc["remediation"])
         ps = RULE_POWERSHELL.get(f.rule_id)
         if ps:
             sub = lambda s: s.replace("{domain}", self.domain or "<domain>").replace("{dc}", self.dc_ip or "<dc>")
-            items = "".join(f'<li><code>{self._e(sub(x))}</code>'
-                            f'<button class="kc-copy" onclick="kcCopy(this)">copy</button></li>' for x in ps)
-            parts.append('<div class="kc-block kc-fix"><div class="kc-bh">Remediation — PowerShell '
-                         '<span style="color:var(--faint);text-transform:none;letter-spacing:0">'
-                         '(test with -WhatIf first)</span></div>'
-                         f'<ul class="kc-cmd">{items}</ul></div>')
-        # 5) framework mappings (ATT&CK / Mitigations / CIS / NIST)
+            rem_items += "".join(f'<li><code>{self._e(sub(x))}</code>'
+                                 f'<button class="kc-copy" onclick="kcCopy(this)">copy</button></li>' for x in ps)
+        if rem_items:
+            parts.append(f'<div class="kc-block kc-fix"><div class="kc-bh">Remediation</div>'
+                         f'<ul class="kc-fixlist">{rem_items}</ul></div>')
+        # 5) framework mappings — collapsed toggle
         fw = self._frameworks_block(f)
         if fw:
             parts.append(fw)
@@ -11451,6 +11445,25 @@ class HTMLReporter:
             parts.append('<div class="kc-bb">No additional detail.</div>')
         return "".join(parts)
 
+    def _finding_panel_slim(self, f):
+        """Compact panel for LOW/INFO findings — evidence + detail + remediation only."""
+        parts = []
+        if f.details:
+            parts.append(f'<div class="kc-bb" style="color:var(--muted)">{self._e(f.details[:200])}</div>')
+        if f.affected:
+            n = len(f.affected); shown = f.affected[:20]
+            flat = ", ".join(self._e(str(a)) for a in shown)
+            if n > len(shown):
+                flat += f" … and {n-len(shown)} more"
+            parts.append(f'<div class="kc-bb kc-mono" style="font-size:11.5px;color:var(--muted)">{flat}</div>')
+        doc = self._doc(f.rule_id)
+        if doc.get("remediation"):
+            parts.append(f'<div class="kc-bb" style="color:var(--muted)">'
+                         f'<strong>Fix:</strong> {self._e(doc["remediation"][0])}</div>')
+        if not parts:
+            parts.append('<div class="kc-bb" style="color:var(--muted)">No additional detail.</div>')
+        return "".join(parts)
+
     def _findings_section(self):
         # Group by operational category, then severity within — the way an
         # operator works the list during an engagement.
@@ -11462,11 +11475,12 @@ class HTMLReporter:
             anchor = f"f-{f.rule_id}" if f.rule_id not in seen_rid else f"f-{f.rule_id}-{i}"
             seen_rid.add(f.rule_id)
             eff = rule_effort(f.rule_id); ecol = EFFORT_COLOR.get(eff, "var(--muted)")
-            # Precompute (single-quoted attr) — a backslash inside an f-string
-            # expression only parses on Python 3.12+, and SCOUT supports 3.9+.
             new_badge = " <span class='kc-navb'>new</span>" if f.rule_id in self._new_rules else ""
+            is_low = f.severity in ("LOW", "INFO")
+            panel = self._finding_panel_slim(f) if is_low else self._finding_panel(f)
+            row_cls = "kc-frow kc-frow-low" if is_low else "kc-frow"
             rows.append(
-                f'<tr class="kc-frow" id="{self._e(anchor)}" data-i="{i}" data-sev="{f.severity}" '
+                f'<tr class="{row_cls}" id="{self._e(anchor)}" data-i="{i}" data-sev="{f.severity}" '
                 f'data-cat="{self._e(oc)}" onclick="kcTog({i})" tabindex="0" role="button" '
                 f'onkeydown="if(event.key===\'Enter\'||event.key===\' \'){{event.preventDefault();kcTog({i})}}">'
                 f'<td><span id="ic-{i}" class="kc-toggle">+</span></td>'
@@ -11476,7 +11490,7 @@ class HTMLReporter:
                 f'<td><span class="kc-effort" style="--e:{ecol}">{self._e(eff)}</span></td>'
                 f'<td class="kc-num">{f.points}</td></tr>'
                 f'<tr class="kc-drow" id="dr-{i}" style="display:none"><td></td>'
-                f'<td colspan="6"><div class="kc-panel">{self._finding_panel(f)}</div></td></tr>')
+                f'<td colspan="6"><div class="kc-panel">{panel}</div></td></tr>')
         catpills = "".join(
             f'<button class="kc-fp kc-fp-cat" data-f="cat:{self._e(c)}" onclick="kcFil(this)" '
             f'style="--c:{OPCAT_COLOR[c]}">{self._e(c)}</button>' for c in OPCAT_ORDER)
@@ -11555,8 +11569,7 @@ class HTMLReporter:
                       '<th>Direction</th><th>Transitive</th><th>SID filtering</th>'
                       '<th>Risk</th></tr></thead>'
                       f'<tbody>{rows}</tbody></table>')
-        return ('<div class="kc-sub-h">Domain inventory</div>'
-                f'<div class="kc-stat-grid">{cells}</div>'
+        return (f'<div class="kc-stat-grid">{cells}</div>'
                 + (f'<div class="kc-invcols">'
                    f'<div><div class="kc-sub-h">Operating systems</div><div class="kc-barchart">{bars}</div></div>'
                    f'<div>{trusts}</div></div>' if (bars or trusts) else ""))
@@ -11572,6 +11585,7 @@ class HTMLReporter:
                 self._summary_section() + self._priorities_section() + self._changes_section() +
                 self._paths_section() + self._privileged_section() +
                 self._pki_section() + self._gpo_section() + self._findings_section() +
+                self._inventory_section() +
                 '</main>' + drawer +
                 f'<footer class="kc-footer">{TOOL_NAME} v{VERSION} — authorized security assessment use only · '
                 f'generated {self._e(self.ts)}</footer>'
@@ -11706,12 +11720,9 @@ def main():
     proto = "LDAPS" if args.ldaps else "LDAP"
     print()
     print(rule)
-    print(f"  {bone}>>  S C O U T  <<{rs}   {od}FIELD INTELLIGENCE // RECON ELEMENT{rs}")
-    print(f"  {br}( + ){rs}  {fnt}ACTIVE DIRECTORY DOMAIN ASSESSMENT · v{VERSION}{rs}")
-    print(f"{br}{'-'*64}{rs}")
+    print(f"  {bone}>> SCOUT <<{rs}  {fnt}AD Domain Assessment · v{VERSION}{rs}")
     print(f"  {fnt}DOMAIN{rs} {bone}{args.domain}{rs}    {fnt}DC{rs} {bone}{args.dc_ip}{rs}    "
           f"{fnt}PROTO{rs} {bone}{proto}{rs}    {fnt}AUTH{rs} {bone}{auth_mode}{rs}")
-    print(f"  {fnt}CLASSIFIED // FOUO — AUTHORIZED PERSONNEL ONLY{rs}")
     print(rule)
     print()
 
@@ -11852,11 +11863,30 @@ def main():
     sev_order = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
     sorted_findings = sorted(findings,
         key=lambda f: (sev_order.get(f.severity, 5), f.category))
-    for f in sorted_findings:
-        c = _c(ANSI_SEV.get(f.severity, "")); g = SEV_GLYPH.get(f.severity, "*")
-        print(f"   {c}{g} {f.severity:8s}{rs} {faint}{f.rule_id:26s}{rs} {f.title}")
-        if f.details and args.verbose:
-            print(f"       {faint}{f.details[:140]}{rs}")
+    # Group by operational category
+    from itertools import groupby as _groupby
+    cat_sorted = sorted(findings,
+        key=lambda f: (OPCAT_ORDER.index(op_category(f.rule_id, f.category))
+                        if op_category(f.rule_id, f.category) in OPCAT_ORDER else 9,
+                        sev_order.get(f.severity, 5)))
+    for cat, grp in _groupby(cat_sorted, key=lambda f: op_category(f.rule_id, f.category)):
+        items = list(grp)
+        crit_high = [f for f in items if f.severity in ("CRITICAL", "HIGH")]
+        med_low = [f for f in items if f.severity not in ("CRITICAL", "HIGH")]
+        if not items:
+            continue
+        print(f"   {brass}── {cat} ──{rs}")
+        for f in crit_high:
+            c = _c(ANSI_SEV.get(f.severity, "")); g = SEV_GLYPH.get(f.severity, "*")
+            print(f"   {c}{g} {f.severity:8s}{rs} {f.title}")
+            if f.details:
+                print(f"     {faint}{f.details[:120]}{rs}")
+        for f in med_low:
+            c = _c(ANSI_SEV.get(f.severity, "")); g = SEV_GLYPH.get(f.severity, "*")
+            print(f"   {c}{g} {f.severity:8s}{rs} {f.title}")
+            if f.details and args.verbose:
+                print(f"     {faint}{f.details[:120]}{rs}")
+        print()
 
     # ── HTML report ───────────────────────────────────────────────────────────
     if not args.output:
