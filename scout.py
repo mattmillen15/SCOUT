@@ -8188,6 +8188,8 @@ class ACLAnalyzer:
                 ace_type = ace["TypeName"]
                 if "DENIED" in ace_type.upper():
                     continue
+                if int(ace["AceFlags"]) & 0x08:   # INHERIT_ONLY — not effective here
+                    continue
                 mask = int(ace["Ace"]["Mask"]["Mask"])
                 sid_str_val = self._sid_str(ace["Ace"]["Sid"])
                 principal_name = self._broad.get(sid_str_val)
@@ -8259,6 +8261,11 @@ class ACLAnalyzer:
             try:
                 ace_type = ace["TypeName"]
                 if "DENIED" in ace_type.upper():
+                    continue
+                flags = int(ace["AceFlags"])
+                if flags & 0x10:   # INHERITED_ACE — inherited from parent container, skip
+                    continue
+                if flags & 0x08:   # INHERIT_ONLY — not effective on this object
                     continue
                 mask = int(ace["Ace"]["Mask"]["Mask"])
                 sid_str_val = self._sid_str(ace["Ace"]["Sid"])
@@ -8713,6 +8720,13 @@ class ControlPathAnalyzer:
         for ace in dacl["Data"]:
             try:
                 if "DENIED" in ace["TypeName"].upper():
+                    continue
+                aflags = int(ace["AceFlags"])
+                if aflags & 0x08:   # INHERIT_ONLY — not effective on this object
+                    continue
+                # GPO inherited ACEs come from CN=Policies container and do NOT
+                # grant SYSVOL write, so they aren't real GPO-modify edges.
+                if kind == "gpo" and (aflags & 0x10):
                     continue
                 mask = int(ace["Ace"]["Mask"]["Mask"])
                 psid = ace["Ace"]["Sid"].formatCanonical()
