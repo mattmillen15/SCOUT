@@ -13,13 +13,13 @@ Data is collected over LDAP/LDAPS; SMB/SYSVOL checks use impacket where
 available. Outputs an interactive single-file HTML report plus JSON and CSV.
 
 Auth options (impacket / bloodhound-python style):
-  -u user -p pass         -d domain.local --dc-ip 10.0.0.1
-  -u user -H :NThash      -d domain.local --dc-ip 10.0.0.1            (PtH)
-  -u user -p pass  -k     -d domain.local --dc-ip 10.0.0.1           (request a TGT)
-  -u user -H :NThash -k   -d domain.local --dc-ip 10.0.0.1   (overpass-the-hash)
-  --aes-key <hex>         -d domain.local --dc-ip 10.0.0.1
-  --ccache user.ccache    -d domain.local --dc-ip 10.0.0.1   (or KRB5CCNAME)
-  --null-session          -d domain.local --dc-ip 10.0.0.1
+  -u user -p pass         -d domain.local -dc 10.0.0.1
+  -u user -H :NThash      -d domain.local -dc 10.0.0.1            (PtH)
+  -u user -p pass  -k     -d domain.local -dc 10.0.0.1           (request a TGT)
+  -u user -H :NThash -k   -d domain.local -dc 10.0.0.1   (overpass-the-hash)
+  --aes-key <hex>         -d domain.local -dc 10.0.0.1
+  --ccache user.ccache    -d domain.local -dc 10.0.0.1   (or KRB5CCNAME)
+  --null-session          -d domain.local -dc 10.0.0.1
 
 Kerberos (-k) requests the ticket itself and binds with GSS-SPNEGO, which
 satisfies "LDAP signing required" and — over plain 389 — bypasses LDAPS
@@ -2178,17 +2178,17 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s -d corp.local -u john -p 'P@ssw0rd' --dc-ip 10.0.0.1
-  %(prog)s -d corp.local -u john -H :31d6cfe0d16ae931b73c59d7e0c089c0 --dc-ip 10.0.0.1
-  %(prog)s -d corp.local -k --dc-ip 10.0.0.1
-  %(prog)s -d corp.local --null-session --dc-ip 10.0.0.1
-  %(prog)s -d corp.local -u john -p 'P@ssw0rd' --dc-ip 10.0.0.1 --ldaps
-  %(prog)s -d corp.local -u john -p 'P@ssw0rd' --dc-ip 10.0.0.1 --output /tmp/report.html
-  %(prog)s -d corp.local --ccache /tmp/krb5cc_1000 --dc-ip 10.0.0.1
+  %(prog)s -d corp.local -u john -p 'P@ssw0rd' -dc 10.0.0.1
+  %(prog)s -d corp.local -u john -H :31d6cfe0d16ae931b73c59d7e0c089c0 -dc 10.0.0.1
+  %(prog)s -d corp.local -k -dc 10.0.0.1
+  %(prog)s -d corp.local --null-session -dc 10.0.0.1
+  %(prog)s -d corp.local -u john -p 'P@ssw0rd' -dc 10.0.0.1 --ldaps
+  %(prog)s -d corp.local -u john -p 'P@ssw0rd' -dc 10.0.0.1 --output /tmp/report.html
+  %(prog)s -d corp.local --ccache /tmp/krb5cc_1000 -dc 10.0.0.1
 
 Relay (no creds — NTLM relayed via ntlmrelayx -socks):
-  %(prog)s -d corp.local -u relayed_user --dc-ip 10.0.0.1 --relay
-  %(prog)s -d corp.local -u relayed_user --dc-ip 10.0.0.1 --relay 127.0.0.1:1080
+  %(prog)s -d corp.local -u relayed_user -dc 10.0.0.1 --relay
+  %(prog)s -d corp.local -u relayed_user -dc 10.0.0.1 --relay 127.0.0.1:1080
         """)
 
     auth = p.add_argument_group("Authentication")
@@ -2212,7 +2212,7 @@ Relay (no creds — NTLM relayed via ntlmrelayx -socks):
                       help="Do not prompt for password")
     auth.add_argument("--null-session",    action="store_true",
                       help="Attempt unauthenticated LDAP (anonymous bind)")
-    auth.add_argument("--dc-ip",           metavar="IP",    required=True,
+    auth.add_argument("-dc", "--dc-ip",     metavar="HOST",  required=True,
                       help="IP or hostname of domain controller (also used as the KDC)")
     auth.add_argument("--dc-host",         metavar="FQDN",
                       help="DC FQDN for the Kerberos SPN (auto-resolved if omitted)")
@@ -2270,7 +2270,7 @@ def make_args(**overrides):
     with overrides applied. Lets embedders — notably the NetExec module — drive
     the engine without reconstructing the whole flag set."""
     ns = build_parser().parse_args(["-d", overrides.get("domain", "example.local"),
-                                    "--dc-ip", overrides.get("dc_ip", "127.0.0.1")])
+                                    "-dc", overrides.get("dc_ip", "127.0.0.1")])
     for k, v in overrides.items():
         setattr(ns, k, v)
     return ns
