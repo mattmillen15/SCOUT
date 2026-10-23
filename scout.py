@@ -221,7 +221,7 @@ RULES: Dict[str, Tuple[str, str, int, str]] = {
     "A-LimitBlankPasswordUse":("Blank passwords accessible from network","Anomaly",25,"HIGH"),
     "A-WSUS-SslProtocol":     ("WSUS using weak SSL/TLS protocol","Anomaly",10,"MEDIUM"),
     # Privileged
-    "P-AdminNum":             ("Excessive domain administrator accounts","Privileged",25,"HIGH"),
+    "P-AdminNum":             ("Large number of domain administrator accounts","Privileged",5,"INFO"),
     "P-AdminPwdTooOld":       ("Admin account password not changed in >90 days","Privileged",25,"HIGH"),
     "P-AdminLogin":           ("Admin accounts that have never logged in","Privileged",5,"LOW"),
     "P-AdminEmailOn":         ("Admin accounts with email attributes","Privileged",5,"LOW"),
@@ -240,7 +240,7 @@ RULES: Dict[str, Tuple[str, str, int, str]] = {
     "P-DangerousExtendedRight":("Dangerous extended rights on AD object","Privileged",50,"CRITICAL"),
     "P-ControlPathIndirectEveryone":("Everyone has indirect control path to admin","Privileged",50,"CRITICAL"),
     "P-ControlPathIndirectMany":("Many users have indirect control path to admin","Privileged",25,"HIGH"),
-    "P-DNSAdmin":             ("DNSAdmins group has members","Privileged",15,"HIGH"),
+    "P-DNSAdmin":             ("DNSAdmins group has members","Privileged",5,"INFO"),
     "P-DNSDelegation":        ("DNS delegation object misconfigured","Privileged",25,"HIGH"),
     "P-ExchangePrivEsc":      ("Exchange configuration allows privilege escalation","Privileged",50,"CRITICAL"),
     "P-ExchangeAdminSDHolder":("Exchange groups in AdminSDHolder scope","Privileged",25,"HIGH"),
@@ -252,7 +252,7 @@ RULES: Dict[str, Tuple[str, str, int, str]] = {
     "P-RODCAllowedGroup":     ("RODC allowed group not configured","Privileged",5,"LOW"),
     "P-RODCDeniedGroup":      ("RODC denied group not configured","Privileged",5,"LOW"),
     "P-ServiceDomainAdmin":   ("Service account is member of Domain Admins","Privileged",50,"CRITICAL"),
-    "P-SchemaAdmin":          ("Schema Admins group is not empty","Privileged",25,"HIGH"),
+    "P-SchemaAdmin":          ("Schema Admins group is not empty","Privileged",5,"LOW"),
     "P-SchemaDefaultSD":       ("Broad principal can write all future objects via class defaultSecurityDescriptor","Privileged",50,"HIGH"),
     "P-RecycleBin":           ("AD Recycle Bin not enabled","Privileged",5,"LOW"),
     "P-ProtectedUsers":       ("Privileged accounts not in Protected Users group","Privileged",10,"MEDIUM"),
@@ -5851,8 +5851,9 @@ class CheckEngine:
         if len(active_admins) > threshold:
             names = [get_str(m["attrs"],"sAMAccountName") for m in active_admins]
             self._add("P-AdminNum",
-                      f"{len(active_admins)} active Domain Admin accounts found "
-                      f"(recommended ≤ {threshold}). Reduce attack surface.",
+                      f"{len(active_admins)} active Domain Admin accounts. "
+                      "Consider whether all need persistent DA membership or "
+                      "could use just-in-time / delegated roles instead.",
                       names[:30])
         # Check for admins that have never logged in (reconciled across DCs when
         # --accurate-logon, so a DA who only logs on to one DC isn't a false hit).
@@ -6375,7 +6376,8 @@ class CheckEngine:
         if active:
             self._add("P-DNSAdmin",
                       f"DNSAdmins group has {len(active)} member(s). "
-                      "Members can load arbitrary DLLs into the DNS service on DCs.",
+                      "Members can configure the DNS service on DCs (DLL load "
+                      "attack requires existing privileged access to exploit).",
                       active[:20])
 
     def _p_exchange_priv_esc(self):
