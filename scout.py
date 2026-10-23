@@ -3400,10 +3400,15 @@ class CheckEngine:
     def _rule(self, rule_id: str) -> Tuple[str, str, int, str]:
         return RULES.get(rule_id, (rule_id, "Anomaly", 5, "MEDIUM"))
 
-    def _add(self, rule_id: str, details: str = "", affected: List[str] = None):
+    def _add(self, rule_id: str, details: str = "", affected: List[str] = None,
+             *, sev_override: str = None, pts_override: int = None):
         if rule_id in SUPPRESSED_RULES:   # non-actionable on an engagement
             return
         t, cat, pts, sev = self._rule(rule_id)
+        if sev_override:
+            sev = sev_override
+        if pts_override is not None:
+            pts = pts_override
         aff = _dedup_keep_order(affected or [])
         # Emit ONE finding per rule_id. Some rules are contributed from more than
         # one code path or in a per-object loop; merge into the existing finding
@@ -3780,11 +3785,13 @@ class CheckEngine:
                       "Walk the chain and remove the first dangerous edge.",
                       samples or broad)
         else:
-            self._add("P-ControlPathDA",
-                      f"{count} non-privileged principal(s) can reach Domain Admin through a "
-                      "chain of group membership and dangerous ACLs/ownership (not direct "
-                      "membership). These are the multi-hop escalation routes to fix first.",
-                      samples)
+            if count >= 10:
+                self._add("P-ControlPathDA",
+                          f"{count} non-privileged principal(s) can reach Domain Admin through "
+                          "a chain of group membership and dangerous ACLs/ownership (not direct "
+                          "membership). These are the multi-hop escalation routes to fix first.",
+                          samples,
+                          sev_override="HIGH", pts_override=40)
         if count >= 25:
             self._add("P-ControlPathIndirectMany",
                       f"{count} distinct non-privileged principals have a control path to "
@@ -7498,17 +7505,39 @@ class CheckEngine:
 
     def _p_modifiable_gpo(self):
         gpo_write = [f for f in self.d.acl_findings if f.get("type") == "gpo_write"]
+        gpo_by_dn = {}
+        for g in self.d.gpos:
+            gdn = g.get("dn", "")
+            if gdn:
+                gpo_by_dn[gdn.lower()] = g
         seen = set()
         for f in gpo_write:
             key = (f["sid_name"], f["object"])
             if key in seen:
                 continue
             seen.add(key)
+            dn = f.get("dn", "")
+            gpo_id = ""
+            if dn:
+                m = re.match(r"CN=(\{[0-9A-Fa-f-]+\})", dn, re.IGNORECASE)
+                if m:
+                    gpo_id = m.group(1)
+            sysvol = ""
+            gpo_obj = gpo_by_dn.get(dn.lower()) if dn else None
+            if gpo_obj:
+                sysvol = get_str(gpo_obj.get("attrs", {}), "gPCFileSysPath") or ""
+            gpo_label = f['object']
+            if gpo_id:
+                gpo_label += f" {gpo_id}"
+            if sysvol:
+                gpo_label += f" ({sysvol})"
+            tool_hint = f"  pyGPOAbuse.py -gpo-id '{gpo_id}'" if gpo_id else ""
             self._add("P-ModifiableGPO",
-                      f"{f['sid_name']} ({f['sid']}) can modify GPO '{f['object']}'. "
+                      f"{f['sid_name']} ({f['sid']}) can modify GPO '{f['object']}'"
+                      f"{f' {gpo_id}' if gpo_id else ''}. "
                       "Attacker controlling this principal can edit GPO content to execute "
-                      "arbitrary code on all computers/users in the GPO scope.",
-                      [f['sid_name'], f['object']])
+                      f"arbitrary code on all computers/users in the GPO scope.{tool_hint}",
+                      [f['sid_name'], gpo_label])
 
     def _p_machine_account_quota(self):
         maq = self.d.machine_account_quota
@@ -10702,7 +10731,12 @@ class HTMLReporter:
             elif t in ("dangerous_acl","owner"):
                 add("CRITICAL", [n_who, right or "WriteDACL", self._node(obj or "Domain root"), "grant DCSync", DOM], "dacledit / secretsdump", "P-DangerousACLDomain")
             elif t == "gpo_write":
-                add("CRITICAL", [n_who, "edit GPO", self._node(obj or "GPO"), "applies to", self._node("Computers / DCs"), "SYSTEM", DOM], "pyGPOAbuse", "P-ModifiableGPO")
+                gpo_dn = a.get("dn", "")
+                _gid_m = re.match(r"CN=(\{[0-9A-Fa-f-]+\})", gpo_dn, re.IGNORECASE)
+                _gid = _gid_m.group(1) if _gid_m else ""
+                gpo_node = self._node(f"{obj} {_gid}" if _gid else obj or "GPO")
+                gpo_tool = f"pyGPOAbuse -gpo-id '{_gid}'" if _gid else "pyGPOAbuse"
+                add("CRITICAL", [n_who, "edit GPO", gpo_node, "applies to", self._node("Computers / DCs"), "SYSTEM", DOM], gpo_tool, "P-ModifiableGPO")
             elif t == "write_property":
                 add("HIGH", [n_who, right or "Write", self._node(obj or "privileged object"), "add member", DA], "", "P-WriteToPrivGroup")
 
